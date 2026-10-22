@@ -7,6 +7,10 @@ on:
         description: Build only the Windows package
         type: boolean
         default: false
+      release_tag:
+        description: Publish the Windows package as a pre-release of this fork with this tag (empty - none)
+        type: string
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -545,3 +549,34 @@ jobs:
               --target "$GITHUB_SHA" \
               --title "$RELEASE_NAME"
           fi
+
+  # This fork's test releases (workflow_dispatch with release_tag): the Windows package as a
+  # pre-release, its notes from docs/ASTRO-BOT-DLSSG.md.
+  fork-release:
+    name: Publish the Windows package
+    if: inputs.release_tag != '' && needs.windows.result == 'success'
+    needs: [windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-Windows-x64
+          path: package/KytyPS5-AstroBot-DLSSG
+
+      - name: Package and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          cp docs/ASTRO-BOT-DLSSG.md package/KytyPS5-AstroBot-DLSSG/README-DLSSG.md
+          (cd package && zip -qr "../KytyPS5-AstroBot-DLSSG-${TAG}-Windows-x64.zip" KytyPS5-AstroBot-DLSSG)
+          gh release create "$TAG" "KytyPS5-AstroBot-DLSSG-${TAG}-Windows-x64.zip" \
+            --repo "${{ github.repository }}" --target "${{ github.sha }}" --prerelease \
+            --title "Astro Bot DLSS frame generation (${TAG}, experimental)" \
+            --notes-file docs/ASTRO-BOT-DLSSG.md

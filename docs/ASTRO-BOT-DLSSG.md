@@ -1,0 +1,100 @@
+# KytyPS5 (Jetsku U59) with DLSS frame generation for Astro Bot
+
+An **experimental, unofficial** test build of [Jetsku/KytyPS5](https://github.com/Jetsku/KytyPS5)
+that adds NVIDIA **DLSS frame generation (DLSS-G)** to **ASTRO BOT (PPSA21564)**. Everything else
+is Jetsku's emulator as it was on 22 October 2026.
+
+Frame generation only switches on where it finds Astro Bot's inputs; in other games it stays
+off. With the `streamline` folder present Streamline still sits between the emulator and the
+driver, so if another game misbehaves with this build, set `KYTY_FRAMEGEN=0` or remove the folder.
+
+## Requirements
+
+- Windows 10/11 with **hardware-accelerated GPU scheduling** on (Settings > System > Display >
+  Graphics > Advanced graphics settings; restart after changing it).
+- An **NVIDIA RTX 40 or RTX 50** graphics card and a recent driver (tested: RTX 5080, 617.42).
+- NVIDIA's **Streamline v2.14.1** runtime files (not included, see below).
+
+## Setup
+
+1. Download this release's zip and unzip it into a new folder.
+2. Download NVIDIA Streamline **v2.14.1**:
+   https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.1 - pick
+   `streamline-sdk-v2.14.1.zip` (not the aarch64/arm64ec ones).
+3. In the unzipped emulator folder, next to `kyty_emulator.exe`, make a folder named exactly
+   `streamline` and copy into it the files from the Streamline zip's `bin\x64` folder (the files
+   themselves; the `development` subfolder is not needed).
+
+   ```
+   KytyPS5-AstroBot-DLSSG\
+   ├── kyty_emulator.exe
+   ├── kyty_launcher.exe
+   ├── ...
+   └── streamline\
+       ├── sl.interposer.dll
+       ├── sl.common.dll
+       ├── sl.dlss_g.dll
+       ├── sl.reflex.dll
+       ├── sl.pcl.dll
+       ├── nvngx_dlssg.dll
+       └── ...
+   ```
+4. Turn **NVIDIA Smooth Motion off** for kyty_emulator.exe in the NVIDIA App (the two clash).
+5. Start Astro Bot from the launcher as usual.
+
+## Checking it works
+
+The emulator's console window shows, in order:
+
+```
+Frame generation: Streamline loaded from ...\streamline (1 generated frame(s) per frame)
+Frame generation: Streamline offers DLSS-G with this GPU, driver and Windows
+Frame generation: Vulkan is loaded from sl.interposer.dll (Streamline's interposer, as needed)
+Frame generation: DLSS-G ready (1 generated frame(s) per frame); it turns on in the game's 3D view
+Frame generation: Astro Bot's inputs found (motion and depth 3840x2160, ...)
+Frame generation: DLSS-G on
+```
+
+Use the **NVIDIA overlay** (Alt+R) to see the frame rate on screen: it counts the generated
+frames. The emulator's own counter shows the game's real frame rate, which DLSS-G does not
+change.
+
+## Settings (environment variables)
+
+| Variable | Effect |
+|---|---|
+| `KYTY_FRAMEGEN=0` | Frame generation off |
+| `KYTY_FRAMEGEN=1` | 2x (default) |
+| `KYTY_FRAMEGEN=2` / `3` | 3x / 4x multi frame generation (RTX 50 only) |
+| `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
+| `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
+
+## Known issues
+
+- **The HUD can smear slightly** in generated frames: the game image is given to DLSS-G with its
+  HUD (no HUD-less image yet).
+- **Frame generation does not fix game slowdown.** If the game itself runs below the frame rate
+  its patches expect, it still slows down; DLSS-G only adds frames on top of what is rendered.
+- Generated frames need a decent base frame rate: about 40 fps or more looks good.
+- Experimental: setting `KYTY_CUDA_EARLY_INIT=1` (for NVIDIA Smooth Motion) puts CUDA's memory
+  above 512 GiB in this build, inside the emulator's address range. Astro Bot does not use that
+  part of it, but other games might. Leave it unset with DLSS-G.
+
+## Reporting problems
+
+Please include your GPU, driver version, and all the `Frame generation:` and `Streamline` lines
+from the console (or the lines just before a crash).
+
+## How it works
+
+The DLSS-G integration through NVIDIA Streamline (loading `sl.interposer.dll` as the Vulkan loader,
+DLSS-G options, constants, resource tags and Reflex/PCL markers at the present) follows
+**chenxiao07/KytyPS5**'s `src/local/frame-gen.cpp`, which does this for Demon's Souls - many
+thanks. Astro Bot's motion vectors, depth and camera constants were found with a capture tool in
+this build (`KYTY_FG_DISCOVER=1`); the details are in
+[docs/RE-ASTRO-BOT-FG.md](https://github.com/biggsymobile-png/KytyPS5/blob/fg-discovery/docs/RE-ASTRO-BOT-FG.md), the code in
+`src/graphics/host_gpu/renderer/frameGenDlssg.{h,cpp}`.
+
+KytyPS5 is free software under the GPL-2.0 (see LICENSE). NVIDIA Streamline and DLSS are NVIDIA's;
+their files are not distributed here. This build is not affiliated with Sony, NVIDIA, the KytyPS5
+project or Jetsku.
