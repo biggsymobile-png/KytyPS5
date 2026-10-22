@@ -1,7 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_FG_DISCOVERY_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_FG_DISCOVERY_H_
 
-// KYTY_FG_DISCOVER (default ON in the fg-discovery test branch, =0 off): records, for a few pairs of consecutive frames, every draw and
+// KYTY_FG_DISCOVER=1 (default off): records, for a few pairs of consecutive frames, every draw and
 // compute dispatch with its shaders, the images it reads and writes (format, size, guest address)
 // and the first dwords of its user data and flattened SRT, into fg-discovery.txt next to the
 // emulator. It does nothing else and changes no rendering.

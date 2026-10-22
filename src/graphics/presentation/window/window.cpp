@@ -1,4 +1,5 @@
-﻿#include "graphics/presentation/window.h"
+﻿#include "graphics/host_gpu/renderer/frameGenDlssg.h"
+#include "graphics/presentation/window.h"
 
 #include <SDL3/SDL.h>
 
@@ -820,6 +821,8 @@ static void WindowCreate(WindowContext& context) {
 	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
 		EXIT("%s\n", SDL_GetError());
 	}
+	// DLSS frame generation: Streamline becomes SDL's Vulkan loader (before the window loads it).
+	Libs::Graphics::FrameGen::Initialize();
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 

@@ -90,6 +90,18 @@ jobs:
           glslangValidator --version
           echo Qt6_DIR=%Qt6_DIR%
 
+      # DLSS frame generation (src/graphics/host_gpu/renderer/frameGenDlssg.cpp): NVIDIA Streamline's
+      # headers (MIT) at build time; its runtime is the user's own (a "streamline" folder next to
+      # kyty_emulator.exe). Without them the build has no frame generation.
+      - name: Streamline headers
+        shell: pwsh
+        run: |
+          git clone --quiet --depth 1 --branch v2.14.1 --filter=blob:none --sparse https://github.com/NVIDIA-RTX/Streamline.git _Build\streamline-src
+          git -C _Build\streamline-src sparse-checkout set include
+          New-Item -ItemType Directory -Force _Build\deps\streamline\sdk | Out-Null
+          Copy-Item _Build\streamline-src\include _Build\deps\streamline\sdk -Recurse
+          Get-ChildItem _Build\deps\streamline\sdk\include -Name
+
       - name: Configure
         shell: cmd
         run: |

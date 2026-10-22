@@ -13,6 +13,7 @@
 #include "common/textureSparseResidency.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/renderer/frameGenDlssg.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -2080,13 +2081,18 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(calibration);
 			GpuTiming::NoteCalibrationExtensionEnabled(calibration);
 		}
+		FrameGen::AddDeviceExtensions(available_extensions, device_extensions);
 	}
 
+	(void)FrameGen::SupportProblem(graphic_ctx.physical_device);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
 	if (graphic_ctx.device == nullptr) {
-		EXIT("Could not create device");
+		EXIT("Could not create device.%s", FrameGen::RefusedDeviceAdvice().c_str());
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	// Before the profiler's and recorder's hooks copy the dispatcher's entries.
+	FrameGen::BypassCommandHooks(graphic_ctx.device);
+	FrameGen::OnDevice(graphic_ctx.physical_device);
 	// Diagnostic only (KYTY_GPU_OP_PROFILE / KYTY_GPU_OP_COUNTERS): wraps dispatcher entries.
 	GpuOpProfiler::InstallHooks(graphic_ctx);
 	// KYTY_CP_RECORDER_VERIFY ownership hooks wrap the GpuOpProfiler's.

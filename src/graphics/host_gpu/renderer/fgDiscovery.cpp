@@ -33,7 +33,7 @@ constexpr uint64_t WatchedShaders[] = {
 };
 
 struct Settings {
-	bool enabled = true;
+	bool enabled = false;
 	int  start   = 3600;
 	int  every   = 600;
 	int  count   = 8;
@@ -49,7 +49,7 @@ const Settings& GetSettings() {
 	static const Settings settings = [] {
 		Settings s;
 		const char* value = std::getenv("KYTY_FG_DISCOVER");
-		s.enabled = value == nullptr || value[0] == '\0' || value[0] != '0';
+		s.enabled = value != nullptr && value[0] != '\0' && value[0] != '0';
 		s.start   = EnvInt("KYTY_FG_DISCOVER_START", s.start);
 		s.every   = std::max(2, EnvInt("KYTY_FG_DISCOVER_EVERY", s.every));
 		s.count   = EnvInt("KYTY_FG_DISCOVER_COUNT", s.count);

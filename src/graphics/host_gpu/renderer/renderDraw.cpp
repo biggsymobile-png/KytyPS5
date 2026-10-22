@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/frameGenDlssg.h"
 #include "graphics/host_gpu/renderer/fgDiscovery.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
@@ -3887,6 +3888,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::PrepareGraphicsBindings");
 		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count},
 		                        m_run_active);
+	}
+	if (FrameGen::Enabled()) {
+		std::array<const PreparedBindings*, 3> fg_vertex {};
+		uint32_t                               fg_vertex_count = 0;
+		for (uint32_t i = 0; i < vertex_stages.size() && fg_vertex_count < 3; i++) {
+			fg_vertex[fg_vertex_count++] = &bindings.vertex[i];
+		}
+		const auto* ps_program = state.ps_input_info.stage.program;
+		FrameGen::OnDraw(state.ps_active && ps_program != nullptr ? ps_program->shader_hash : 0,
+		                 state.ps_active && bindings.pixel ? &*bindings.pixel : nullptr,
+		                 std::span {fg_vertex.data(), fg_vertex_count},
+		                 std::span {state.color_info, state.color_count}, state.depth_info);
 	}
 	if (FgDiscovery::Recording()) [[unlikely]] {
 		std::array<FgDiscovery::DrawStage, 4> fg_stages {};

@@ -54,3 +54,18 @@ degrees), jitter -0.25 px in both axes.
 
 Identifying the buffer at run time: a 576-byte buffer of a draw writing the motion-vector target
 whose dwords 43 and 47 read -1.0 and 0.0 (projection col2.w and col3.w).
+
+## Using it (frameGenDlssg.h)
+
+Windows, an NVIDIA RTX 40/50 GPU, hardware-accelerated GPU scheduling on.
+
+1. Download NVIDIA Streamline **v2.14.1** (the version the build's headers are from):
+   https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.1
+2. Copy the files of its `bin\x64` folder into a folder named `streamline` next to
+   kyty_emulator.exe (or point KYTY_STREAMLINE_DIR at it).
+3. Start the game. The console shows `Frame generation: DLSS-G ready`, then
+   `Astro Bot's inputs found` and `DLSS-G on` once the 3D view runs.
+
+KYTY_FRAMEGEN=0 turns it off; 2 or 3 asks for multi frame generation (RTX 50). Turn NVIDIA Smooth
+Motion off for kyty_emulator.exe while using it. The HUD is not separated yet (no HUD-less
+image), so it can smear slightly in generated frames.
