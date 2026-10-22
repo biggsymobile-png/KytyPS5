@@ -71,6 +71,14 @@ change.
 
 ## Known issues
 
+- **Game patches are separate and up to you.** Frame generation does not depend on them: it works
+  with or without the usual Astro Bot patches (ultrawide, fixed resolution, FPS unlock / decouple
+  and so on). Patches that replace the game's renderer or its anti-aliasing could stop it finding
+  its inputs; it then just stays off.
+- **Tested on version 01.018 (PPSA21564).** Other regions or updates very likely work the same,
+  but if the console never shows `Astro Bot's inputs found` in the game's 3D view, your version
+  draws differently: please report it with your title ID and version.
+
 - **The HUD can smear slightly** in generated frames: the game image is given to DLSS-G with its
   HUD (no HUD-less image yet).
 - **Frame generation does not fix game slowdown.** If the game itself runs below the frame rate
