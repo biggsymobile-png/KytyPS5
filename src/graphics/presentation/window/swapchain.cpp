@@ -1408,7 +1408,9 @@ void Presenter::Impl::Present() {
 		// DLSS frame generation: its constants, tags and markers around the present (Streamline
 		// makes and shows the generated frames inside vkQueuePresentKHR). A frame shown again
 		// (a repeat) has no inputs.
-		const bool frame_gen = FrameGen::Enabled();
+		// (Requested, not Enabled: BeforePresent itself finishes DLSS-G's setup once the
+		// swapchain exists.)
+		const bool frame_gen = FrameGen::Requested();
 		if (frame_gen) {
 			auto* fg_frame = layers[0].frame;
 			FrameGen::BeforePresent(fg_frame != nullptr && fg_frame->fg.valid ? &fg_frame->fg : nullptr,

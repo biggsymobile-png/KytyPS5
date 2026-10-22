@@ -290,6 +290,13 @@ Mat4 Identity() {
 
 void LogMessage(sl::LogType type, const char* message) {
 	static const bool verbose = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr;
+	// (Asked again at the first presents until DLSS-G is set up: its "not initialized yet" shown twice.)
+	static std::atomic<uint32_t> not_ready {0};
+	if (message != nullptr && std::strstr(message, "has not been initialized yet") != nullptr &&
+	    not_ready.fetch_add(1, std::memory_order_relaxed) >= 2 && !verbose) {
+		LOGF("Streamline: %s", message);
+		return;
+	}
 	if (type == sl::LogType::eError || verbose) {
 		std::printf("Streamline %s: %s", type == sl::LogType::eError ? "error" : "log", message);
 		std::fflush(stdout);
@@ -717,7 +724,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 	if (!g_ready.load(std::memory_order_relaxed)) {
 		// (The swapchain exists now; asked once more, then reported.)
 		static uint32_t attempts = 0;
-		if (!g_device_ok || attempts > 2 || !FindFunctions(++attempts > 2)) return;
+		if (!g_device_ok || attempts > 300 || !FindFunctions(++attempts > 300)) return;
 	}
 	const sl::ViewportHandle viewport {0};
 	const bool               usable = inputs != nullptr && inputs->valid;
@@ -904,7 +911,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 
 void AfterPresent() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-	if (!g_ready || g_token == nullptr) return;
+	if (!g_ready.load(std::memory_order_relaxed) || g_token == nullptr) return;
 	g_api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *g_token);
 	const auto presents = ++g_presents;
 	if (presents % 600 != 1) return;
