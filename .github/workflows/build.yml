@@ -37,6 +37,7 @@ jobs:
 
   windows:
     name: Build KytyPS5 (Windows)
+    if: inputs.release_tag == ''
     needs: metadata
     runs-on: windows-2022
 
@@ -155,7 +156,7 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
-    if: ${{ !inputs.windows_only }}
+    if: ${{ !inputs.windows_only && inputs.release_tag == '' }}
     needs: metadata
     runs-on: macos-15
 
@@ -312,7 +313,7 @@ jobs:
 
   linux:
     name: Build KytyPS5 (Linux)
-    if: ${{ !inputs.windows_only }}
+    if: ${{ !inputs.windows_only && inputs.release_tag == '' }}
     needs: metadata
     runs-on: ubuntu-24.04
 
@@ -550,33 +551,13 @@ jobs:
               --title "$RELEASE_NAME"
           fi
 
-  # This fork's test releases (workflow_dispatch with release_tag): the Windows package as a
-  # pre-release, its notes from docs/ASTRO-BOT-DLSSG.md.
+  # This fork's test releases (workflow_dispatch with release_tag): built and published by
+  # u59-windows-release.yml, Jetsku's release recipe (PGO, CP diagnostics off, the preset).
   fork-release:
-    name: Publish the Windows package
-    if: inputs.release_tag != '' && needs.windows.result == 'success'
-    needs: [windows]
-    runs-on: ubuntu-latest
+    name: Optimised release
+    if: inputs.release_tag != ''
     permissions:
       contents: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download Windows build
-        uses: actions/download-artifact@v4
-        with:
-          name: KytyPS5-Windows-x64
-          path: package/KytyPS5-AstroBot-DLSSG
-
-      - name: Package and publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
-        run: |
-          cp docs/ASTRO-BOT-DLSSG.md package/KytyPS5-AstroBot-DLSSG/README-DLSSG.md
-          (cd package && zip -qr "../KytyPS5-AstroBot-DLSSG-${TAG}-Windows-x64.zip" KytyPS5-AstroBot-DLSSG)
-          gh release create "$TAG" "KytyPS5-AstroBot-DLSSG-${TAG}-Windows-x64.zip" \
-            --repo "${{ github.repository }}" --target "${{ github.sha }}" --prerelease \
-            --title "Astro Bot DLSS frame generation (${TAG}, experimental)" \
-            --notes-file docs/ASTRO-BOT-DLSSG.md
+    uses: ./.github/workflows/u59-windows-release.yml
+    with:
+      tag: ${{ inputs.release_tag }}

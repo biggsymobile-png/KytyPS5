@@ -8,6 +8,12 @@ on:
   push:
     tags:
       - 'u59-windows-*'
+  # From build.yml (its release_tag input): the tag to publish under.
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
 
 permissions:
   contents: write
@@ -109,7 +115,7 @@ jobs:
             -DKYTY_PGO_USE=%PGO_PROFILE% ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=%GITHUB_REPOSITORY% ^
-            -DKYTY_RELEASE_TAG=${{ github.ref_name }} ^
+            -DKYTY_RELEASE_TAG=${{ inputs.tag || github.ref_name }} ^
             -DCMAKE_C_COMPILER=%LLVM%/clang-cl.exe ^
             -DCMAKE_CXX_COMPILER=%LLVM%/clang-cl.exe ^
             -DCMAKE_LINKER=%LLVM%/lld-link.exe ^
@@ -184,7 +190,7 @@ jobs:
           Copy-Item -Path '3rdparty/tracy/profiler/src/font/Roboto-*.ttf' -Destination $fonts
           if (@(Get-ChildItem -LiteralPath $fonts -Filter 'Roboto-*.ttf').Count -ne 4) { throw 'Expected four Roboto fonts.' }
           Copy-Item -LiteralPath '3rdparty/SPIRV-Tools/LICENSE' -Destination (Join-Path $fonts 'LICENSE-Apache-2.0.txt')
-          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-AstroBot-DLSSG-${{ github.ref_name }}-Windows-x64.zip'
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'KytyPS5-AstroBot-DLSSG-${{ inputs.tag || github.ref_name }}-Windows-x64.zip'
           Compress-Archive -Path $release -DestinationPath $archive
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -193,7 +199,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create '${{ github.ref_name }}' 'KytyPS5-AstroBot-DLSSG-${{ github.ref_name }}-Windows-x64.zip' --prerelease `
+          gh release create '${{ inputs.tag || github.ref_name }}' 'KytyPS5-AstroBot-DLSSG-${{ inputs.tag || github.ref_name }}-Windows-x64.zip' --prerelease `
             --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA `
-            --title 'Astro Bot DLSS frame generation (${{ github.ref_name }}, experimental)' `
+            --title 'Astro Bot DLSS frame generation (${{ inputs.tag || github.ref_name }}, experimental)' `
             --notes-file 'docs/ASTRO-BOT-DLSSG.md'
