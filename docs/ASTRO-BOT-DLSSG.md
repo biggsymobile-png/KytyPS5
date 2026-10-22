@@ -59,7 +59,14 @@ Use the **NVIDIA overlay** (Alt+R) to see the frame rate on screen: it counts th
 frames. The emulator's own counter shows the game's real frame rate, which DLSS-G does not
 change.
 
-## Settings (environment variables)
+## Settings
+
+This build is made like Jetsku's U59 releases (profile-guided optimisation trained on Astro Bot,
+the emulator's diagnostics compiled out) and ships Jetsku's tuned **`u59-preset.json`** next to
+the launcher. While that file is there, the launcher **ignores `KYTY_...` environment variables**
+and uses the file instead: add settings to it, one `"NAME": "value",` line each, for example
+`"KYTY_FRAMEGEN": "2",` or `"KYTY_VRAM_BUDGET_MB": "12000",`.
+
 
 | Variable | Effect |
 |---|---|
