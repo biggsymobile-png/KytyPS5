@@ -823,6 +823,10 @@ static void WindowCreate(WindowContext& context) {
 	}
 	// DLSS frame generation: Streamline becomes SDL's Vulkan loader (before the window loads it).
 	Libs::Graphics::FrameGen::Initialize();
+	// (SDL3 reads hints from an environment copy made at its start: told directly.)
+	if (const char* loader = Libs::Graphics::FrameGen::VulkanLoaderPath(); loader != nullptr) {
+		SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, loader);
+	}
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 

@@ -1799,6 +1799,7 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not load Vulkan: %s\n", SDL_GetError());
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+	FrameGen::NoteVulkanLoader(reinterpret_cast<void*>(get_instance_proc_addr));
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);

@@ -56,6 +56,12 @@ struct FrameInputs {
 // Process start, before SDL makes the Vulkan window: loads Streamline (it then becomes SDL's
 // Vulkan loader, and so the proxy of the instance, device and swapchain calls).
 void Initialize();
+// After Initialize: the Vulkan loader SDL must load (Streamline's interposer, UTF-8), or null.
+// SDL3 reads its hints from an environment copy made at its start, so the window code sets it
+// with SDL_SetHint (SDL_HINT_VULKAN_LIBRARY) before the window loads Vulkan.
+[[nodiscard]] const char* VulkanLoaderPath();
+// The vkGetInstanceProcAddr SDL loaded: logs which DLL it is (Streamline's interposer, or not).
+void NoteVulkanLoader(void* get_instance_proc_addr);
 // Streamline is loaded and frame generation asked for.
 [[nodiscard]] bool Requested();
 // Before the device: why DLSS-G cannot run with this GPU, driver and Windows (logged); empty

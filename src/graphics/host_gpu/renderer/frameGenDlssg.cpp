@@ -52,6 +52,7 @@ int  g_generate = 0;     // frames to generate per rendered frame (0 = off)
 bool g_loaded   = false; // Streamline loaded (Initialize)
 std::atomic<bool> g_ready {false}; // ... and DLSS-G's functions found (OnDevice or the first present)
 bool g_device_ok = false;           // DLSS-G supported and loaded on the device (OnDevice)
+std::string g_loader_path;          // Streamline's interposer, UTF-8 (VulkanLoaderPath)
 
 // GPU thread: what the current guest frame has drawn so far.
 struct Gathered {
@@ -465,6 +466,10 @@ void Initialize() {
 	// then goes through Streamline, which adds what DLSS-G needs.
 	SetEnvironmentVariableW(L"SDL_VULKAN_LIBRARY", interposer.c_str());
 	_putenv_s("SDL_VULKAN_LIBRARY", interposer.string().c_str());
+	{
+		const auto utf8 = interposer.u8string();
+		g_loader_path.assign(reinterpret_cast<const char*>(utf8.data()), utf8.size());
+	}
 	g_loaded = true;
 	LOGF("frame generation: Streamline loaded from %s, %d generated frame(s)\n", dir.string().c_str(),
 	     g_generate);
@@ -473,6 +478,30 @@ void Initialize() {
 	std::fflush(stdout);
 #else
 	LOGF("frame generation: this build has no Streamline support\n");
+#endif
+}
+
+const char* VulkanLoaderPath() {
+	return g_loaded && !g_loader_path.empty() ? g_loader_path.c_str() : nullptr;
+}
+
+void NoteVulkanLoader(void* get_instance_proc_addr) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_loaded || get_instance_proc_addr == nullptr) return;
+	HMODULE module = nullptr;
+	wchar_t name[MAX_PATH] {};
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       static_cast<LPCWSTR>(get_instance_proc_addr), &module) &&
+	    GetModuleFileNameW(module, name, MAX_PATH) != 0) {
+		const auto file = std::filesystem::path(name).filename();
+		const bool streamline = _wcsicmp(file.c_str(), L"sl.interposer.dll") == 0;
+		std::printf("Frame generation: Vulkan is loaded from %s%s\n", file.string().c_str(),
+		            streamline ? " (Streamline's interposer, as needed)"
+		                       : " - not Streamline's interposer: DLSS-G cannot start");
+		std::fflush(stdout);
+	}
+#else
+	(void)get_instance_proc_addr;
 #endif
 }
 
