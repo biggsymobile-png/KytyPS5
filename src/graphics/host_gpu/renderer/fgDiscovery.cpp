@@ -12,13 +12,25 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics::FgDiscovery {
 
 namespace {
 
 constexpr uint32_t SrtDwords      = 96; // enough for a few 4x4 matrices at the start of an SRT
-constexpr uint32_t UserDataDwords = 16;
+constexpr uint32_t UserDataDwords = 32;
+constexpr uint32_t BufferDwords   = 256; // per bound buffer of a watched shader
+constexpr uint32_t WatchedPerFrame = 3;  // draws per watched shader per frame with buffers
+
+constexpr uint64_t WatchedShaders[] = {
+    0x2936e5eca99d75e7ull, // TAA pixel shader
+    0xed17fd5af4ea9b3full, // TAA vertex shader
+    0xe5398a1c6007f356ull, // vertex shaders drawing the most into the motion target
+    0x653419a369aa2c03ull, 0x2e0b0b583b5a02f6ull, 0x8e4a146647cf8029ull,
+};
 
 struct Settings {
 	bool enabled = true;
@@ -50,6 +62,7 @@ std::mutex g_mutex;
 FILE*      g_file       = nullptr;
 bool       g_failed     = false;
 int        g_last_frame = -1;
+std::unordered_map<uint64_t, uint32_t> g_watched_this_frame;
 
 std::atomic<int>  g_frame {0};
 std::atomic<bool> g_recording {false};
@@ -84,6 +97,7 @@ FILE* Begin(int frame) {
 		            error ? "fg-discovery.txt" : path.string().c_str());
 	}
 	if (frame != g_last_frame) {
+		g_watched_this_frame.clear();
 		std::fprintf(g_file, "\n=== frame %d\n", frame);
 		std::fflush(g_file);
 		g_last_frame = frame;
@@ -131,6 +145,24 @@ void PrintStage(FILE* f, char kind, const ShaderStageRuntime& stage, const Prepa
 		PrintDwords(f, "  ud", stage.resources->user_data, UserDataDwords);
 		PrintDwords(f, "  srt", stage.resources->flattened_srt, SrtDwords);
 	}
+	if (Watched(program.shader_hash) && g_watched_this_frame[program.shader_hash]++ < WatchedPerFrame) {
+		// Guest memory is mapped at the same addresses in the emulator: the buffers as the CPU last
+		// wrote them (constants are written by the CPU).
+		for (size_t i = 0; i < bindings.buffer_sources.size(); ++i) {
+			const auto& source = bindings.buffer_sources[i];
+			std::fprintf(f, "    buf%zu @%" PRIx64 " size %" PRIu64 "\n", i, source.address, source.size);
+			if (source.address < 0x10000 || source.size < 4) continue;
+			const auto  count = std::min<uint64_t>(source.size / 4, BufferDwords);
+			const auto* words = reinterpret_cast<const uint32_t*>(source.address);
+			for (uint64_t w = 0; w < count; w += 8) {
+				std::fprintf(f, "      %04" PRIx64 ":", w * 4);
+				for (uint64_t k = w; k < std::min<uint64_t>(w + 8, count); ++k) {
+					std::fprintf(f, " %08" PRIx32, words[k]);
+				}
+				std::fputc('\n', f);
+			}
+		}
+	}
 }
 
 } // namespace
@@ -155,6 +187,28 @@ void OnGuestFlip() {
 
 bool Recording() {
 	return g_recording.load(std::memory_order_relaxed);
+}
+
+bool Watched(uint64_t shader_hash) {
+	if (!GetSettings().enabled) return false;
+	return std::find(std::begin(WatchedShaders), std::end(WatchedShaders), shader_hash) !=
+	       std::end(WatchedShaders);
+}
+
+void OnShaderDecoded(uint64_t shader_hash, const char* stage, const std::string& text) {
+	if (!Watched(shader_hash)) return;
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> written;
+	std::lock_guard lock(mutex);
+	if (!written.insert(shader_hash).second) return;
+	char name[64];
+	std::snprintf(name, sizeof(name), "fg-shader-%016" PRIx64 ".txt", shader_hash);
+	if (FILE* f = std::fopen(name, "w")) {
+		std::fprintf(f, "# %s shader %016" PRIx64 "\n", stage != nullptr ? stage : "", shader_hash);
+		std::fputs(text.c_str(), f);
+		std::fclose(f);
+		std::printf("FG discovery: wrote %s\n", name);
+	}
 }
 
 void OnDispatch(const ShaderStageRuntime& stage, const PreparedBindings& bindings,

@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -42,6 +43,12 @@ struct DrawStage {
 	const ShaderStageRuntime* stage    = nullptr;
 	const PreparedBindings*   bindings = nullptr;
 };
+
+// Shaders whose code (decoded) and bound buffers (first dwords) are also written: Astro Bot's TAA
+// (VS ed17fd5a, PS 2936e5ec) and the vertex shaders that draw most into its motion target.
+[[nodiscard]] bool Watched(uint64_t shader_hash);
+// The decoded guest code of a watched shader, written once to fg-shader-<hash>.txt.
+void OnShaderDecoded(uint64_t shader_hash, const char* stage, const std::string& text);
 
 void OnDraw(std::span<const DrawStage> stages, std::span<const RenderColorInfo> colors,
             const RenderDepthInfo& depth);

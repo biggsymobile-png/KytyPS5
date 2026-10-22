@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/fgDiscovery.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -834,6 +835,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		return skipped;
 	}
 
+	if (FgDiscovery::Watched(options.shader_hash)) [[unlikely]] {
+		FgDiscovery::OnShaderDecoded(options.shader_hash, GetDumpLabel(options),
+		                             Decoder::ProgramToString(decoded));
+	}
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
