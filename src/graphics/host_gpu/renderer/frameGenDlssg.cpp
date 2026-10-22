@@ -50,7 +50,8 @@ constexpr uint32_t ViewConstantsBytes = 576; // docs/RE-ASTRO-BOT-FG.md
 
 int  g_generate = 0;     // frames to generate per rendered frame (0 = off)
 bool g_loaded   = false; // Streamline loaded (Initialize)
-bool g_ready    = false; // ... and DLSS-G available on the device (OnDevice)
+std::atomic<bool> g_ready {false}; // ... and DLSS-G's functions found (OnDevice or the first present)
+bool g_device_ok = false;           // DLSS-G supported and loaded on the device (OnDevice)
 
 // GPU thread: what the current guest frame has drawn so far.
 struct Gathered {
@@ -296,18 +297,6 @@ void LogMessage(sl::LogType type, const char* message) {
 	LOGF("Streamline: %s", message);
 }
 
-template <typename F>
-bool FeatureFunction(sl::Feature feature, const char* name, F*& function) {
-	void* pointer = nullptr;
-	if (g_api.get_feature_function(feature, name, pointer) != sl::Result::eOk || pointer == nullptr) {
-		LOGF("frame generation: %s missing\n", name);
-		std::printf("Frame generation: Streamline has no %s\n", name);
-		return false;
-	}
-	function = reinterpret_cast<F*>(pointer);
-	return true;
-}
-
 // The file is signed by NVIDIA (Streamline then checks its plugins' signatures itself).
 bool IsNvidiaSigned(const std::wstring& path) {
 	WINTRUST_FILE_INFO file {};
@@ -337,6 +326,43 @@ bool IsNvidiaSigned(const std::wstring& path) {
 	data.dwStateAction = WTD_STATEACTION_CLOSE;
 	(void)WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action, &data);
 	return nvidia;
+}
+
+// DLSS-G's, Reflex's and PCL's functions, then DLSS-G ready. `report`: say what is missing.
+bool FindFunctions(bool report) {
+	if (g_ready.load(std::memory_order_relaxed)) return true;
+	if (!g_device_ok) return false;
+	const auto find = [&](sl::Feature feature, const char* name, auto*& function) {
+		void* pointer = nullptr;
+		if (g_api.get_feature_function(feature, name, pointer) != sl::Result::eOk || pointer == nullptr) {
+			if (report) {
+				std::printf("Frame generation: Streamline has no %s\n", name);
+				std::fflush(stdout);
+			}
+			return false;
+		}
+		function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(pointer);
+		return true;
+	};
+	if (!find(sl::kFeatureDLSS_G, "slDLSSGSetOptions", g_api.dlssg_set_options) ||
+	    !find(sl::kFeatureDLSS_G, "slDLSSGGetState", g_api.dlssg_get_state) ||
+	    !find(sl::kFeatureReflex, "slReflexSetOptions", g_api.reflex_set_options) ||
+	    !find(sl::kFeaturePCL, "slPCLSetMarker", g_api.pcl_set_marker)) {
+		return false;
+	}
+	(void)find(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
+	// (Required with DLSS-G, whatever the Reflex mode: Streamline's DLSS-G and Reflex guides.)
+	sl::ReflexOptions reflex {};
+	reflex.mode = sl::ReflexMode::eLowLatency;
+	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
+		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
+	}
+	g_ready.store(true, std::memory_order_relaxed);
+	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame); it turns on in "
+	            "the game's 3D view\n",
+	            g_generate);
+	std::fflush(stdout);
+	return true;
 }
 #endif
 
@@ -448,7 +474,7 @@ bool Requested() {
 }
 
 bool Enabled() {
-	return g_ready;
+	return g_ready.load(std::memory_order_relaxed);
 }
 
 std::string SupportProblem(vk::PhysicalDevice physical_device) {
@@ -561,24 +587,10 @@ void OnDevice(vk::PhysicalDevice physical_device) {
 		std::fflush(stdout);
 		return;
 	}
-	if (!FeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", g_api.dlssg_set_options) ||
-	    !FeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", g_api.dlssg_get_state) ||
-	    !FeatureFunction(sl::kFeatureReflex, "slReflexSetOptions", g_api.reflex_set_options) ||
-	    !FeatureFunction(sl::kFeaturePCL, "slPCLSetMarker", g_api.pcl_set_marker)) {
-		return;
-	}
-	(void)FeatureFunction(sl::kFeatureReflex, "slReflexSleep", g_api.reflex_sleep);
-	// (Required with DLSS-G, whatever the Reflex mode: Streamline's DLSS-G and Reflex guides.)
-	sl::ReflexOptions reflex {};
-	reflex.mode = sl::ReflexMode::eLowLatency;
-	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
-		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
-	}
-	g_ready = true;
-	std::printf("Frame generation: DLSS-G ready (%d generated frame(s) per frame); it turns on in "
-	            "the game's 3D view\n",
-	            g_generate);
-	std::fflush(stdout);
+	g_device_ok = true;
+	// (Streamline's feature functions exist once DLSS-G is set up on the device; if not yet, the
+	// first present asks again, its swapchain made by then.)
+	(void)FindFunctions(false);
 #else
 	(void)physical_device;
 #endif
@@ -702,7 +714,11 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Format format,
                    uint32_t image_count) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-	if (!g_ready) return;
+	if (!g_ready.load(std::memory_order_relaxed)) {
+		// (The swapchain exists now; asked once more, then reported.)
+		static uint32_t attempts = 0;
+		if (!g_device_ok || attempts > 2 || !FindFunctions(++attempts > 2)) return;
+	}
 	const sl::ViewportHandle viewport {0};
 	const bool               usable = inputs != nullptr && inputs->valid;
 	g_run_with    = usable ? g_run_with + 1 : 0;

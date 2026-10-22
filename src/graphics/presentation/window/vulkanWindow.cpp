@@ -2092,7 +2092,6 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	// Before the profiler's and recorder's hooks copy the dispatcher's entries.
 	FrameGen::BypassCommandHooks(graphic_ctx.device);
-	FrameGen::OnDevice(graphic_ctx.physical_device);
 	// Diagnostic only (KYTY_GPU_OP_PROFILE / KYTY_GPU_OP_COUNTERS): wraps dispatcher entries.
 	GpuOpProfiler::InstallHooks(graphic_ctx);
 	// KYTY_CP_RECORDER_VERIFY ownership hooks wrap the GpuOpProfiler's.
@@ -2116,6 +2115,9 @@ void WindowContext::CreateVulkan() {
 		PrintDeviceReport(graphic_ctx);
 	}
 	LogStabilitySwitches(graphic_ctx);
+
+	// (After the device's queues: Streamline sets up DLSS-G as they are fetched.)
+	FrameGen::OnDevice(graphic_ctx.physical_device);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
