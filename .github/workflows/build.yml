@@ -2,6 +2,11 @@ name: Build and Release KytyPS5
 
 on:
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Build only the Windows package
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -146,6 +151,7 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
+    if: ${{ !inputs.windows_only }}
     needs: metadata
     runs-on: macos-15
 
@@ -302,6 +308,7 @@ jobs:
 
   linux:
     name: Build KytyPS5 (Linux)
+    if: ${{ !inputs.windows_only }}
     needs: metadata
     runs-on: ubuntu-24.04
 
