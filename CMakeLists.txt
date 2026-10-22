@@ -2638,7 +2638,3 @@ endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
 endif()
-if(WIN32)
-	# Frame-generation discovery run (src/graphics/host_gpu/renderer/fgDiscovery.h).
-	install(FILES "${CMAKE_SOURCE_DIR}/fg-discover.bat" DESTINATION .)
-endif()

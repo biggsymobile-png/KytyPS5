@@ -21,8 +21,8 @@ constexpr uint32_t SrtDwords      = 96; // enough for a few 4x4 matrices at the 
 constexpr uint32_t UserDataDwords = 16;
 
 struct Settings {
-	bool enabled = false;
-	int  start   = 1200;
+	bool enabled = true;
+	int  start   = 3600;
 	int  every   = 600;
 	int  count   = 8;
 };
@@ -37,7 +37,7 @@ const Settings& GetSettings() {
 	static const Settings settings = [] {
 		Settings s;
 		const char* value = std::getenv("KYTY_FG_DISCOVER");
-		s.enabled = value != nullptr && value[0] != '\0' && value[0] != '0';
+		s.enabled = value == nullptr || value[0] == '\0' || value[0] != '0';
 		s.start   = EnvInt("KYTY_FG_DISCOVER_START", s.start);
 		s.every   = std::max(2, EnvInt("KYTY_FG_DISCOVER_EVERY", s.every));
 		s.count   = EnvInt("KYTY_FG_DISCOVER_COUNT", s.count);
@@ -51,8 +51,8 @@ FILE*      g_file       = nullptr;
 bool       g_failed     = false;
 int        g_last_frame = -1;
 
-std::atomic<int>  g_cached_frame {-1};
-std::atomic<bool> g_cached_value {false};
+std::atomic<int>  g_frame {0};
+std::atomic<bool> g_recording {false};
 
 bool Decide(int frame) {
 	const auto& s = GetSettings();
@@ -135,22 +135,33 @@ void PrintStage(FILE* f, char kind, const ShaderStageRuntime& stage, const Prepa
 
 } // namespace
 
-bool Recording(int frame) {
-	if (!GetSettings().enabled) return false;
-	if (g_cached_frame.load(std::memory_order_relaxed) == frame) {
-		return g_cached_value.load(std::memory_order_relaxed);
+void OnGuestFlip() {
+	const auto& settings = GetSettings();
+	if (!settings.enabled) return;
+	const int frame = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (frame == 1) {
+		std::printf("FG discovery: on, recording starts at frame %d (8 snapshots, %d frames apart)\n",
+		            settings.start, settings.every);
 	}
-	const bool value = Decide(frame);
-	g_cached_value.store(value, std::memory_order_relaxed);
-	g_cached_frame.store(frame, std::memory_order_relaxed);
-	return value;
+	const bool recording = Decide(frame);
+	if (recording && !g_recording.load(std::memory_order_relaxed)) {
+		std::printf("FG discovery: recording frames %d-%d\n", frame, frame + 1);
+	}
+	if (frame == settings.start + settings.every * std::max(settings.count - 1, 0) + 2) {
+		std::printf("FG discovery: finished, you can close the game\n");
+	}
+	g_recording.store(recording, std::memory_order_relaxed);
 }
 
-void OnDispatch(int frame, const ShaderStageRuntime& stage, const PreparedBindings& bindings,
+bool Recording() {
+	return g_recording.load(std::memory_order_relaxed);
+}
+
+void OnDispatch(const ShaderStageRuntime& stage, const PreparedBindings& bindings,
                 uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, bool indirect) {
-	if (!stage || !Recording(frame)) return;
+	if (!stage || !Recording()) return;
 	std::lock_guard lock(g_mutex);
-	FILE* f = Begin(frame);
+	FILE* f = Begin(g_frame.load(std::memory_order_relaxed));
 	if (f == nullptr) return;
 	if (indirect) {
 		std::fputs("C indirect\n", f);
@@ -160,11 +171,11 @@ void OnDispatch(int frame, const ShaderStageRuntime& stage, const PreparedBindin
 	PrintStage(f, 'C', stage, bindings);
 }
 
-void OnDraw(int frame, std::span<const DrawStage> stages, std::span<const RenderColorInfo> colors,
+void OnDraw(std::span<const DrawStage> stages, std::span<const RenderColorInfo> colors,
             const RenderDepthInfo& depth) {
-	if (!Recording(frame)) return;
+	if (!Recording()) return;
 	std::lock_guard lock(g_mutex);
-	FILE* f = Begin(frame);
+	FILE* f = Begin(g_frame.load(std::memory_order_relaxed));
 	if (f == nullptr) return;
 	std::fputs("D\n", f);
 	for (size_t i = 0; i < colors.size(); ++i) {
