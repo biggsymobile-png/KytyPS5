@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/fgDiscovery.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
@@ -3886,6 +3887,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::PrepareGraphicsBindings");
 		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count},
 		                        m_run_active);
+	}
+	if (const int fg_frame = m_context.GetGpu().GetFrameNum(); FgDiscovery::Recording(fg_frame))
+	    [[unlikely]] {
+		std::array<FgDiscovery::DrawStage, 4> fg_stages {};
+		uint32_t                              fg_count = 0;
+		for (uint32_t i = 0; i < vertex_stages.size() && fg_count < 3; i++) {
+			fg_stages[fg_count++] = {'V', &state.vertex_info[i].stage, &bindings.vertex[i]};
+		}
+		if (state.ps_active && bindings.pixel) {
+			fg_stages[fg_count++] = {'P', &state.ps_input_info.stage, &*bindings.pixel};
+		}
+		FgDiscovery::OnDraw(fg_frame, std::span {fg_stages.data(), fg_count},
+		                    std::span {state.color_info, state.color_count}, state.depth_info);
 	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;

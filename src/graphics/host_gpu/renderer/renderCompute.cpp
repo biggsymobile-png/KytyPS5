@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/fgDiscovery.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
@@ -523,6 +524,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	BindComputeLds(input_info, bindings, input_info.workgroup_counts);
 	RebindBuffers(bindings);
+	FgDiscovery::OnDispatch(m_context.GetGpu().GetFrameNum(), input_info.stage, bindings,
+	                        thread_group_x, thread_group_y, thread_group_z, false);
 	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 
 	PreparedBindings* descriptor_stage = &bindings;
@@ -773,6 +776,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	FgDiscovery::OnDispatch(m_context.GetGpu().GetFrameNum(), input_info.stage, bindings, 0, 0, 0,
+	                        true);
 	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).
