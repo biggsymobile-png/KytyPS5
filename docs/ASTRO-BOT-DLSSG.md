@@ -91,9 +91,12 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 - **Frame generation does not fix game slowdown.** If the game itself runs below the frame rate
   its patches expect, it still slows down; DLSS-G only adds frames on top of what is rendered.
 - Generated frames need a decent base frame rate: about 40 fps or more looks good.
-- Experimental: setting `KYTY_CUDA_EARLY_INIT=1` (for NVIDIA Smooth Motion) puts CUDA's memory
-  above 512 GiB in this build, inside the emulator's address range. Astro Bot does not use that
-  part of it, but other games might. Leave it unset with DLSS-G.
+- The bundled `u59-preset.json` turns on `KYTY_CUDA_EARLY_INIT` (CUDA set up before the
+  emulator's memory): without it an RTX 5080 refused the Vulkan device with Streamline ("Could not
+  create device"). In this build CUDA's memory then sits above 512 GiB, inside the emulator's
+  address range; Astro Bot does not use that part of it, but other games might. If the device is
+  still refused, set Bottom-up ASLR on for kyty_emulator.exe in Windows Security > App & browser
+  control > Exploit protection > Program settings.
 
 ## Reporting problems
 
