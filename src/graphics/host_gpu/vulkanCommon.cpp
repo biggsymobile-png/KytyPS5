@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
+#include "graphics/host_gpu/spirvBitcastFold.h"
 #include "graphics/host_gpu/spirvLocalArrays.h"
 #include "graphics/host_gpu/vramStats.h"
 
@@ -247,6 +248,16 @@ std::vector<uint32_t> ShrinkFunctionArrays(std::span<const uint32_t> code, uint6
 
 } // namespace
 
+// KYTY_SPIRV_BITCAST_FOLD=0: give the driver the module with its redundant OpBitcasts
+// (spirvBitcastFold.h; default 1).
+static bool BitcastFoldEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SPIRV_BITCAST_FOLD");
+		return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	std::vector<uint32_t> shrunk;
 	uint64_t              declared = 0;
@@ -264,6 +275,10 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	}
 	if (VramStats::Enabled()) {
 		VramStats::NoteFunctionStorage(declared, created);
+	}
+	std::vector<uint32_t> folded;
+	if (BitcastFoldEnabled() && SpirvBitcastFold::Fold(code, folded).changed) {
+		code = folded;
 	}
 	// Startup diagnostic; the program cache retains unsalted code. Only driver input changes.
 	static const uint32_t salt = [] {

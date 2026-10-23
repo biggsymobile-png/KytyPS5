@@ -157,7 +157,8 @@ inline constexpr uint32_t kMinGeneralProcessors = 6;
 // the fastest class's processors, the P-cores, and cold threads (background pipeline optimisation,
 // shader precompile and journal replay, cache savers, file I/O, monitors) on the other ones, the
 // E-cores. `dual` false when every processor has the same class.
-// KYTY_HYBRID_PLACEMENT=0 turns the detection off (default 1); KYTY_VCACHE_PLACEMENT (auto by
+// KYTY_HYBRID_PLACEMENT=1 turns the detection on (default off: much slower on an
+// i7-13700K in Astro Bot); KYTY_VCACHE_PLACEMENT (auto by
 // default: only without an external CPU-set or affinity rule) then decides as for an X3D.
 [[nodiscard]] VCacheTopology DetectHybrid(const std::vector<CpuSetInfo>& sets);
 // Pure (tested): whether the V-cache placement applies. `external_rule`: an affinity or CPU-set

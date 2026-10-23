@@ -712,10 +712,11 @@ void PublishTopology(const std::vector<CpuSetInfo>& sets) {
 }
 
 #if defined(_WIN32)
-// KYTY_HYBRID_PLACEMENT=0: Intel hybrid CPUs are left as they are (default 1: DetectHybrid).
+// KYTY_HYBRID_PLACEMENT=1: Intel hybrid CPUs get the P-core/E-core placement (DetectHybrid).
+// Default off: on an i7-13700K Astro Bot ran much worse with it.
 bool HybridPlacementEnabled() {
 	const auto* value = EnvValue("KYTY_HYBRID_PLACEMENT");
-	return value == nullptr || (value[0] != '0' && std::strcmp(value, "off") != 0);
+	return value != nullptr && value[0] != '0' && std::strcmp(value, "off") != 0;
 }
 #endif
 
