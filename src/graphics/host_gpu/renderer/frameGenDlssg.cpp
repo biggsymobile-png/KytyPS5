@@ -227,11 +227,11 @@ using Mat4 = sl::float4x4;
 // The previous presented frame's world-to-clip (unjittered), for clipToPrevClip.
 Mat4 g_previous_view_proj;
 bool g_previous_valid = false;
-// The last presented frame's inputs (their images belong to a presenter frame): a present without
-// inputs while DLSS-G is on (a repeated or held guest frame) tags them again with zero motion
-// instead of none, which made Streamline log "Failed to find global tag" and reset DLSS-G.
-FrameInputs g_last_inputs;
-bool        g_last_inputs_valid = false;
+// The last presented frame's inputs (owned by its presenter frame, which outlives this pointer:
+// DestroyInputs and SwapchainChanging clear it): a present without inputs while DLSS-G is on (a
+// repeated or held guest frame) tags them again with zero motion instead of none, which made
+// Streamline log "Failed to find global tag" and reset DLSS-G.
+const FrameInputs* g_last_inputs = nullptr;
 
 Mat4 FromColumnMajor(const std::array<float, 16>& m) {
 	Mat4 r;
@@ -756,8 +756,8 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 		}
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-	if (g_last_inputs_valid && g_last_inputs.depth.image == inputs.depth.image) {
-		g_last_inputs_valid = false;
+	if (g_last_inputs == &inputs) {
+		g_last_inputs = nullptr;
 	}
 #endif
 	inputs.valid = false;
@@ -846,12 +846,12 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 	constants.motionVectorsDilated   = sl::Boolean::eFalse;
 	constants.motionVectorsJittered  = sl::Boolean::eFalse;
 	// A frame without inputs while DLSS-G is on: the last inputs again, as a still frame.
-	const bool         held   = !usable && g_mode_on && g_last_inputs_valid;
-	const FrameInputs* tagged = usable ? inputs : held ? &g_last_inputs : nullptr;
+	const bool held = !usable && g_mode_on && g_last_inputs != nullptr &&
+	                  g_last_inputs->depth.image != nullptr && g_last_inputs->motion.image != nullptr;
+	const FrameInputs* tagged = usable ? inputs : held ? g_last_inputs : nullptr;
 	bool               reset  = tagged == nullptr;
 	if (usable) {
-		g_last_inputs       = *inputs;
-		g_last_inputs_valid = true;
+		g_last_inputs = inputs;
 	}
 	if (tagged != nullptr) {
 		const auto& v = tagged->camera.view;
@@ -991,7 +991,7 @@ void AfterPresent() {
 void SwapchainChanging() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// Off before the swapchain is made again (DLSS-G guide: before a resize or a full screen change).
-	g_last_inputs_valid = false;
+	g_last_inputs = nullptr;
 	if (!g_ready || !g_mode_on) return;
 	sl::DLSSGOptions options {};
 	options.mode                = sl::DLSSGMode::eOff;

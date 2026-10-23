@@ -155,7 +155,7 @@ jobs:
         run: |
           # Job logs need a GitHub sign-in to read; annotations do not. Repeat the first error lines as annotations.
           if (Test-Path -LiteralPath 'pgo-build.log') {
-            $lines = @(Get-Content -LiteralPath 'pgo-build.log' | Select-String -Pattern 'error|FAILED|fatal' | Select-Object -First 8)
+            $lines = @(Get-Content -LiteralPath 'pgo-build.log' | Select-String -Pattern ': error|: fatal error|^FAILED:|error LNK|undefined symbol' | Select-Object -First 9)
             if (-not $lines) { $lines = @(Get-Content -LiteralPath 'pgo-build.log' | Select-Object -Last 8) }
             foreach ($line in $lines) { Write-Host ('::error::' + "$line".Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')) }
           } else { Write-Host '::error::pgo-build.log was not written' }
