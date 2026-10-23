@@ -1723,12 +1723,16 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 			return false;
 		case ValueOpcode::ConvertU32F32:
 			if (arg(0, a)) {
+				// Saturated as on the GPU (the relaxed float profile emits the bare conversion):
+				// NaN and negative values give 0, values past the range UINT32_MAX.
 				const auto value = Float32(a);
-				if (!std::isfinite(value) || value < 0.0f ||
-				    static_cast<double>(value) > UINT32_MAX) {
-					return false;
+				if (std::isnan(value) || value <= 0.0f) {
+					result = 0u;
+				} else if (static_cast<double>(value) >= 4294967296.0) {
+					result = UINT32_MAX;
+				} else {
+					result = static_cast<uint32_t>(value);
 				}
-				result = static_cast<uint32_t>(value);
 				return true;
 			}
 			return false;

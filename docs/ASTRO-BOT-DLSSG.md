@@ -75,7 +75,16 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FRAMEGEN=2` / `3` | 3x / 4x multi frame generation (RTX 50 only) |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
 | `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
+| `KYTY_FLOAT_PROFILE=relaxed` | Simpler shader maths (see below); `precise` is the default |
 | `KYTY_HYBRID_PLACEMENT=0` | Intel 12th-14th gen / Core Ultra: don't keep the game's threads on the P-cores (see below) |
+
+**Shader maths profile (`KYTY_FLOAT_PROFILE`, experimental):** `precise` (the default) copies the
+PS5 GPU's exact floating-point rules, which takes several instructions for things like min/max with
+NaNs, tiny (denormal) numbers and rounding modes. `relaxed` maps those to the PC GPU's own
+instructions instead: smaller shaders that compile and run a little faster, which can mean less
+stutter when new shaders appear. Most games never notice; if you see sparkles, black or white
+pixels, flicker or broken effects with it, go back to `precise`. The first start after changing it
+compiles the game's shaders again.
 
 **Intel hybrid CPUs (12th-14th gen Core, Core Ultra):** the emulator keeps the game's busy threads
 (the command processor, guest threads, draw preparation, presenting, the driver's) on the

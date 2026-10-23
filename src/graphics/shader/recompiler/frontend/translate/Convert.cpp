@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include "graphics/shader/recompiler/CodegenOptions.h"
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 IR::F32 Translator::SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value) {
@@ -8,6 +10,11 @@ IR::F32 Translator::SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 fals
 
 IR::U32 Translator::ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,
                                              uint32_t upper_result) {
+	// KYTY_FLOAT_PROFILE=relaxed: a full 32-bit conversion saturates on the host (0 for NaN and
+	// below zero, UINT32_MAX above), as on RDNA2. Narrower results keep their own clamp.
+	if (upper_result == 0xffffffffu && GetCodegenOptions().float_profile == FloatProfile::Relaxed) {
+		return IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32F32, {value}));
+	}
 	const auto zero = IR::F32(IR::Value::F32(0.0f));
 	const auto nan  = IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {value}));
 	const auto low  = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdLessThanEqual32, {value, zero}));
@@ -23,6 +30,9 @@ IR::U32 Translator::ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, f
 IR::U32 Translator::ConvertF32ToI32Saturated(IR::F32 value, float lower_bound, float upper_bound,
                                              float safe_upper, uint32_t lower_result,
                                              uint32_t upper_result) {
+	if (upper_result == 0x7fffffffu && GetCodegenOptions().float_profile == FloatProfile::Relaxed) {
+		return IR::U32(ir.Emit(IR::ValueOpcode::ConvertS32F32, {value}));
+	}
 	const auto nan = IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {value}));
 	const auto low = IR::U1(
 	    ir.Emit(IR::ValueOpcode::FPOrdLessThanEqual32, {value, IR::Value::F32(lower_bound)}));

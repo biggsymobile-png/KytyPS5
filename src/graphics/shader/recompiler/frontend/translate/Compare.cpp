@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include "graphics/shader/recompiler/CodegenOptions.h"
+
 #include <bit>
 #include <utility>
 
@@ -67,7 +69,8 @@ void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpc
 	const auto rhs =
 	    half ? IR::Value(ReadF16AsF32(inst.src1)) : ReadOperand(inst.src1, type);
 	const IR::FPCompareFlags flags{
-	    .flush_input_denorms = !half && type == IR::Type::F32 && flush_f32_inputs};
+	    .flush_input_denorms = !half && type == IR::Type::F32 && flush_f32_inputs &&
+	                           GetCodegenOptions().float_profile != FloatProfile::Relaxed};
 	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs}, flags)), false, cmpx);
 }
 
