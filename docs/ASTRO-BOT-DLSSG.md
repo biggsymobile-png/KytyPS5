@@ -73,7 +73,7 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FRAMEGEN=0` | Frame generation off |
 | `KYTY_FRAMEGEN=1` | 2x (default) |
 | `KYTY_FRAMEGEN=2` / `3` | 3x / 4x multi frame generation (RTX 50 only) |
-| `KYTY_FRAMEGEN_FPS_CAP=50` | Hold the real frame rate to at most 50 (or 60, ...): steadier frame pacing with frame generation |
+| `KYTY_FRAMEGEN_FPS_CAP=40` | Hold the real frame rate to at most 40: perfectly even 25 ms frames with a 120 Hz vblank (use a multiple of the vblank tick: 40 or 60 at 120 Hz) |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
 | `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
 | `KYTY_SPIRV_BITCAST_FOLD=0` | Give the driver shaders without the redundant-conversion cleanup (exact either way) |
@@ -98,6 +98,9 @@ emulator made, at most two frames old, instead of waiting for the GPU) and
 `KYTY_READBACK_FLUSH_SIDE`. In Astro Bot's first level the copy matched the fresh data for every
 read checked, and the frame rate went from about 50 to 54.5 fps at a 60 Hz vblank. Set either to
 `"0"` if a game misbehaves.
+
+The relaxed shader profile (`KYTY_FLOAT_PROFILE=relaxed`) is optional and less tested: use
+`precise` (the default) if you see crashes or broken effects.
 
 It also sets `KYTY_FAULT_AHEAD_ADAPT=512`, which halves the emulator's write faults (on an
 i7-13700K: 6.3 to 5.6 ms per frame). `KYTY_READ_FAULT_LEND` (lets copy loops read GPU-written
