@@ -222,6 +222,8 @@ public:
 	}
 	// Guest frame counter for hot-page detection (any thread, once per completed guest flip).
 	void AdvanceFrame() noexcept { m_frame.fetch_add(1, std::memory_order_relaxed); }
+	// The page manager the tracker protects through (BufferCache's read lending).
+	[[nodiscard]] PageManager& Pages() noexcept { return m_page_manager; }
 	[[nodiscard]] uint32_t Frame() const noexcept {
 		return m_frame.load(std::memory_order_relaxed);
 	}

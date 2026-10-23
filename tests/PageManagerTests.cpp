@@ -1033,6 +1033,51 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 
 } // namespace Libs::LibKernel::Memory
 
+
+// KYTY_READ_FAULT_LEND: a no-access (read-watched) page is lent read-only; writes stay blocked; a later
+// update of its watchers or EndLend protects it again; other pages are left alone.
+void TestLendRead() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *allocation = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(allocation);
+  const auto address = (allocation_base + region_size - 1) & ~(region_size - 1);
+  auto *memory = reinterpret_cast<uint8_t *>(address);
+
+  RegionBits read_mask;
+  read_mask.Set(0);
+  read_mask.Set(1);
+  manager.UpdatePageWatchers<true>(address + page_size * 2, page_size);
+  manager.UpdatePageWatchersForRegion<true, true>(address, read_mask);
+  Check(Protection(memory) == PAGE_NOACCESS && Protection(memory + page_size * 2) == PAGE_READONLY,
+        "lend setup protections");
+  // Page 2 (write-watched only) and page 3 (unwatched) are not lent.
+  Check(manager.LendRead(address + page_size * 2, page_size * 2) == 0, "lent a page that is not no-access");
+  Check(manager.LendRead(address, page_size) == 1 && Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size) == PAGE_NOACCESS,
+        "lend did not make exactly the page read-only");
+  Check(manager.LendRead(address, page_size) == 0, "a lent page was lent again");
+  manager.EndLend(address, page_size * 4);
+  Check(Protection(memory) == PAGE_NOACCESS && Protection(memory + page_size * 2) == PAGE_READONLY &&
+            IsWritable(memory + page_size * 3),
+        "end of lending did not restore the counts' protection");
+  // A watcher update that keeps the page no-access leaves the lending in place (EndLend ends it).
+  Check(manager.LendRead(address, page_size) == 1, "second lend");
+  manager.UpdatePageWatchers<true>(address, page_size);
+  manager.UpdatePageWatchers<false>(address, page_size);
+  manager.EndLend(address, page_size);
+  Check(Protection(memory) == PAGE_NOACCESS, "EndLend after a watcher update");
+  // Released read watchers: the lent page becomes what its counts ask (read-write here).
+  Check(manager.LendRead(address + page_size, page_size) == 1, "third lend");
+  manager.UpdatePageWatchersForRegion<false, true>(address, read_mask);
+  Check(IsWritable(memory) && IsWritable(memory + page_size), "released lent page not writable");
+  manager.EndLend(address, page_size * 2);
+  Check(IsWritable(memory + page_size), "EndLend after release tightened a released page");
+  manager.UpdatePageWatchers<false>(address + page_size * 2, page_size);
+  Check(VirtualFree(allocation, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -1046,6 +1091,7 @@ int main(int argc, char **argv) {
   TestCountWatchedPages();
   TestReadWriteWatcherInteractions();
   TestResyncHostProtection();
+  TestLendRead();
   TestConcurrentSharedWatchers();
   TestFatalPaths();
 

@@ -329,6 +329,24 @@ int64_t ParseReadFaultPublished(const char* value) {
 }
 Live::Switch g_read_fault_published("KYTY_READ_FAULT_PUBLISHED", ParseReadFaultPublished);
 
+// KYTY_READ_FAULT_LEND=1 (default 0; with KYTY_READ_FAULT_PUBLISHED=1): a copy loop over a page that
+// KYTY_READ_FAULT_PUBLISHED would serve one load at a time (each load a fault: after 8 within 1 ms
+// it waited for the GPU instead, the "copy burst" count) gets the page lent for reading:
+// PageManager::LendRead makes it read-only on the host while its tracker state stays GPU-owned, so
+// the loop reads the bytes last published without faulting; writes still fault. The conditions are
+// those of a served load (a buffer page, no image, published at most KYTY_READ_FAULT_PUBLISHED_FRAMES
+// guest frames ago), so the loop sees what the loads served one by one would have seen. Every guest
+// flip ends the frame's lendings (PageManager::EndLend), so a page's next read faults again and is
+// checked again; a page lent in the last 4 frames is lent at that first fault, without a new burst.
+// Astro Bot's render threads copy GPU-written pages this way ~75 times a second (2-3 ms waits each).
+bool ReadFaultLendEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_READ_FAULT_LEND");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 uint32_t ReadFaultPublishedFrames() {
 	static const uint32_t frames = [] {
 		const auto* value = std::getenv("KYTY_READ_FAULT_PUBLISHED_FRAMES");
@@ -346,6 +364,11 @@ struct ReadFaultPublishedState {
 	std::atomic<uint64_t>                  stale {0};
 	std::atomic<uint64_t>                  other {0};
 	std::atomic<uint64_t>                  burst {0};
+	std::atomic<uint64_t>                  lent {0};
+	// KYTY_READ_FAULT_LEND: pages lent this frame (ended at the next guest flip), and the frame each
+	// page was last lent in (a page lent recently is lent again at its first fault).
+	std::vector<uint64_t>                  lent_pages;
+	std::unordered_map<uint64_t, uint32_t> lent_frame;
 	std::atomic<uint64_t>                  verify_equal {0};
 	std::atomic<uint64_t>                  verify_different {0};
 	std::atomic<uint64_t>                  report_ns {0};
@@ -399,10 +422,11 @@ void ReportReadFaultPublished(uint32_t frame) {
 	const auto served = take(state.served);
 	std::printf("Kyty read-fault published 10s: %u frames, served %" PRIu64 " (%.2f/frame); waited: "
 	            "not a plain load %" PRIu64 ", image %" PRIu64 ", not published recently %" PRIu64
-	            ", other %" PRIu64 ", copy burst %" PRIu64 "; verify: equal %" PRIu64 ", different %" PRIu64 "\n",
+	            ", other %" PRIu64 ", copy burst %" PRIu64 "; lent %" PRIu64 "; verify: equal %" PRIu64
+	            ", different %" PRIu64 "\n",
 	            frames, served, static_cast<double>(served) / frames, take(state.undecodable),
-	            take(state.image), take(state.stale), take(state.other), take(state.burst), take(state.verify_equal),
-	            take(state.verify_different));
+	            take(state.image), take(state.stale), take(state.other), take(state.burst), take(state.lent),
+	            take(state.verify_equal), take(state.verify_different));
 }
 
 // The number of regions copies (source ascending) give when a copy starting at most `gap` bytes
@@ -1586,6 +1610,20 @@ void BufferCache::AdvanceFrame() noexcept {
 	FaultCost::AdvanceFrame();
 	// KYTY_FAULT_AHEAD_ADAPT, applied once per guest flip (the cost model moves slowly).
 	MemoryTracker::SetFaultAheadOverride(FaultAheadOverridePages());
+	// KYTY_READ_FAULT_LEND: the frame's lendings end; the next read of each page faults again.
+	if (ReadFaultLendEnabled()) {
+		std::vector<uint64_t> pages;
+		{
+			auto&           state = ReadFaultPublished();
+			std::lock_guard lock(state.mutex);
+			pages.swap(state.lent_pages);
+		}
+		std::sort(pages.begin(), pages.end());
+		pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+		for (const auto page: pages) {
+			m_memory_tracker.Pages().EndLend(page, TRACKER_PAGE_SIZE);
+		}
+	}
 }
 
 void BufferCache::EraseHotShadows(uint64_t vaddr, uint64_t size) {
@@ -1888,6 +1926,37 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		burst_count = burst_page == page && now_ns - burst_ns < 1'000'000 ? burst_count + 1 : 0;
 		burst_page  = page;
 		burst_ns    = now_ns;
+		// KYTY_READ_FAULT_LEND: a copy loop (or a page lent recently) reads the page lent instead.
+		const bool lend = published_mode == 1 && ReadFaultLendEnabled() && [&] {
+			if (burst_count >= 8) {
+				return true;
+			}
+			std::lock_guard lock(state.mutex);
+			const auto      found = state.lent_frame.find(page);
+			return found != state.lent_frame.end() && frame - found->second <= 4;
+		}();
+		if (lend && IsRegionGpuModifiedRelaxed(page, TRACKER_PAGE_SIZE) &&
+		    !m_texture_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) &&
+		    ReadFaultPublishedRecently(page, frame) &&
+		    m_memory_tracker.Pages().LendRead(page, TRACKER_PAGE_SIZE) != 0) {
+			{
+				std::lock_guard lock(state.mutex);
+				state.lent_pages.push_back(page);
+				state.lent_frame[page] = frame;
+				if (state.lent_frame.size() > 4096) {
+					std::erase_if(state.lent_frame, [frame](const auto& entry) { return frame - entry.second > 4; });
+				}
+			}
+			state.lent.fetch_add(1, std::memory_order_relaxed);
+			burst_count = 0;
+			// Keep the page read-hot so its eager copy keeps publishing the GPU's new bytes.
+			(void)m_scheduler.Context().GetGpu().TrySendCommand(
+			    [this, page] { NoteEagerRead(page, TRACKER_PAGE_SIZE, false); });
+			if (diag) {
+				diag->SetPath("lent");
+			}
+			return; // the load runs again and reads the lent page
+		}
 		if (burst_count >= 8) {
 			state.burst.fetch_add(1, std::memory_order_relaxed);
 		} else if (!GuestLoad::Decode(vaddr, load) ||

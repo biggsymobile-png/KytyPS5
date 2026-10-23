@@ -72,6 +72,19 @@ public:
 	// the guest address-space lock.
 	void ResyncHostProtection(uint64_t vaddr, uint64_t size);
 
+	// Read lending (KYTY_READ_FAULT_LEND, BufferCache::ReadMemory). Pages of [vaddr, vaddr + size)
+	// whose watchers ask for no access, are recorded as no access on the host and have no deferred
+	// protection pending become readable (host read-only, recorded as such), so the guest's loads
+	// read their backing bytes without faulting; writes still fault. An update that changes such a
+	// page's level (its read watchers released) sets the host protection from the counts as usual;
+	// one that keeps it no-access leaves the lending in place until EndLend, which the caller must
+	// call (BufferCache: at the next guest flip). Returns the pages lent. Any thread, outside the
+	// tracker's region locks.
+	[[nodiscard]] uint32_t LendRead(uint64_t vaddr, uint64_t size);
+	// Brings [vaddr, vaddr + size) back to what the watcher counts ask (ends a lending; pages
+	// already updated since are left as they are).
+	void EndLend(uint64_t vaddr, uint64_t size);
+
 	// Deferred write protections (KYTY_DEFER_PROTECTS, default off; the idea of peepostarexx's
 	// DEFER_PROTECTS, re-implemented on the watcher counts). While a DeferProtectsScope is active on
 	// a thread, a new write watcher that makes pages read-only only updates the counts, under the

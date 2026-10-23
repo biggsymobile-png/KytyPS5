@@ -1036,6 +1036,59 @@ void PageManager::ResyncHostProtection(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+uint32_t PageManager::LendRead(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE) {
+		return 0;
+	}
+	const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto end   = std::min(Common::AlignUp(vaddr + size, PAGE_SIZE), ADDRESS_SIZE);
+	uint32_t   lent  = 0;
+	for (auto chunk_begin = begin; chunk_begin < end;) {
+		const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+		const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+		const auto first       = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+		const auto last        = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+		auto*      region      = m_impl->FindRegion(chunk_begin);
+		chunk_begin            = chunk_end;
+		if (region == nullptr) {
+			continue; // not the tracker's protection
+		}
+		SpinGuard host(region->host_lock, FaultCost::Split::HostLock);
+		SpinGuard counts(region->lock);
+		for (size_t page = first; page < last; page++) {
+			if (region->applied[page] != Impl::Level::NoAccess ||
+			    Impl::ToLevel(region->pages[page].Perms()) != Impl::Level::NoAccess ||
+			    (region->pending_count != 0 && region->pending.test(page))) {
+				continue;
+			}
+			m_impl->Protect(region_base + page * PAGE_SIZE, PAGE_SIZE, Common::VirtualMemory::Mode::Read);
+			// Recorded as it is (looser than the counts): the next update of the page protects it again.
+			region->applied[page] = Impl::Level::Read;
+			lent++;
+		}
+	}
+	return lent;
+}
+
+void PageManager::EndLend(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid() || vaddr >= ADDRESS_SIZE) {
+		return;
+	}
+	const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto end   = std::min(Common::AlignUp(vaddr + size, PAGE_SIZE), ADDRESS_SIZE);
+	for (auto chunk_begin = begin; chunk_begin < end;) {
+		const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+		const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+		const auto first       = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+		const auto last        = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+		auto*      region      = m_impl->FindRegion(chunk_begin);
+		chunk_begin            = chunk_end;
+		if (region != nullptr) {
+			Impl::CountApplied(m_impl->ApplySpan(*region, region_base, first, last));
+		}
+	}
+}
+
 PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {
 	m_impl->owner = this;
 }
