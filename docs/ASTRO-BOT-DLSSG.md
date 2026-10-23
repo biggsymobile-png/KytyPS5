@@ -99,12 +99,10 @@ emulator made, at most two frames old, instead of waiting for the GPU) and
 read checked, and the frame rate went from about 50 to 54.5 fps at a 60 Hz vblank. Set either to
 `"0"` if a game misbehaves.
 
-It also sets `KYTY_READ_FAULT_LEND` (new in this build, experimental): when a game thread copies a
-whole page of such data in a loop, the page is made readable for the rest of that frame instead of
-waiting for the GPU (Astro Bot's first level did this about 75 times a second, 2-3 ms each), and
-`KYTY_FAULT_AHEAD_ADAPT=512`, which halves the emulator's write faults (on an i7-13700K: 6.3 to
-5.6 ms per frame). If you see flickering, objects in the wrong place for a frame or a crash, set
-`"KYTY_READ_FAULT_LEND": "0"` first.
+It also sets `KYTY_FAULT_AHEAD_ADAPT=512`, which halves the emulator's write faults (on an
+i7-13700K: 6.3 to 5.6 ms per frame). `KYTY_READ_FAULT_LEND` (lets copy loops read GPU-written
+pages without waiting) is in the build but off: in its first test Astro Bot lost the GPU device
+after about a minute, most likely because the game copied data one or two frames old.
 
 **Choppy frame pacing:** in the launcher's game settings set **Present mode** to `Fifo` (or
 `Immediate` on a G-Sync/FreeSync display); `Mailbox` throws frames away, generated ones included.
