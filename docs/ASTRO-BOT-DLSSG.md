@@ -88,6 +88,15 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FRAMEGEN_FPS_CAP=40` | With frame generation: Reflex limits the rendered frames to 40 fps (launcher: Frame rate limit) |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
 | `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
+| `KYTY_FLOAT_PROFILE=relaxed` | Simpler shader maths, see below (launcher: Shader maths) |
+
+**Shader maths profile (`KYTY_FLOAT_PROFILE`, experimental):** `precise` (the default) copies the
+PS5 GPU's exact floating-point rules, which takes several instructions for things like min/max with
+NaNs, tiny (denormal) numbers and rounding modes. `relaxed` maps those to the PC GPU's own
+instructions instead: smaller shaders that compile and run a little faster, which can mean less
+stutter when new shaders appear. Most games never notice; if you see sparkles, black or white
+pixels, flicker or broken effects with it, go back to `precise`. The first start after changing it
+compiles the game's shaders again.
 
 ## DLSS upscaling (experimental)
 
@@ -134,6 +143,7 @@ do), the emulator applies `u59-preset.json` from its folder itself, so add setti
 
 Batocera: run the community `install_ps5_kyty.sh` with this release's Linux file:
 `KYTY_URL=<the .tar.gz's download link> bash install_ps5_kyty.sh`.
+
 
 ## Known issues
 

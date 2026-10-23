@@ -168,6 +168,10 @@ bool FastFloatMinMax() {
 	return GetCodegenOptions().fast_float_min_max;
 }
 
+bool Relaxed() {
+	return GetCodegenOptions().float_profile == FloatProfile::Relaxed;
+}
+
 uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
                  std::initializer_list<uint32_t> args) {
 	const auto            result = state.builder.AllocateId();
@@ -175,6 +179,13 @@ uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
 	words.insert(words.end(), args.begin(), args.end());
 	state.builder.AddFunction(words);
 	return result;
+}
+
+// KYTY_FLOAT_PROFILE=relaxed: GLSL NMin/NMax return the non-NaN operand when one is NaN, as
+// RDNA2's non-IEEE min/max do; the order of signed zeros and denormal handling are the host's.
+uint32_t EmitRelaxedMinMax(EmitterState& state, uint32_t type, uint32_t lhs, uint32_t rhs,
+                           bool max_value) {
+	return EmitExt(state, type, max_value ? GLSLstd450NMax : GLSLstd450NMin, {lhs, rhs});
 }
 
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
@@ -212,6 +223,15 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 } // namespace
 uint32_t EmitFPMedTri32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1, IR::Value arg2) {
 	auto& state = ctx.state;
+	if (Relaxed()) {
+		const auto a        = ctx.Def(arg0);
+		const auto b        = ctx.Def(arg1);
+		const auto f32      = TypeF32(state);
+		const auto high_min = EmitRelaxedMinMax(state, f32, EmitRelaxedMinMax(state, f32, a, b, true),
+		                                        ctx.Def(arg2), false);
+		return EmitRelaxedMinMax(state, f32, EmitRelaxedMinMax(state, f32, a, b, false), high_min,
+		                         true);
+	}
 	if (FastFloatMinMax()) {
 		return EmitFastMedTri32(state, OperandF32(ctx, arg0), OperandF32(ctx, arg1),
 		                          OperandF32(ctx, arg2));
@@ -371,6 +391,12 @@ uint32_t EmitFastPackFloat2x16Rtz(EmitterState& state, uint32_t x, uint32_t y) {
 } // namespace
 
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	if (Relaxed()) {
+		const auto pair = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0,
+		                          arg1);
+		return EmitPackHalf2x16(state, pair);
+	}
 	if (GetCodegenOptions().fast_pkrtz) {
 		return EmitFastPackFloat2x16Rtz(state, arg0, arg1);
 	}
@@ -520,6 +546,9 @@ uint32_t EmitFPMad32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitFPMin32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1) {
+	if (Relaxed()) {
+		return EmitRelaxedMinMax(ctx.state, TypeF32(ctx.state), ctx.Def(arg0), ctx.Def(arg1), false);
+	}
 	if (FastFloatMinMax()) {
 		return EmitFastMinMaxF32(ctx.state, OperandF32(ctx, arg0), OperandF32(ctx, arg1), false)
 		    .id;
@@ -528,6 +557,9 @@ uint32_t EmitFPMin32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1) {
 }
 
 uint32_t EmitFPMax32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1) {
+	if (Relaxed()) {
+		return EmitRelaxedMinMax(ctx.state, TypeF32(ctx.state), ctx.Def(arg0), ctx.Def(arg1), true);
+	}
 	if (FastFloatMinMax()) {
 		return EmitFastMinMaxF32(ctx.state, OperandF32(ctx, arg0), OperandF32(ctx, arg1), true)
 		    .id;
@@ -536,14 +568,26 @@ uint32_t EmitFPMax32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1) {
 }
 
 uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	if (Relaxed()) {
+		return EmitRelaxedMinMax(state, TypeF64(state), arg0, arg1, false);
+	}
 	return EmitMinMaxF64(state, arg0, arg1, false);
 }
 
 uint32_t EmitFPMax64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	if (Relaxed()) {
+		return EmitRelaxedMinMax(state, TypeF64(state), arg0, arg1, true);
+	}
 	return EmitMinMaxF64(state, arg0, arg1, true);
 }
 
 uint32_t EmitFPMinTri32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1, IR::Value arg2) {
+	if (Relaxed()) {
+		const auto f32 = TypeF32(ctx.state);
+		return EmitRelaxedMinMax(
+		    ctx.state, f32, EmitRelaxedMinMax(ctx.state, f32, ctx.Def(arg0), ctx.Def(arg1), false),
+		    ctx.Def(arg2), false);
+	}
 	if (FastFloatMinMax()) {
 		return EmitFastMinMax3F32(ctx.state, OperandF32(ctx, arg0), OperandF32(ctx, arg1),
 		                            OperandF32(ctx, arg2), false)
@@ -553,6 +597,12 @@ uint32_t EmitFPMinTri32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1, I
 }
 
 uint32_t EmitFPMaxTri32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1, IR::Value arg2) {
+	if (Relaxed()) {
+		const auto f32 = TypeF32(ctx.state);
+		return EmitRelaxedMinMax(
+		    ctx.state, f32, EmitRelaxedMinMax(ctx.state, f32, ctx.Def(arg0), ctx.Def(arg1), true),
+		    ctx.Def(arg2), true);
+	}
 	if (FastFloatMinMax()) {
 		return EmitFastMinMax3F32(ctx.state, OperandF32(ctx, arg0), OperandF32(ctx, arg1),
 		                            OperandF32(ctx, arg2), true)
@@ -565,7 +615,8 @@ uint32_t EmitFPMaxTri32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1, I
 // -inf). KYTY_HOST_FTZ_INPUTS=1 leaves that to a module declaring DenormFlushToZero 32
 // (CodegenTranscendentalDenormInputs checks the host keeps the sign).
 static uint32_t FlushTranscendentalInput(EmitterState& state, uint32_t value) {
-	if (GetCodegenOptions().host_ftz_inputs && GetHostFloatControls().denorm_flush_f32) {
+	if (Relaxed() ||
+	    (GetCodegenOptions().host_ftz_inputs && GetHostFloatControls().denorm_flush_f32)) {
 		return value;
 	}
 	return EmitFlushF32DenormToSignedZero(state, value);
@@ -609,13 +660,17 @@ uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 }
 
 uint32_t EmitFPSin(EmitterState& state, uint32_t arg0) {
-	auto source = EmitTrigCycleF32(state, arg0, true);
+	// Relaxed: the fractional cycle alone (no |x| >= 2^23 or signed-zero selects).
+	auto source = Relaxed() ? EmitExt(state, TypeF32(state), GLSLstd450Fract, {arg0})
+	                        : EmitTrigCycleF32(state, arg0, true);
 	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
 	return EmitExt(state, TypeF32(state), GLSLstd450Sin, {source});
 }
 
 uint32_t EmitFPCos(EmitterState& state, uint32_t arg0) {
-	auto source = EmitTrigCycleF32(state, arg0, false);
+	// Relaxed: the fractional cycle alone (no |x| >= 2^23 or signed-zero selects).
+	auto source = Relaxed() ? EmitExt(state, TypeF32(state), GLSLstd450Fract, {arg0})
+	                        : EmitTrigCycleF32(state, arg0, false);
 	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
 	return EmitExt(state, TypeF32(state), GLSLstd450Cos, {source});
 }

@@ -135,6 +135,13 @@ CodegenOptions FromEnvironment() {
 	}
 	options.ps_per_vertex = EnvFlag("KYTY_PS_PER_VERTEX", options.ps_per_vertex);
 	options.clip_guard    = EnvFlag("KYTY_CLIP_GUARD", options.clip_guard);
+	if (const auto* profile = std::getenv("KYTY_FLOAT_PROFILE"); profile != nullptr) {
+		if (std::strcmp(profile, "relaxed") == 0 || std::strcmp(profile, "1") == 0) {
+			options.float_profile = FloatProfile::Relaxed;
+		} else if (std::strcmp(profile, "precise") == 0 || std::strcmp(profile, "0") == 0) {
+			options.float_profile = FloatProfile::Precise;
+		}
+	}
 	if (const auto* mode = std::getenv("KYTY_MAD_MODE"); mode != nullptr) {
 		if (std::strcmp(mode, "exact") == 0) {
 			options.mad_mode = MadMode::Exact;

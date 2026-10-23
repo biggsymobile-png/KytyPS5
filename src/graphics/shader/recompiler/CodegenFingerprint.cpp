@@ -138,6 +138,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.uniform_buffers && GetHostUniformBufferRobust()) {
 		b.Text("uniform_buffers");
 	}
+	if (options.float_profile == FloatProfile::Relaxed) {
+		b.Text("float_profile_relaxed");
+	}
 	if (options.lane_local) {
 		b.Text("lane_local");
 		b.U8(GetHostComputeSubgroups32() ? 1u : 0u);

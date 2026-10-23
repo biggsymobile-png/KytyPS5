@@ -20,6 +20,24 @@ enum class MadMode : uint8_t {
 	Fused,
 };
 
+// How closely float arithmetic follows RDNA2's rules (KYTY_FLOAT_PROFILE).
+enum class FloatProfile : uint8_t {
+	// Bit exact: min/max/med3 with RDNA2's NaN and signed-zero rules, f32 denormal inputs of
+	// rcp/rsq/sqrt/exp/log flushed in the shader, sin/cos range reduction with its special cases,
+	// V_CVT_PKRTZ rounded toward zero in integer code, saturating float-to-int conversions, and
+	// denormal-flushing compares in compute shaders.
+	Precise,
+	// Close to one host instruction per guest instruction: NMin/NMax (a NaN operand yields the other
+	// one, as on RDNA2; signed zeros and denormals as the host has them), transcendental inputs as
+	// they are, sin/cos of the fractional cycle without the large-value and signed-zero selects,
+	// V_CVT_PKRTZ through PackHalf2x16 (rounded to nearest: at most one f16 ulp apart),
+	// float-to-32-bit-int conversions the host saturates (NVIDIA and AMD return 0 for NaN and clamp,
+	// as RDNA2 does; Vulkan leaves out-of-range values undefined), compares without the denormal
+	// flush. Fewer SPIR-V instructions per shader: less for the driver to compile, less to run.
+	// Games that depend on the exact rules can show wrong pixels.
+	Relaxed,
+};
+
 // Which pixel shaders start with EXEC holding only the non-helper invocations (KYTY_PS_LIVE_EXEC).
 enum class PsLiveExec : uint8_t {
 	// Every invocation starts with its EXEC bit set, helper invocations included.
@@ -163,6 +181,9 @@ struct CodegenOptions {
 	// (serbru20066666/brunoKytyPs5 def478029: a lighting shader of ASTRO's PLAYROOM 3.45 -> 2.76 ms
 	// on an RX 6800 XT); other drivers may use their read-only caches.
 	bool readonly_buffers = true;
+	// KYTY_FLOAT_PROFILE=precise|relaxed (default precise), see FloatProfile. Independent of
+	// mad_mode: relaxed keeps the position slice unfused, so depth pre-pass and main pass agree.
+	FloatProfile float_profile = FloatProfile::Precise;
 	// KYTY_MAD_MODE=exact|position|fused, see MadMode.
 	MadMode mad_mode = MadMode::Position;
 	// KYTY_INTERP_MODES=0: interpolate every pixel input at the pixel center with the shader-wide
