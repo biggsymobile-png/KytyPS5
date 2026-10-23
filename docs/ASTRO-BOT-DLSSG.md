@@ -73,6 +73,7 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FRAMEGEN=0` | Frame generation off |
 | `KYTY_FRAMEGEN=1` | 2x (default) |
 | `KYTY_FRAMEGEN=2` / `3` | 3x / 4x multi frame generation (RTX 50 only) |
+| `KYTY_FRAMEGEN_FPS_CAP=50` | Hold the real frame rate to at most 50 (or 60, ...): steadier frame pacing with frame generation |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
 | `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
 | `KYTY_SPIRV_BITCAST_FOLD=0` | Give the driver shaders without the redundant-conversion cleanup (exact either way) |
@@ -85,6 +86,11 @@ instructions instead: smaller shaders that compile and run a little faster, whic
 stutter when new shaders appear. Most games never notice; if you see sparkles, black or white
 pixels, flicker or broken effects with it, go back to `precise`. The first start after changing it
 compiles the game's shaders again.
+
+**Choppy frame pacing:** in the launcher's game settings set **Present mode** to `Fifo` (or
+`Immediate` on a G-Sync/FreeSync display); `Mailbox` throws frames away, generated ones included.
+If it is still uneven, cap the real frame rate just below where it usually sits, e.g.
+`"KYTY_FRAMEGEN_FPS_CAP": "50",`.
 
 ## Known issues
 
