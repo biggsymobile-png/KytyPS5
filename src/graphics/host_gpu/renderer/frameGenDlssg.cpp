@@ -227,6 +227,11 @@ using Mat4 = sl::float4x4;
 // The previous presented frame's world-to-clip (unjittered), for clipToPrevClip.
 Mat4 g_previous_view_proj;
 bool g_previous_valid = false;
+// The last presented frame's inputs (their images belong to a presenter frame): a present without
+// inputs while DLSS-G is on (a repeated or held guest frame) tags them again with zero motion
+// instead of none, which made Streamline log "Failed to find global tag" and reset DLSS-G.
+FrameInputs g_last_inputs;
+bool        g_last_inputs_valid = false;
 
 Mat4 FromColumnMajor(const std::array<float, 16>& m) {
 	Mat4 r;
@@ -750,6 +755,11 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 			graphics.DeleteImage(*image);
 		}
 	}
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_last_inputs_valid && g_last_inputs.depth.image == inputs.depth.image) {
+		g_last_inputs_valid = false;
+	}
+#endif
 	inputs.valid = false;
 }
 
@@ -835,10 +845,17 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 	constants.orthographicProjection = sl::Boolean::eFalse;
 	constants.motionVectorsDilated   = sl::Boolean::eFalse;
 	constants.motionVectorsJittered  = sl::Boolean::eFalse;
-	bool reset                       = !usable;
+	// A frame without inputs while DLSS-G is on: the last inputs again, as a still frame.
+	const bool         held   = !usable && g_mode_on && g_last_inputs_valid;
+	const FrameInputs* tagged = usable ? inputs : held ? &g_last_inputs : nullptr;
+	bool               reset  = tagged == nullptr;
 	if (usable) {
-		const auto& v = inputs->camera.view;
-		auto        p = inputs->camera.projection;
+		g_last_inputs       = *inputs;
+		g_last_inputs_valid = true;
+	}
+	if (tagged != nullptr) {
+		const auto& v = tagged->camera.view;
+		auto        p = tagged->camera.projection;
 		// The projection's jitter (col2.x, col2.y in NDC), then without it.
 		const float jitter_x = p[8], jitter_y = p[9];
 		p[8] = 0.0f;
@@ -849,16 +866,20 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 		// World to clip, row vectors: p * V * P.
 		const Mat4 view_proj = Multiply(FromColumnMajor(v), projection);
 		Mat4       clip_to_world;
-		if (g_previous_valid && Inverted(view_proj, clip_to_world)) {
+		if (held) {
+			// Nothing moved since the last frame: identity reprojection (set above).
+		} else if (g_previous_valid && Inverted(view_proj, clip_to_world)) {
 			constants.clipToPrevClip = Multiply(clip_to_world, g_previous_view_proj);
 			Inverted(constants.clipToPrevClip, constants.prevClipToClip);
 		} else {
 			reset = true;
 		}
-		g_previous_view_proj = view_proj;
-		g_previous_valid     = true;
-		const float width    = static_cast<float>(inputs->render_extent.width);
-		const float height   = static_cast<float>(inputs->render_extent.height);
+		if (!held) {
+			g_previous_view_proj = view_proj;
+			g_previous_valid     = true;
+		}
+		const float width    = static_cast<float>(tagged->render_extent.width);
+		const float height   = static_cast<float>(tagged->render_extent.height);
 		constants.jitterOffset = sl::float2(jitter_x * width * 0.5f, -jitter_y * height * 0.5f);
 		// The game's vectors are current minus previous, in UV units (its TAA reads the history
 		// at uv - mv); Streamline wants previous = current + mv * scale.
@@ -866,7 +887,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 			const char* sign = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
 			return sign != nullptr && std::atof(sign) > 0 ? 1.0f : -1.0f;
 		}();
-		constants.mvecScale = sl::float2(mv_sign, mv_sign);
+		constants.mvecScale = held ? sl::float2(0.0f, 0.0f) : sl::float2(mv_sign, mv_sign);
 		// The view's rows are the camera's axes in the world (column-major: v[0], v[4], v[8] ...);
 		// the camera looks down its -Z; its position is -R^T t.
 		const sl::float3 right(v[0], v[4], v[8]), up(v[1], v[5], v[9]), back(v[2], v[6], v[10]);
@@ -893,28 +914,28 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 		LOGF("frame generation: slSetConstants failed (%d)\n", static_cast<int>(result));
 	}
 
-	if (usable) {
-		sl::Resource depth(sl::ResourceType::eTex2d, static_cast<VkImage>(inputs->depth.image), nullptr,
-		                   static_cast<VkImageView>(inputs->depth_view),
+	if (tagged != nullptr) {
+		sl::Resource depth(sl::ResourceType::eTex2d, static_cast<VkImage>(tagged->depth.image), nullptr,
+		                   static_cast<VkImageView>(tagged->depth_view),
 		                   static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
-		depth.width        = inputs->depth.extent.width;
-		depth.height       = inputs->depth.extent.height;
-		depth.nativeFormat = static_cast<uint32_t>(inputs->depth.format);
+		depth.width        = tagged->depth.extent.width;
+		depth.height       = tagged->depth.extent.height;
+		depth.nativeFormat = static_cast<uint32_t>(tagged->depth.format);
 		depth.mipLevels    = 1;
 		depth.arrayLayers  = 1;
 		depth.flags        = 0;
-		depth.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(inputs->depth.usage));
-		sl::Resource motion(sl::ResourceType::eTex2d, static_cast<VkImage>(inputs->motion.image), nullptr,
-		                    static_cast<VkImageView>(inputs->motion_view),
+		depth.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(tagged->depth.usage));
+		sl::Resource motion(sl::ResourceType::eTex2d, static_cast<VkImage>(tagged->motion.image), nullptr,
+		                    static_cast<VkImageView>(tagged->motion_view),
 		                    static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
-		motion.width        = inputs->motion.extent.width;
-		motion.height       = inputs->motion.extent.height;
-		motion.nativeFormat = static_cast<uint32_t>(inputs->motion.format);
+		motion.width        = tagged->motion.extent.width;
+		motion.height       = tagged->motion.extent.height;
+		motion.nativeFormat = static_cast<uint32_t>(tagged->motion.format);
 		motion.mipLevels    = 1;
 		motion.arrayLayers  = 1;
 		motion.flags        = 0;
-		motion.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(inputs->motion.usage));
-		const sl::Extent full {0, 0, inputs->render_extent.width, inputs->render_extent.height};
+		motion.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(tagged->motion.usage));
+		const sl::Extent full {0, 0, tagged->render_extent.width, tagged->render_extent.height};
 		sl::ResourceTag  tags[] {
             sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &full),
             sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
@@ -925,7 +946,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 		    result != sl::Result::eOk && g_presents < 8) {
 			LOGF("frame generation: slSetTagForFrame failed (%d)\n", static_cast<int>(result));
 		}
-		++g_with_inputs;
+		g_with_inputs += usable ? 1u : 0u;
 	} else {
 		// Menus, movies, loading: no depth and motion (DLSS-G then presents the frame as is).
 		sl::ResourceTag tags[] {
@@ -970,6 +991,7 @@ void AfterPresent() {
 void SwapchainChanging() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// Off before the swapchain is made again (DLSS-G guide: before a resize or a full screen change).
+	g_last_inputs_valid = false;
 	if (!g_ready || !g_mode_on) return;
 	sl::DLSSGOptions options {};
 	options.mode                = sl::DLSSGMode::eOff;

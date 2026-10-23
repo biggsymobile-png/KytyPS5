@@ -87,6 +87,18 @@ stutter when new shaders appear. Most games never notice; if you see sparkles, b
 pixels, flicker or broken effects with it, go back to `precise`. The first start after changing it
 compiles the game's shaders again.
 
+**Smoother frames (recommended):** in the launcher's game settings set **Vblank frequency** to
+`120`. At the default 60, a frame that misses the 16.7 ms tick by a little is held to 33 ms; at 120
+it waits for the next 8.3 ms tick instead (Astro Bot's start: frames at 33 ms or more went from 18%
+to under 1%).
+
+**Game threads reading GPU results:** the bundled preset turns on two of Jetsku's experimental
+switches, `KYTY_READ_FAULT_PUBLISHED` (simple reads of GPU-written data use the last copy the
+emulator made, at most two frames old, instead of waiting for the GPU) and
+`KYTY_READBACK_FLUSH_SIDE`. In Astro Bot's first level the copy matched the fresh data for every
+read checked, and the frame rate went from about 50 to 54.5 fps at a 60 Hz vblank. Set either to
+`"0"` if a game misbehaves.
+
 **Choppy frame pacing:** in the launcher's game settings set **Present mode** to `Fifo` (or
 `Immediate` on a G-Sync/FreeSync display); `Mailbox` throws frames away, generated ones included.
 If it is still uneven, cap the real frame rate just below where it usually sits, e.g.
