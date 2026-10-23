@@ -846,7 +846,12 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 	constants.motionVectorsDilated   = sl::Boolean::eFalse;
 	constants.motionVectorsJittered  = sl::Boolean::eFalse;
 	// A frame without inputs while DLSS-G is on: the last inputs again, as a still frame.
-	const bool held = !usable && g_mode_on && g_last_inputs != nullptr &&
+	// KYTY_FRAMEGEN_HOLD=0: frames without inputs get no tags (DLSS-G resets), as before build 6.
+	static const bool hold_enabled = [] {
+		const char* value = std::getenv("KYTY_FRAMEGEN_HOLD");
+		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	const bool held = hold_enabled && !usable && g_mode_on && g_last_inputs != nullptr &&
 	                  g_last_inputs->depth.image != nullptr && g_last_inputs->motion.image != nullptr;
 	const FrameInputs* tagged = usable ? inputs : held ? g_last_inputs : nullptr;
 	bool               reset  = tagged == nullptr;
