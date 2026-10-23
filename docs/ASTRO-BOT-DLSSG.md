@@ -75,6 +75,14 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FRAMEGEN=2` / `3` | 3x / 4x multi frame generation (RTX 50 only) |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
 | `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
+| `KYTY_HYBRID_PLACEMENT=0` | Intel 12th-14th gen / Core Ultra: don't keep the game's threads on the P-cores (see below) |
+
+**Intel hybrid CPUs (12th-14th gen Core, Core Ultra):** the emulator keeps the game's busy threads
+(the command processor, guest threads, draw preparation, presenting, the driver's) on the
+**P-cores**, and its background work (pipeline optimisation, shader precompile, cache saving, file
+I/O) on the **E-cores**, so a burst of background compiling no longer lands on the cores the frame
+needs. The console shows a `Kyty P-core placement` line. It stays off while Process Lasso or a
+similar tool sets the emulator's cores.
 
 ## Known issues
 

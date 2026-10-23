@@ -66,6 +66,7 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 		int                            index      = 0;
 		uint8_t                        cache      = 0;
 		uint8_t                        preference = 0;
+		uint8_t                        efficiency = 0;
 		bool                           whole      = true; // every logical processor allowed
 		bool                           has_zero   = false;
 		std::vector<const CpuSetInfo*> processors;
@@ -81,6 +82,7 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 		core.index      = set.core;
 		core.cache      = set.cache;
 		core.preference = std::max(core.preference, set.scheduling_class);
+		core.efficiency = std::max(core.efficiency, set.efficiency_class);
 		core.whole      = core.whole && set.allowed;
 		core.has_zero   = core.has_zero || set.logical == 0;
 		core.processors.push_back(&set);
@@ -118,6 +120,9 @@ CpuLayout ComputeCpuLayout(const std::vector<CpuSetInfo>& sets, CpuReserveMode m
 	std::sort(candidates.begin(), candidates.end(), [](const Core* a, const Core* b) {
 		if (a->has_zero != b->has_zero) {
 			return !a->has_zero; // the core of processor 0 (interrupts) last
+		}
+		if (a->efficiency != b->efficiency) {
+			return a->efficiency > b->efficiency; // a P-core before an E-core (Intel hybrid)
 		}
 		if (a->preference != b->preference) {
 			return a->preference > b->preference;
@@ -244,6 +249,39 @@ VCacheTopology DetectVCache(const std::vector<L3Cache>& caches) {
 		topology.other_mask |= groups[i].first;
 	}
 	topology.description = "dual-CCD X3D (L3 " + sizes + ")";
+	return topology;
+}
+
+VCacheTopology DetectHybrid(const std::vector<CpuSetInfo>& sets) {
+	VCacheTopology topology;
+	uint8_t        fastest = 0;
+	uint8_t        slowest = UINT8_MAX;
+	for (const auto& set: sets) {
+		if (set.group == 0 && set.logical < 64) {
+			fastest = std::max(fastest, set.efficiency_class);
+			slowest = std::min(slowest, set.efficiency_class);
+		}
+	}
+	if (slowest == UINT8_MAX || fastest == slowest) {
+		topology.description = "not a hybrid CPU (one efficiency class)";
+		return topology;
+	}
+	for (const auto& set: sets) {
+		if (set.group != 0 || set.logical >= 64) {
+			continue;
+		}
+		const auto bit = uint64_t {1} << set.logical;
+		if (set.efficiency_class == fastest) {
+			topology.vcache_mask |= bit;
+		} else {
+			topology.other_mask |= bit;
+		}
+	}
+	topology.dual        = true;
+	topology.hybrid      = true;
+	topology.groups      = 1;
+	topology.description = "Intel hybrid (P-cores on logical " + MaskText(topology.vcache_mask) +
+	                       ", E-cores on logical " + MaskText(topology.other_mask) + ")";
 	return topology;
 }
 
@@ -535,6 +573,7 @@ std::vector<CpuSetInfo> ReadCpuSets(uint64_t& affinity, const std::vector<ULONG>
 			set.core             = cpu.CoreIndex;
 			set.cache            = cpu.LastLevelCacheIndex;
 			set.scheduling_class = cpu.SchedulingClass;
+			set.efficiency_class = cpu.EfficiencyClass;
 			const bool ours      = cpu.Allocated == 0 || cpu.AllocatedToTargetProcess != 0;
 			const bool in_constraint =
 			    restriction != 0
@@ -672,6 +711,14 @@ void PublishTopology(const std::vector<CpuSetInfo>& sets) {
 	g_topology_ready.store(true, std::memory_order_release);
 }
 
+#if defined(_WIN32)
+// KYTY_HYBRID_PLACEMENT=0: Intel hybrid CPUs are left as they are (default 1: DetectHybrid).
+bool HybridPlacementEnabled() {
+	const auto* value = EnvValue("KYTY_HYBRID_PLACEMENT");
+	return value == nullptr || (value[0] != '0' && std::strcmp(value, "off") != 0);
+}
+#endif
+
 int ForcedCpLogical() {
 	const auto* value = EnvValue("KYTY_CPU_RESERVE_CORE");
 	return value != nullptr ? static_cast<int>(std::strtol(value, nullptr, 10)) : -1;
@@ -751,7 +798,8 @@ void LogVCacheLocked(State& state, const char* why, const std::string& text) {
 	}
 	state.vcache_logged = text;
 	const auto mode     = GetVCacheMode();
-	std::printf("Kyty V-cache placement (KYTY_VCACHE_PLACEMENT=%s, %s): %s\n",
+	std::printf("Kyty %s placement (KYTY_VCACHE_PLACEMENT=%s, %s): %s\n",
+	            state.topology.hybrid ? "P-core" : "V-cache",
 	            mode == VCacheMode::Auto ? "auto" : mode == VCacheMode::On ? "1" : "0", why,
 	            text.c_str());
 	std::fflush(stdout);
@@ -913,6 +961,14 @@ void InitCpuPlacement() {
 		// rule), or empty.
 		state.external = ProcessDefaultCpuSets();
 		state.topology = DetectVCache(ReadL3Caches());
+		if (!state.topology.dual && HybridPlacementEnabled()) {
+			// Intel hybrid: P-cores for the hot threads, E-cores for the cold ones.
+			uint64_t   affinity = 0;
+			const auto hybrid   = DetectHybrid(ReadCpuSets(affinity, state.external));
+			if (hybrid.dual) {
+				state.topology = hybrid;
+			}
+		}
 		// KYTY_VCACHE_PLACEMENT=auto stays off when another process's rule is already in effect.
 		state.external_rule = !state.external.empty() || AffinityRestricted();
 #endif

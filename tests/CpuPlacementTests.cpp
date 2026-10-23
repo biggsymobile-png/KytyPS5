@@ -365,6 +365,48 @@ void TestVCache() {
 	std::puts("CpuPlacementTests: V-cache topologies ok");
 }
 
+// Intel Core i7-13700K: 8 P-cores with SMT (logical 0-15, EfficiencyClass 1) and 8 E-cores
+// (16-23, class 0), one L3. `e_preference`: the E-cores' SchedulingClass (the P-cores' is 0).
+std::vector<CpuSetInfo> HybridTable(uint8_t e_preference = 0) {
+	std::vector<CpuSetInfo> sets;
+	for (uint32_t lp = 0; lp < 24; lp++) {
+		CpuSetInfo set;
+		set.id               = 256 + lp;
+		set.logical          = static_cast<uint8_t>(lp);
+		set.core             = static_cast<uint8_t>(lp < 16 ? lp & ~1u : lp);
+		set.efficiency_class = lp < 16 ? 1 : 0;
+		set.scheduling_class = lp < 16 ? 0 : e_preference;
+		set.allowed          = true;
+		sets.push_back(set);
+	}
+	return sets;
+}
+
+void TestHybrid() {
+	using Common::ComputeCpuLayout;
+	using Common::ComputeVCacheLayout;
+	using Common::DecideVCachePlacement;
+	using Common::DetectHybrid;
+	const auto table    = HybridTable();
+	const auto topology = DetectHybrid(table);
+	Check(topology.dual && topology.hybrid && topology.vcache_mask == 0xFFFF &&
+	          topology.other_mask == 0xFF0000 && Contains(topology.description, "Intel hybrid"),
+	      "13700K: P-cores 0-15 hot, E-cores 16-23 cold");
+	Check(DecideVCachePlacement(VCacheMode::Auto, topology, false, false).engage,
+	      "13700K, no external rule: applies");
+	Check(!DecideVCachePlacement(VCacheMode::Auto, topology, true, false).engage,
+	      "13700K with Process Lasso: left to it");
+	Check(!DetectHybrid(GenericTable(16, 16)).dual, "one efficiency class: not hybrid");
+	const auto cp = ComputeVCacheLayout(table, CpuReserveMode::Cp, -1, topology);
+	Check(cp.vcache && cp.reserved && cp.cp_mask == 0xC && cp.general_mask == (0xFFFFu & ~0xCu) &&
+	          cp.cold_mask == 0xFF0000 && cp.cold_ids.size() == 8,
+	      "13700K cp: CP on P-core 2-3, hot threads on the other P-cores, cold on the E-cores");
+	// Without the placement (an external rule), the CP's core is still a P-core, even when the
+	// E-cores report a higher SchedulingClass.
+	const auto plain = ComputeCpuLayout(HybridTable(5), CpuReserveMode::Cp, -1);
+	Check(plain.reserved && plain.cp_mask == 0xC, "hybrid: the CP gets a P-core first");
+}
+
 void TestAffinityAndModes() {
 	const auto layout = Common::ComputeCpuLayout(MachineTable(0xFFFF), CpuReserveMode::Cp, -1);
 	Check(Common::GeneralPoolAffinity(0x4, layout) == layout.general_mask,
@@ -1223,6 +1265,8 @@ int main(int argc, char** argv) {
 
 	TestLayouts();
 	TestVCache();
+	TestHybrid();
+	std::printf("CpuPlacementTests: Intel hybrid ok\n");
 	TestAffinityAndModes();
 	Check(Common::GetCpuReserveMode() == mode, "KYTY_CPU_RESERVE");
 #if defined(_WIN32)

@@ -91,6 +91,7 @@ struct CpuSetInfo {
 	uint8_t  core             = 0; // CoreIndex: shared by SMT siblings
 	uint8_t  cache            = 0; // LastLevelCacheIndex
 	uint8_t  scheduling_class = 0; // higher = preferred (CPPC)
+	uint8_t  efficiency_class = 0; // higher = faster cores (P-cores of an Intel hybrid CPU)
 	bool     allowed          = false;
 };
 
@@ -127,6 +128,9 @@ struct VCacheTopology {
 	uint64_t    other_mask   = 0;     // those of every smaller L3
 	uint64_t    vcache_bytes = 0;
 	uint64_t    other_bytes  = 0; // the largest of the smaller ones
+	// KYTY_HYBRID_PLACEMENT (DetectHybrid): an Intel hybrid CPU seen the same way, the P-cores as
+	// vcache_mask (hot threads) and the E-cores as other_mask (cold threads).
+	bool        hybrid = false;
 	std::string description;
 };
 
@@ -148,6 +152,14 @@ inline constexpr uint32_t kMinGeneralProcessors = 6;
                                          uint64_t preferred_mask = 0);
 // Pure (tested): the L3 groups as a V-cache topology (KYTY_VCACHE_PLACEMENT).
 [[nodiscard]] VCacheTopology DetectVCache(const std::vector<L3Cache>& caches);
+// Pure (tested): an Intel hybrid CPU (CPU sets of more than one EfficiencyClass in group 0) as a
+// topology for the same placement: hot threads (guest, CP, recorder, draw prep, present, driver) on
+// the fastest class's processors, the P-cores, and cold threads (background pipeline optimisation,
+// shader precompile and journal replay, cache savers, file I/O, monitors) on the other ones, the
+// E-cores. `dual` false when every processor has the same class.
+// KYTY_HYBRID_PLACEMENT=0 turns the detection off (default 1); KYTY_VCACHE_PLACEMENT (auto by
+// default: only without an external CPU-set or affinity rule) then decides as for an X3D.
+[[nodiscard]] VCacheTopology DetectHybrid(const std::vector<CpuSetInfo>& sets);
 // Pure (tested): whether the V-cache placement applies. `external_rule`: an affinity or CPU-set
 // rule of another process was seen; `cpu_sets`: KYTY_CPU_SETS is set.
 [[nodiscard]] VCacheDecision DecideVCachePlacement(VCacheMode mode, const VCacheTopology& topology,
