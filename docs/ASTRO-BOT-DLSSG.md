@@ -104,13 +104,14 @@ The relaxed shader profile (`KYTY_FLOAT_PROFILE=relaxed`) is optional and less t
 
 It also sets `KYTY_FAULT_AHEAD_ADAPT=512`, which halves the emulator's write faults (on an
 i7-13700K: 6.3 to 5.6 ms per frame). `KYTY_READ_FAULT_LEND` (lets copy loops read GPU-written
-pages without waiting) is in the build but off: in its first test Astro Bot lost the GPU device
-after about a minute, most likely because the game copied data one or two frames old.
+pages without waiting) is in the build but off: it removed the waits but Astro Bot ran slightly
+slower with it.
 
 **Choppy frame pacing:** in the launcher's game settings set **Present mode** to `Fifo` (or
 `Immediate` on a G-Sync/FreeSync display); `Mailbox` throws frames away, generated ones included.
-If it is still uneven, cap the real frame rate just below where it usually sits, e.g.
-`"KYTY_FRAMEGEN_FPS_CAP": "50",`.
+If it is still uneven, cap the real frame rate at a multiple of the vblank tick, e.g.
+`"KYTY_FRAMEGEN_FPS_CAP": "40",` with a 120 Hz vblank (a cap of 50 falls between ticks and alternates
+16.7 and 25 ms frames).
 
 ## Known issues
 
