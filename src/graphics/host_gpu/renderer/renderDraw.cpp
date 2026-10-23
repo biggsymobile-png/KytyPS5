@@ -4624,6 +4624,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	CommitStats::StepMark(CommitStats::Step::RunRecord);
+	const auto* taa_program = state.ps_active ? state.ps_input_info.stage.program : nullptr;
+	if (taa_program != nullptr && taa_program->shader_hash == FrameGen::TaaPixelShader &&
+	    FrameGen::ResolveTaa(buffer, taa_program->shader_hash,
+	                         bindings.pixel ? &*bindings.pixel : nullptr, colors_span)) {
+		// DLSS records native compute commands and ends rendering. No continuation may
+		// reuse the state preceding it, including recalled draw runs and dynamic state.
+		m_run.valid        = false;
+		m_run_active       = false;
+		m_run_targets_kept = false;
+		for (auto& record: m_run_kept)
+			record.valid = false;
+		m_dynamic_state.valid = false;
+	}
 	if (CommitStats::Enabled()) [[unlikely]] {
 		CommitStats::Mark(CommitStats::Phase::Emit);
 		uint64_t textures = 0;

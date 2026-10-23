@@ -2,11 +2,14 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/host_gpu/renderer/astroTaaGeometry.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -32,14 +35,14 @@
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
 
+#include <filesystem>
 #include <sl.h>
 #include <sl_consts.h>
+#include <sl_dlss.h>
 #include <sl_dlss_g.h>
 #include <sl_helpers.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
-
-#include <filesystem>
 #endif
 
 namespace Libs::Graphics::FrameGen {
@@ -49,6 +52,8 @@ namespace {
 constexpr uint32_t ViewConstantsBytes = 576; // docs/RE-ASTRO-BOT-FG.md
 
 int  g_generate = 0;     // frames to generate per rendered frame (0 = off)
+bool              g_super_resolution = false;
+std::atomic<bool> g_sr_ready {false};
 bool g_loaded   = false; // Streamline loaded (Initialize)
 std::atomic<bool> g_ready {false}; // ... and DLSS-G's functions found (OnDevice or the first present)
 bool g_device_ok = false;           // DLSS-G supported and loaded on the device (OnDevice)
@@ -191,6 +196,9 @@ void CopyInto(vk::CommandBuffer command, Image& source, VulkanImage& target) {
 }
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+// Streamline's feature entry points are not thread safe. SR runs on the GPU thread,
+// whereas frame generation runs on the presenter thread.
+std::mutex g_streamline_mutex;
 // Streamline entry points (sl.interposer.dll, loaded at run time) and feature functions.
 struct Api {
 	PFun_slInit*               init                 = nullptr;
@@ -200,6 +208,9 @@ struct Api {
 	PFun_slGetNewFrameToken*   get_new_frame_token  = nullptr;
 	PFun_slSetConstants*       set_constants        = nullptr;
 	PFun_slSetTagForFrame*     set_tag_for_frame    = nullptr;
+	PFun_slEvaluateFeature*        evaluate_feature      = nullptr;
+	PFun_slDLSSSetOptions*         dlss_set_options      = nullptr;
+	PFun_slDLSSGetOptimalSettings* dlss_optimal_settings = nullptr;
 	PFun_slDLSSGSetOptions*    dlssg_set_options    = nullptr;
 	PFun_slDLSSGGetState*      dlssg_get_state      = nullptr;
 	PFun_slReflexSetOptions*   reflex_set_options   = nullptr;
@@ -208,7 +219,110 @@ struct Api {
 };
 Api             g_api;
 sl::FrameToken* g_token       = nullptr; // present thread: the frame being presented
-uint32_t        g_frame_index = 0;
+std::atomic<uint32_t> g_frame_index {0};
+sl::DLSSMode          g_sr_mode = sl::DLSSMode::eOff;
+const char*           SrModeName() {
+    switch (g_sr_mode) {
+        case sl::DLSSMode::eMaxQuality: return "quality";
+        case sl::DLSSMode::eBalanced: return "balanced";
+        case sl::DLSSMode::eMaxPerformance: return "performance";
+        case sl::DLSSMode::eUltraPerformance: return "ultra-performance";
+        case sl::DLSSMode::eDLAA: return "dlaa";
+        default: return "off";
+    }
+}
+bool         g_sr_history_valid = false;
+uint32_t     g_sr_last_frame    = 0;
+vk::Extent2D g_sr_input {}, g_sr_output {};
+// GPU thread: bounded diagnostics, including when no recognized TAA draw executes.
+uint64_t g_sr_taa_calls = 0, g_sr_guest_flips = 0;
+enum class SrSkip : size_t {
+	Bindings,
+	Camera,
+	CameraValues,
+	Constants,
+	Images,
+	Extent,
+	MissingImage,
+	Aliasing,
+	Format,
+	MotionIdentity,
+	MotionSize,
+	Subresources,
+	Jitter,
+	OptimalSettings,
+	Options,
+	Projection,
+	View,
+	Reprojection,
+	ClipPlanes,
+	FrameToken,
+	SetConstants,
+	Count
+};
+std::array<uint64_t, static_cast<size_t>(SrSkip::Count)> g_sr_skip_counts {};
+
+template <typename... Args>
+bool SkipSr(SrSkip reason, const char* format, Args... args) {
+	const auto count = ++g_sr_skip_counts[static_cast<size_t>(reason)];
+	if (count == 1 || count == 300) {
+		std::printf("DLSS SR: skipped: ");
+		if constexpr (sizeof...(Args) == 0) {
+			std::printf("%s", format);
+		} else {
+			std::printf(format, args...);
+		}
+		std::printf(" (occurrences=%" PRIu64 "; keeping game TAA)\n", count);
+		std::fflush(stdout);
+	}
+	return false;
+}
+
+void ReportSrLayout(TextureCache& cache, const PreparedBindings* pixel,
+                    std::span<const RenderColorInfo> colors) {
+	std::array<uint64_t, 36> signature {};
+	signature[0]      = pixel != nullptr ? pixel->images.size() : 0;
+	signature[1]      = colors.size();
+	signature[2]      = pixel != nullptr ? pixel->buffer_sources.size() : 0;
+	const auto record = [&](size_t slot, ImageId id, const ImageInfo& guest) {
+		if (!id) return;
+		const auto& image       = cache.GetImage(id).backing;
+		signature[3 + slot * 5] = image.extent.width;
+		signature[4 + slot * 5] = image.extent.height;
+		signature[5 + slot * 5] = static_cast<uint32_t>(image.format);
+		signature[6 + slot * 5] = guest.extent.width;
+		signature[7 + slot * 5] = guest.extent.height;
+	};
+	if (pixel != nullptr) {
+		for (size_t i = 0; i < std::min<size_t>(3, pixel->images.size()); ++i)
+			record(i, pixel->images[i].image_id, pixel->images[i].desc.info);
+		for (size_t i = 0; i < std::min<size_t>(8, pixel->buffer_sources.size()); ++i)
+			signature[28 + i] = pixel->buffer_sources[i].size;
+	}
+	for (size_t i = 0; i < std::min<size_t>(2, colors.size()); ++i)
+		record(3 + i, colors[i].image_id, colors[i].desc.info);
+	static std::array<uint64_t, 36> previous {};
+	static uint32_t                 reports = 0;
+	if (signature == previous || reports >= 16) return;
+	previous = signature;
+	++reports;
+	std::printf("DLSS SR: TAA observed: %" PRIu64 " sampled images, %" PRIu64 " colour targets\n",
+	            signature[0], signature[1]);
+	constexpr const char* names[] {"motion input[0]", "lit colour input[1]", "history input[2]",
+	                               "TAA output[0]", "history output[1]"};
+	for (size_t i = 0; i < 5; ++i) {
+		std::printf("DLSS SR: %s: image=%" PRIu64 "x%" PRIu64 " guest=%" PRIu64 "x%" PRIu64
+		            " format=%s\n",
+		            names[i], signature[3 + i * 5], signature[4 + i * 5], signature[6 + i * 5],
+		            signature[7 + i * 5],
+		            vk::to_string(static_cast<vk::Format>(signature[5 + i * 5])).c_str());
+	}
+	std::printf("DLSS SR: TAA buffer sizes:");
+	for (size_t i = 0; i < std::min<uint64_t>(8, signature[2]); ++i)
+		std::printf(" %" PRIu64, signature[28 + i]);
+	std::printf("\n");
+	std::fflush(stdout);
+}
 bool            g_options_set = false;
 vk::Extent2D    g_options_backbuffer {};
 vk::Extent2D    g_options_render {};
@@ -224,6 +338,7 @@ uint32_t           g_run_with = 0, g_run_without = 0;
 // Matrices in Streamline's convention: row-major, row vectors (p' = p * M). A column-major
 // column-vector matrix in memory reads as exactly that.
 using Mat4 = sl::float4x4;
+Mat4 g_sr_previous_view_proj;
 // The previous presented frame's world-to-clip (unjittered), for clipToPrevClip.
 Mat4 g_previous_view_proj;
 bool g_previous_valid = false;
@@ -390,10 +505,30 @@ bool FindFunctions(bool report) {
 void Initialize() {
 	const char* value = std::getenv("KYTY_FRAMEGEN");
 	g_generate        = value != nullptr && value[0] != '\0' ? std::clamp(std::atoi(value), 0, 3) : 1;
-	if (g_generate == 0) {
+	const char* sr    = std::getenv("KYTY_DLSS_SR");
+	g_super_resolution =
+	    sr != nullptr && sr[0] != '\0' && std::strcmp(sr, "off") != 0 && std::strcmp(sr, "0") != 0;
+	if (g_generate == 0 && !g_super_resolution) {
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_super_resolution) {
+		if (std::strcmp(sr, "quality") == 0)
+			g_sr_mode = sl::DLSSMode::eMaxQuality;
+		else if (std::strcmp(sr, "balanced") == 0)
+			g_sr_mode = sl::DLSSMode::eBalanced;
+		else if (std::strcmp(sr, "performance") == 0)
+			g_sr_mode = sl::DLSSMode::eMaxPerformance;
+		else if (std::strcmp(sr, "ultra-performance") == 0)
+			g_sr_mode = sl::DLSSMode::eUltraPerformance;
+		else if (std::strcmp(sr, "dlaa") == 0)
+			g_sr_mode = sl::DLSSMode::eDLAA;
+		else {
+			std::printf("DLSS SR: unknown KYTY_DLSS_SR=%s; using the game's TAA\n", sr);
+			g_super_resolution = false;
+		}
+	}
+	if (g_generate == 0 && !g_super_resolution) return;
 	// NVIDIA's Streamline runtime, the user's own copy (the Streamline SDK's bin\x64):
 	// KYTY_STREAMLINE_DIR, else a "streamline" folder next to the emulator. A folder may be the
 	// SDK's own (its bin\x64 is taken).
@@ -451,7 +586,9 @@ void Initialize() {
 	}
 	static const std::wstring    plugin_dir = dir.wstring();
 	static const wchar_t*        plugin_paths[] {plugin_dir.c_str()};
-	static std::vector<sl::Feature> features {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+	static std::vector<sl::Feature> features;
+	if (g_generate > 0) features = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+	if (g_super_resolution) features.push_back(sl::kFeatureDLSS);
 	sl::Preferences preferences {};
 	preferences.showConsole        = false;
 	preferences.logLevel           = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr ? sl::LogLevel::eVerbose
@@ -489,6 +626,9 @@ void Initialize() {
 	std::fflush(stdout);
 #else
 	LOGF("frame generation: this build has no Streamline support\n");
+	if (g_super_resolution) {
+		std::printf("DLSS SR: this build has no Streamline support; using the game's TAA\n");
+	}
 #endif
 }
 
@@ -517,16 +657,16 @@ void NoteVulkanLoader(void* get_instance_proc_addr) {
 }
 
 bool Requested() {
-	return g_loaded && g_generate > 0;
+	return g_loaded && (g_generate > 0 || g_super_resolution);
 }
 
 bool Enabled() {
-	return g_ready.load(std::memory_order_relaxed);
+	return g_ready.load(std::memory_order_relaxed) || g_sr_ready.load(std::memory_order_relaxed);
 }
 
 std::string SupportProblem(vk::PhysicalDevice physical_device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-	if (!Requested()) return {};
+	if (!Requested() || g_generate == 0) return {};
 	sl::AdapterInfo adapter {};
 	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
 	const auto  result       = g_api.is_feature_supported(sl::kFeatureDLSS_G, adapter);
@@ -627,6 +767,30 @@ void OnDevice(vk::PhysicalDevice physical_device) {
 	if (!Requested()) return;
 	sl::AdapterInfo adapter {};
 	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+	if (g_super_resolution) {
+		bool  sr_loaded   = false;
+		void* set_options = nullptr;
+		void* optimal     = nullptr;
+		if (g_api.is_feature_supported(sl::kFeatureDLSS, adapter) == sl::Result::eOk &&
+		    g_api.is_feature_loaded(sl::kFeatureDLSS, sr_loaded) == sl::Result::eOk && sr_loaded &&
+		    g_api.get_feature_function(sl::kFeatureDLSS, "slDLSSSetOptions", set_options) ==
+		        sl::Result::eOk &&
+		    g_api.get_feature_function(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", optimal) ==
+		        sl::Result::eOk) {
+			g_api.dlss_set_options      = reinterpret_cast<PFun_slDLSSSetOptions*>(set_options);
+			g_api.dlss_optimal_settings = reinterpret_cast<PFun_slDLSSGetOptimalSettings*>(optimal);
+			HMODULE module              = GetModuleHandleW(L"sl.interposer.dll");
+			g_api.evaluate_feature      = reinterpret_cast<PFun_slEvaluateFeature*>(
+                reinterpret_cast<void*>(GetProcAddress(module, "slEvaluateFeature")));
+			g_sr_ready =
+			    set_options != nullptr && optimal != nullptr && g_api.evaluate_feature != nullptr;
+		}
+		std::printf("DLSS SR: %s (mode=%s)\n",
+		            g_sr_ready ? "ready for Astro Bot's TAA pass"
+		                       : "unavailable on this device/runtime; using the game's TAA",
+		            SrModeName());
+	}
+	if (g_generate == 0) return;
 	bool loaded              = false;
 	if (g_api.is_feature_supported(sl::kFeatureDLSS_G, adapter) != sl::Result::eOk ||
 	    g_api.is_feature_loaded(sl::kFeatureDLSS_G, loaded) != sl::Result::eOk || !loaded) {
@@ -646,7 +810,7 @@ void OnDevice(vk::PhysicalDevice physical_device) {
 void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
             std::span<const PreparedBindings* const> vertex, std::span<const RenderColorInfo> colors,
             const RenderDepthInfo& depth) {
-	if (!g_ready) return;
+	if (!Enabled()) return;
 	// The TAA pass: its first image is the motion vectors.
 	if (pixel_shader == TaaPixelShader) {
 		if (pixel == nullptr || pixel->images.empty()) return;
@@ -696,13 +860,25 @@ void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs) {
 	inputs.valid = false;
-	if (!g_ready) return;
+	if (!Enabled()) return;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_sr_ready && ++g_sr_guest_flips == 120 && g_sr_taa_calls == 0) {
+		std::printf("DLSS SR: waiting: no executed Astro Bot TAA shader (0x%" PRIx64
+		            ") after 120 guest flips; enter gameplay or capture KYTY_FG_DISCOVER=1 "
+		            "to check this game/patch's shader path\n",
+		            TaaPixelShader);
+		std::fflush(stdout);
+	}
+#endif
 	Gathered gathered;
 	{
 		std::lock_guard lock(g_mutex);
 		gathered   = g_gathered;
 		g_gathered = {};
 	}
+	// SR consumes the original images at TAA. It does not need the presenter's
+	// persistent depth/motion copies when frame generation is unavailable or off.
+	if (!g_ready) return;
 	if (!gathered.gbuffer || !gathered.taa || !gathered.camera.valid ||
 	    gathered.motion_address != gathered.gbuffer_motion_address) {
 		return;
@@ -763,9 +939,305 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 	inputs.valid = false;
 }
 
+bool ResolveTaa(CommandBuffer& command, uint64_t pixel_shader, const PreparedBindings* pixel,
+                std::span<const RenderColorInfo> colors) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_sr_ready || pixel_shader != TaaPixelShader) return false;
+	std::lock_guard api_lock(g_streamline_mutex);
+	++g_sr_taa_calls;
+	auto& cache = command.GetContext().GetTextureCache();
+	ReportSrLayout(cache, pixel, colors);
+	// Run after the original TAA draw: its second target remains a valid fallback
+	// history. Only replace rt0, from the unfiltered lit colour (image 1).
+	const bool previous_valid = g_sr_history_valid;
+	g_sr_history_valid        = false;
+	if (pixel == nullptr || pixel->images.size() != 3 || colors.size() != 2 ||
+	    !colors[0].image_id || colors[0].target_slot != 0 || colors[0].guest_mip_level != 0 ||
+	    colors[0].guest_array_layer != 0)
+		return SkipSr(SrSkip::Bindings,
+		              "unexpected TAA bindings/target subresource (images=%zu targets=%zu)",
+		              pixel != nullptr ? pixel->images.size() : size_t {0}, colors.size());
+	Gathered gathered;
+	{
+		std::lock_guard lock(g_mutex);
+		gathered = g_gathered;
+	}
+	std::array<uint32_t, 20> taa {};
+	bool                     have_constants = false;
+	for (const auto& source: pixel->buffer_sources) {
+		if (source.size == sizeof(taa) &&
+		    LibKernel::Memory::TryReadGpuCleanBacking(source.address, taa.data(), sizeof(taa))) {
+			have_constants = true;
+			break;
+		}
+	}
+	if (!have_constants)
+		return SkipSr(SrSkip::Constants, "no readable 80-byte TAA constant buffer");
+	static std::array<uint32_t, 2> reported_constants {};
+	static uint32_t                constant_reports = 0;
+	if (reported_constants != std::array<uint32_t, 2> {taa[4], taa[5]} && constant_reports < 16) {
+		reported_constants = {taa[4], taa[5]};
+		++constant_reports;
+		std::printf("DLSS SR: TAA constants: render=%ux%u\n", taa[4], taa[5]);
+		std::fflush(stdout);
+	}
+	if (!gathered.gbuffer || !gathered.camera.valid || !gathered.taa ||
+	    gathered.motion_address != gathered.gbuffer_motion_address)
+		return SkipSr(
+		    SrSkip::Camera,
+		    "incomplete G-buffer/camera capture (gbuffer=%d camera=%d taa=%d motion_match=%d)",
+		    int(gathered.gbuffer), int(gathered.camera.valid), int(gathered.taa),
+		    int(gathered.motion_address == gathered.gbuffer_motion_address));
+	const auto finite = [](float value) { return std::isfinite(value); };
+	if (!std::all_of(gathered.camera.view.begin(), gathered.camera.view.end(), finite) ||
+	    !std::all_of(gathered.camera.projection.begin(), gathered.camera.projection.end(), finite))
+		return SkipSr(SrSkip::CameraValues, "non-finite camera constants");
+	const auto depth_id =
+	    cache.FindImageFromRange(gathered.depth_address, gathered.depth_size, false);
+	if (!depth_id || !pixel->images[0].image_id || !pixel->images[1].image_id)
+		return SkipSr(SrSkip::Images, "depth/motion/colour image missing from texture cache");
+	auto&              color  = cache.GetImage(pixel->images[1].image_id);
+	auto&              motion = cache.GetImage(pixel->images[0].image_id);
+	auto&              depth  = cache.GetImage(depth_id);
+	auto&              output = cache.GetImage(colors[0].image_id);
+	const vk::Extent2D input_size {color.backing.extent.width, color.backing.extent.height};
+	const vk::Extent2D output_size {output.backing.extent.width, output.backing.extent.height};
+	TaaJitter          jitter;
+	const auto         geometry = ResolveAstroTaaGeometry(taa, gathered.camera.projection,
+	                                                      {input_size.width, input_size.height},
+	                                                      {output_size.width, output_size.height}, jitter);
+	if (geometry == TaaGeometryStatus::InvalidExtent || output_size != colors[0].Extent())
+		return SkipSr(
+		    SrSkip::Extent,
+		    "render area/image mismatch: constants=%ux%u lit=%ux%u TAA=%ux%u target=%ux%u", taa[4],
+		    taa[5], input_size.width, input_size.height, output_size.width, output_size.height,
+		    colors[0].Extent().width, colors[0].Extent().height);
+	if (color.backing.image == nullptr || motion.backing.image == nullptr ||
+	    depth.backing.image == nullptr || output.backing.image == nullptr)
+		return SkipSr(SrSkip::MissingImage, "a TAA resource has no Vulkan image");
+	if (color.backing.image == output.backing.image ||
+	    motion.backing.image == output.backing.image || depth.backing.image == output.backing.image)
+		return SkipSr(SrSkip::Aliasing, "DLSS input aliases the TAA output");
+	if (color.backing.format != vk::Format::eR16G16B16A16Sfloat ||
+	    output.backing.format != color.backing.format || !IsDepthFormat(depth.backing.format) ||
+	    !(output.backing.usage & vk::ImageUsageFlagBits::eStorage))
+		return SkipSr(SrSkip::Format,
+		              "unsupported colour/depth format or output storage usage (lit=%s TAA=%s "
+		              "depth=%s storage=%d)",
+		              vk::to_string(color.backing.format).c_str(),
+		              vk::to_string(output.backing.format).c_str(),
+		              vk::to_string(depth.backing.format).c_str(),
+		              int(bool(output.backing.usage & vk::ImageUsageFlagBits::eStorage)));
+	if (motion.info.data.address != gathered.motion_address ||
+	    depth.info.data.address != gathered.depth_address)
+		return SkipSr(SrSkip::MotionIdentity, "captured depth/motion image was replaced");
+	if (motion.backing.extent.width != input_size.width ||
+	    motion.backing.extent.height != input_size.height ||
+	    depth.backing.extent.width != input_size.width ||
+	    depth.backing.extent.height != input_size.height)
+		return SkipSr(SrSkip::MotionSize, "input size mismatch: lit=%ux%u motion=%ux%u depth=%ux%u",
+		              input_size.width, input_size.height, motion.backing.extent.width,
+		              motion.backing.extent.height, depth.backing.extent.width,
+		              depth.backing.extent.height);
+	for (const auto* image: {&color, &motion, &depth, &output}) {
+		if (image->info.samples != 1 || image->backing.extent.depth != 1)
+			return SkipSr(SrSkip::Subresources, "multisampled or non-2D TAA resource");
+	}
+	if (geometry == TaaGeometryStatus::InvalidJitter)
+		return SkipSr(SrSkip::Jitter, "invalid projection jitter (%g, %g input pixels)", jitter.x,
+		              jitter.y);
+	const sl::ViewportHandle viewport {1}; // distinct constants/tags from presenter-side DLSS-G
+	sl::DLSSOptions          options {};
+	options.mode            = g_sr_mode;
+	options.outputWidth     = output_size.width;
+	options.outputHeight    = output_size.height;
+	options.colorBuffersHDR = sl::Boolean::eTrue; // pre-tonemap RGBA16F, regardless of display HDR
+	options.useAutoExposure = sl::Boolean::eTrue;
+	options.alphaUpscalingEnabled = sl::Boolean::eTrue;
+	sl::DLSSOptimalSettings optimal {};
+	if (const auto result = g_api.dlss_optimal_settings(options, optimal);
+	    result != sl::Result::eOk)
+		return SkipSr(SrSkip::OptimalSettings, "slDLSSGetOptimalSettings failed (%d)", int(result));
+	if ((g_sr_mode == sl::DLSSMode::eDLAA && input_size != output_size) ||
+	    (g_sr_mode != sl::DLSSMode::eDLAA &&
+	     (input_size.width >= output_size.width || input_size.height >= output_size.height)) ||
+	    input_size.width < optimal.renderWidthMin || input_size.height < optimal.renderHeightMin ||
+	    input_size.width > optimal.renderWidthMax || input_size.height > optimal.renderHeightMax) {
+		static vk::Extent2D reported_input {}, reported_output {};
+		if (reported_input != input_size || reported_output != output_size) {
+			std::printf("DLSS SR: %ux%u -> %ux%u is outside mode=%s range "
+			            "(allowed input %ux%u to %ux%u, recommended %ux%u); "
+			            "using the game's TAA. SR needs lower-resolution game input; "
+			            "KYTY_DLSS_SR=dlaa uses native-resolution input.\n",
+			            input_size.width, input_size.height, output_size.width, output_size.height,
+			            SrModeName(), optimal.renderWidthMin, optimal.renderHeightMin,
+			            optimal.renderWidthMax, optimal.renderHeightMax, optimal.optimalRenderWidth,
+			            optimal.optimalRenderHeight);
+			reported_input  = input_size;
+			reported_output = output_size;
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk)
+		return SkipSr(SrSkip::Options, "slDLSSSetOptions failed (%d)", int(result));
+	const bool reset = !previous_valid || g_sr_input != input_size || g_sr_output != output_size ||
+	                   taa[11] != g_sr_last_frame + 1u || taa[13] == 0;
+	sl::Constants constants {};
+	auto          projection = gathered.camera.projection;
+	projection[8] = projection[9] = 0.0f;
+	constants.cameraViewToClip    = FromColumnMajor(projection);
+	if (!Inverted(constants.cameraViewToClip, constants.clipToCameraView))
+		return SkipSr(SrSkip::Projection, "projection matrix cannot be inverted");
+	const auto view_proj =
+	    Multiply(FromColumnMajor(gathered.camera.view), constants.cameraViewToClip);
+	Mat4 clip_to_world;
+	if (!Inverted(view_proj, clip_to_world))
+		return SkipSr(SrSkip::View, "view-projection matrix cannot be inverted");
+	constants.clipToLensClip = Identity();
+	constants.clipToPrevClip =
+	    reset ? Identity() : Multiply(clip_to_world, g_sr_previous_view_proj);
+	if (!Inverted(constants.clipToPrevClip, constants.prevClipToClip))
+		return SkipSr(SrSkip::Reprojection, "reprojection matrix cannot be inverted");
+	constants.jitterOffset        = sl::float2(jitter.x, jitter.y);
+	constants.mvecScale           = sl::float2(-1.0f, -1.0f);
+	constants.cameraPinholeOffset = sl::float2(0, 0);
+	const auto& v                 = gathered.camera.view;
+	constants.cameraRight         = sl::float3(v[0], v[4], v[8]);
+	constants.cameraUp            = sl::float3(v[1], v[5], v[9]);
+	constants.cameraFwd           = sl::float3(-v[2], -v[6], -v[10]);
+	constants.cameraPos           = sl::float3(-(v[0] * v[12] + v[1] * v[13] + v[2] * v[14]),
+	                                           -(v[4] * v[12] + v[5] * v[13] + v[6] * v[14]),
+	                                           -(v[8] * v[12] + v[9] * v[13] + v[10] * v[14]));
+	constants.cameraNear          = std::fabs(projection[14] / (projection[10] - 1.0f));
+	constants.cameraFar =
+	    projection[10] == -1.0f ? 500.0f : std::fabs(projection[14] / (projection[10] + 1.0f));
+	if (!std::isfinite(constants.cameraNear) || !std::isfinite(constants.cameraFar) ||
+	    constants.cameraNear <= 0.0f || constants.cameraFar <= constants.cameraNear)
+		return SkipSr(SrSkip::ClipPlanes, "invalid near/far clip planes (%g, %g)",
+		              constants.cameraNear, constants.cameraFar);
+	constants.cameraFOV              = 2.0f * std::atan(1.0f / std::fabs(projection[5]));
+	constants.cameraAspectRatio      = std::fabs(projection[5] / projection[0]);
+	constants.depthInverted          = sl::Boolean::eFalse;
+	constants.cameraMotionIncluded   = sl::Boolean::eTrue;
+	constants.motionVectors3D        = sl::Boolean::eFalse;
+	constants.orthographicProjection = sl::Boolean::eFalse;
+	constants.reset                  = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+	sl::FrameToken* token            = nullptr;
+	const uint32_t  frame_index      = ++g_frame_index;
+	if (const auto result = g_api.get_new_frame_token(token, &frame_index);
+	    result != sl::Result::eOk || token == nullptr)
+		return SkipSr(SrSkip::FrameToken, "slGetNewFrameToken failed (%d, token=%d)", int(result),
+		              int(token != nullptr));
+	if (const auto result = g_api.set_constants(constants, *token, viewport);
+	    result != sl::Result::eOk)
+		return SkipSr(SrSkip::SetConstants, "slSetConstants failed (%d)", int(result));
+	command.EndRendering();
+	auto native = command.Handle(); // drains the CP recorder before SDK commands
+	for (auto* image: {&color, &motion, &depth}) {
+		image->Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
+		               {}, native);
+	}
+	output.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {}, native);
+	const auto resource = [&](Image& image, vk::ImageAspectFlags aspect,
+	                          vk::ImageUsageFlags usage) {
+		ImageViewInfo view {};
+		view.format = image.backing.format;
+		view.aspect = aspect;
+		view.usage  = usage;
+		sl::Resource r(sl::ResourceType::eTex2d, static_cast<VkImage>(image.backing.image), nullptr,
+		               static_cast<VkImageView>(image.FindView(view)),
+		               static_cast<uint32_t>(image.backing.state.layout));
+		r.width        = image.backing.extent.width;
+		r.height       = image.backing.extent.height;
+		r.nativeFormat = static_cast<uint32_t>(image.backing.format);
+		r.mipLevels    = 1;
+		r.arrayLayers  = 1;
+		r.flags        = 0;
+		r.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.backing.usage));
+		return r;
+	};
+	auto color_resource =
+	    resource(color, vk::ImageAspectFlagBits::eColor, vk::ImageUsageFlagBits::eSampled);
+	auto motion_resource =
+	    resource(motion, vk::ImageAspectFlagBits::eColor, vk::ImageUsageFlagBits::eSampled);
+	auto depth_resource =
+	    resource(depth, vk::ImageAspectFlagBits::eDepth, vk::ImageUsageFlagBits::eSampled);
+	auto output_resource =
+	    resource(output, vk::ImageAspectFlagBits::eColor, vk::ImageUsageFlagBits::eStorage);
+	// NGX otherwise assumes COLOR for Vulkan resources, including depth/stencil images.
+	sl::SubresourceRange color_range {};
+	color_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	color_range.levelCount = 1;
+	color_range.layerCount = 1;
+	sl::SubresourceRange depth_range {};
+	depth_range.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+	depth_range.levelCount = 1;
+	depth_range.layerCount = 1;
+	color_resource.next    = &color_range;
+	motion_resource.next   = &color_range;
+	output_resource.next   = &color_range;
+	depth_resource.next    = &depth_range;
+	const sl::Extent input_extent {0, 0, input_size.width, input_size.height};
+	const sl::Extent output_extent {0, 0, output_size.width, output_size.height};
+	sl::ResourceTag  tags[] {
+        {&color_resource, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow,
+	      &input_extent},
+        {&motion_resource, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow,
+	      &input_extent},
+        {&depth_resource, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow,
+	      &input_extent},
+        {&output_resource, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow,
+	      &output_extent},
+    };
+	auto result =
+	    g_api.set_tag_for_frame(*token, viewport, tags, static_cast<uint32_t>(std::size(tags)),
+	                            static_cast<VkCommandBuffer>(native));
+	if (result == sl::Result::eOk) {
+		const sl::BaseStructure* inputs[] {&viewport};
+		result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, inputs, 1,
+		                                static_cast<VkCommandBuffer>(native));
+	}
+	command.InvalidateExternalState();
+	if (result != sl::Result::eOk) {
+		std::printf("DLSS SR: evaluation failed (%d); disabled for this session\n",
+		            static_cast<int>(result));
+		g_sr_ready = false;
+	} else {
+		g_sr_history_valid      = true;
+		g_sr_last_frame         = taa[11];
+		g_sr_previous_view_proj = view_proj;
+		if (g_sr_input != input_size || g_sr_output != output_size) {
+			std::printf("DLSS SR: active %ux%u -> %ux%u%s\n", input_size.width, input_size.height,
+			            output_size.width, output_size.height,
+			            g_sr_mode == sl::DLSSMode::eDLAA ? " (DLAA)" : "");
+		}
+		g_sr_input  = input_size;
+		g_sr_output = output_size;
+	}
+	return true;
+#else
+	(void)command;
+	(void)pixel_shader;
+	(void)pixel;
+	(void)colors;
+	return false;
+#endif
+}
+
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Format format,
                    uint32_t image_count) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+	std::lock_guard api_lock(g_streamline_mutex);
+	if (g_sr_ready) {
+		static vk::Extent2D reported_backbuffer {};
+		if (reported_backbuffer != backbuffer) {
+			reported_backbuffer = backbuffer;
+			std::printf("DLSS SR: presentation=%ux%u (swapchain; DLSS output is the TAA target)\n",
+			            backbuffer.width, backbuffer.height);
+			std::fflush(stdout);
+		}
+	}
 	if (!g_ready.load(std::memory_order_relaxed)) {
 		// (The swapchain exists now; asked once more, then reported.)
 		static uint32_t attempts = 0;
@@ -807,8 +1279,8 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 		}
 	}
 
-	++g_frame_index;
-	if (g_api.get_new_frame_token(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
+	const uint32_t frame_index = ++g_frame_index;
+	if (g_api.get_new_frame_token(g_token, &frame_index) != sl::Result::eOk || g_token == nullptr) {
 		g_token = nullptr;
 		return;
 	}
@@ -846,15 +1318,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 	constants.motionVectorsDilated   = sl::Boolean::eFalse;
 	constants.motionVectorsJittered  = sl::Boolean::eFalse;
 	// A frame without inputs while DLSS-G is on: the last inputs again, as a still frame.
-	// KYTY_FRAMEGEN_HOLD=1 (default 0): a frame without inputs while DLSS-G is on re-tags the last
-	// inputs as a still frame instead of none. Off: with 3x frame generation it crashed the NVIDIA
-	// driver (nvoglv64.dll, a null read on a Streamline/driver thread) or lost the device at the same
-	// spot of Astro Bot's first level every time; without it that spot plays through (RTX 5080, 617.42).
-	static const bool hold_enabled = [] {
-		const char* value = std::getenv("KYTY_FRAMEGEN_HOLD");
-		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
-	}();
-	const bool held = hold_enabled && !usable && g_mode_on && g_last_inputs != nullptr &&
+	const bool held = !usable && g_mode_on && g_last_inputs != nullptr &&
 	                  g_last_inputs->depth.image != nullptr && g_last_inputs->motion.image != nullptr;
 	const FrameInputs* tagged = usable ? inputs : held ? g_last_inputs : nullptr;
 	bool               reset  = tagged == nullptr;
@@ -975,6 +1439,7 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Forma
 
 void AfterPresent() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+	std::lock_guard api_lock(g_streamline_mutex);
 	if (!g_ready.load(std::memory_order_relaxed) || g_token == nullptr) return;
 	g_api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *g_token);
 	const auto presents = ++g_presents;
@@ -998,6 +1463,8 @@ void AfterPresent() {
 
 void SwapchainChanging() {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+	std::lock_guard api_lock(g_streamline_mutex);
+	g_sr_history_valid = false;
 	// Off before the swapchain is made again (DLSS-G guide: before a resize or a full screen change).
 	g_last_inputs = nullptr;
 	if (!g_ready || !g_mode_on) return;
