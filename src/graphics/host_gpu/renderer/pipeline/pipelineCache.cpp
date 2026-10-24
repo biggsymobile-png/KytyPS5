@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/fgDiscovery.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "common/ramStats.h"
 
@@ -1852,6 +1853,7 @@ struct PipelineCache::ProgramCache {
 		DumpMatchedShaderInputs(params, options, stage_name, static_state,
 		                        push_data_start_dword, result.spirv, result.ir_dump);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
+		FgDiscovery::OnShaderDecoded(options.shader_hash, stage_name, result.decoded_dump);
 		return {.spirv       = std::move(result.spirv),
 		        .spirv_plain = std::move(result.spirv_plain),
 		        .info        = std::move(result.program).TakeCompiledInfo()};
@@ -2819,7 +2821,9 @@ struct PipelineCache::ProgramCache {
 		options.shader_hash = params.hash;
 		options.user_data   = runtime.user_data;
 		options.back_code      = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		// FgDiscovery: the decoded code of a watched shader is written (fg-shader-<hash>.txt).
+		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+		                      FgDiscovery::Watched(params.hash);
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;

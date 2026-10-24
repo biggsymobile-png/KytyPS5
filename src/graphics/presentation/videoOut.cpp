@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/fgDiscovery.h"
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
@@ -1476,6 +1477,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		// KYTY_GPU_TIMING: fold command buffers completed since the previous flip into this flip's
 		// GPU busy/idle totals before the aggregate snapshot below is published.
 		Graphics::GpuOpProfiler::OnGuestFlip();
+		Graphics::FgDiscovery::OnGuestFlip();
 		Graphics::GpuTiming::OnGuestFlip();
 		if (pace_tick != 0) {
 			PaceLog::NotePresent(group, pace_vblank, pace_tick, pace_cost);

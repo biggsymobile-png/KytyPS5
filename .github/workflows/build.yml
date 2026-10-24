@@ -2,6 +2,15 @@ name: Build and Release KytyPS5
 
 on:
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Build only the Windows package
+        type: boolean
+        default: false
+      release_tag:
+        description: Publish the Windows package as a pre-release of this fork with this tag (empty - none)
+        type: string
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -28,6 +37,7 @@ jobs:
 
   windows:
     name: Build KytyPS5 (Windows)
+    if: inputs.release_tag == ''
     needs: metadata
     runs-on: windows-2022
 
@@ -90,6 +100,18 @@ jobs:
           glslangValidator --version
           echo Qt6_DIR=%Qt6_DIR%
 
+      # DLSS frame generation (src/graphics/host_gpu/renderer/frameGenDlssg.cpp): NVIDIA Streamline's
+      # headers (MIT) at build time; its runtime is the user's own (a "streamline" folder next to
+      # kyty_emulator.exe). Without them the build has no frame generation.
+      - name: Streamline headers
+        shell: pwsh
+        run: |
+          git clone --quiet --depth 1 --branch v2.14.1 --filter=blob:none --sparse https://github.com/NVIDIA-RTX/Streamline.git _Build\streamline-src
+          git -C _Build\streamline-src sparse-checkout set include
+          New-Item -ItemType Directory -Force _Build\deps\streamline\sdk | Out-Null
+          Copy-Item _Build\streamline-src\include _Build\deps\streamline\sdk -Recurse
+          Get-ChildItem _Build\deps\streamline\sdk\include -Name
+
       - name: Configure
         shell: cmd
         run: |
@@ -134,6 +156,7 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
+    if: ${{ !inputs.windows_only && inputs.release_tag == '' }}
     needs: metadata
     runs-on: macos-15
 
@@ -290,6 +313,7 @@ jobs:
 
   linux:
     name: Build KytyPS5 (Linux)
+    if: ${{ !inputs.windows_only && inputs.release_tag == '' }}
     needs: metadata
     runs-on: ubuntu-24.04
 
@@ -526,3 +550,14 @@ jobs:
               --target "$GITHUB_SHA" \
               --title "$RELEASE_NAME"
           fi
+
+  # This fork's test releases (workflow_dispatch with release_tag): built and published by
+  # u59-windows-release.yml, Jetsku's release recipe (PGO, CP diagnostics off, the preset).
+  fork-release:
+    name: Optimised release
+    if: inputs.release_tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/u59-windows-release.yml
+    with:
+      tag: ${{ inputs.release_tag }}

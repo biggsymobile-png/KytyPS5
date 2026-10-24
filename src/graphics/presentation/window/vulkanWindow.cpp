@@ -10,6 +10,7 @@
 #include "common/textureSparseResidency.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/renderer/frameGenDlssg.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -1845,6 +1846,7 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not load Vulkan: %s\n", SDL_GetError());
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+	FrameGen::NoteVulkanLoader(reinterpret_cast<void*>(get_instance_proc_addr));
 
 	Vr::OpenXrInit();
 
@@ -2139,13 +2141,17 @@ void WindowContext::CreateVulkan() {
 			GpuTiming::NoteCalibrationExtensionEnabled(calibration);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
+		FrameGen::AddDeviceExtensions(available_extensions, device_extensions);
 	}
 
+	(void)FrameGen::SupportProblem(graphic_ctx.physical_device);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
 	if (graphic_ctx.device == nullptr) {
-		EXIT("Could not create device");
+		EXIT("Could not create device.%s", FrameGen::RefusedDeviceAdvice().c_str());
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	// Before the profiler's and recorder's hooks copy the dispatcher's entries.
+	FrameGen::BypassCommandHooks(graphic_ctx.device);
 	// Diagnostic only (KYTY_GPU_OP_PROFILE / KYTY_GPU_OP_COUNTERS): wraps dispatcher entries.
 	GpuOpProfiler::InstallHooks(graphic_ctx);
 	// KYTY_CP_RECORDER_VERIFY ownership hooks wrap the GpuOpProfiler's.
@@ -2171,6 +2177,9 @@ void WindowContext::CreateVulkan() {
 		PrintDeviceReport(graphic_ctx);
 	}
 	LogStabilitySwitches(graphic_ctx);
+
+	// (After the device's queues: Streamline sets up DLSS-G as they are fetched.)
+	FrameGen::OnDevice(graphic_ctx.physical_device);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

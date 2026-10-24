@@ -691,9 +691,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 // reserves everything around it.
 // KYTY_CUDA_EARLY_INIT=1 turns it on (default off: it adds a DLL, CUDA threads and startup time to
 // every NVIDIA run, while only RTX 40/50 drivers with Smooth Motion gain anything).
-// KYTY_CUDA_VA_FLOOR_GB: the floor in GiB, default and minimum 1024. The floor must sit above
+// KYTY_CUDA_VA_FLOOR_GB: the floor in GiB, default 512 in the fg-discovery branch (minimum 256). The floor must sit above
 // the whole guest range (HOST_USER_MAX + 1 = 1008 GiB): whatever CUDA reserves below it would be a
 // permanent hole in guest VA, and a fixed-address guest mapping there would fail.
+// (fg-discovery branch: the floor was 1024 GiB, and with it cuInit failed with 2 on an RTX 5080,
+// driver 617.42, while the original 512 GiB floor worked on an RTX 5070 Ti with the same driver.
+// 1008 GiB also allows the 16 GiB gap below 1 TiB. The address ranges CUDA reserved are logged.)
 // Without nvcuda.dll (no NVIDIA driver) nothing happens.
 static void InitCudaEarly() {
 	if (const char* value = std::getenv("KYTY_CUDA_EARLY_INIT"); value == nullptr || std::strcmp(value, "1") != 0) {
@@ -708,10 +711,12 @@ static void InitCudaEarly() {
 	if (init == nullptr) {
 		return;
 	}
-	// 1024 GiB = 0x100_0000_0000, above HOST_USER_MAX (0xfb_ffff_ffff); the cap keeps the shift sane.
-	constexpr uint64_t MinFloorGb = 1024;
+	// fg-discovery branch: at 1008 GiB (HOST_USER_MAX + 1, the 16 GiB gap below 1 TiB) cuInit still
+	// failed with 2 on an RTX 5080; 512 GiB is the floor it worked with (PR #58). CUDA's range then
+	// lies inside guest VA (logged below); Astro Bot's mappings seen so far stay below 72 GiB.
+	constexpr uint64_t MinFloorGb = 256;
 	constexpr uint64_t MaxFloorGb = 65536;
-	uint64_t           floor_gb   = MinFloorGb;
+	uint64_t           floor_gb   = 512;
 	if (const char* value = std::getenv("KYTY_CUDA_VA_FLOOR_GB"); value != nullptr && std::atoi(value) > 0) {
 		floor_gb = std::clamp<uint64_t>(static_cast<uint64_t>(std::atoi(value)), MinFloorGb, MaxFloorGb);
 	}
@@ -739,10 +744,52 @@ static void InitCudaEarly() {
 		}
 		next = end;
 	}
+	// The allocations that exist before cuInit (allocation bases), to report the ones CUDA makes.
+	const auto allocations = [] {
+		std::vector<std::pair<uint64_t, uint64_t>> list; // base, size of its reserved regions
+		uint64_t                                    address = 0x10000;
+		while (address < 0x7fff'ffff'0000ull) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == 0) break;
+			const auto base = reinterpret_cast<uint64_t>(info.BaseAddress);
+			const auto size = static_cast<uint64_t>(info.RegionSize);
+			if (info.State != MEM_FREE) {
+				const auto allocation = reinterpret_cast<uint64_t>(info.AllocationBase);
+				if (!list.empty() && list.back().first == allocation) {
+					list.back().second = base + size - allocation;
+				} else {
+					list.emplace_back(allocation, base + size - allocation);
+				}
+			}
+			if (base + size <= address) break;
+			address = base + size;
+		}
+		return list;
+	};
+	const auto before = allocations();
 	const int result = init(0);
+	const auto after  = allocations();
 	for (void* ptr: held) {
 		VirtualFree(ptr, 0, MEM_RELEASE);
 	}
+	std::vector<std::pair<uint64_t, uint64_t>> created;
+	uint64_t                                    reported = 0, total = 0;
+	for (const auto& [base, size]: after) {
+		const bool existed = std::any_of(before.begin(), before.end(),
+		                                 [base = base](const auto& entry) { return entry.first == base; });
+		if (existed) continue;
+		total += size;
+		reported++;
+		created.emplace_back(base, size);
+	}
+	// The largest first: CUDA's address range among its small allocations.
+	std::sort(created.begin(), created.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+	for (size_t i = 0; i < created.size() && i < 6; ++i) {
+		::printf("CUDA: reserved 0x%" PRIx64 "-0x%" PRIx64 " (%" PRIu64 " MiB)\n", created[i].first,
+		         created[i].first + created[i].second, created[i].second >> 20u);
+	}
+	::printf("CUDA: %" PRIu64 " new address range(s), %" PRIu64 " MiB in all, %zu range(s) held below the floor\n",
+	         reported, total >> 20u, held.size());
 	::printf("CUDA: initialized before the guest address space, above %" PRIu64 " GiB (cuInit %d%s)\n", floor_gb,
 	         result, result == 0 ? "" : ", NVIDIA Smooth Motion will not start");
 }

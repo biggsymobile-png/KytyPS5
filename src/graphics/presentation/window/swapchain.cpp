@@ -9,6 +9,7 @@
 #include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/frameGenDlssg.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -42,6 +43,8 @@ struct Presenter::Frame {
 	bool          busy         = false;
 	bool          hdr          = false;
 	bool          blank        = false;
+	// DLSS frame generation's inputs for this frame (frameGenDlssg.h), taken at its guest flip.
+	FrameGen::FrameInputs fg;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -56,6 +59,7 @@ public:
 	~FramePool() {
 		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
 		for (auto& frame: m_frames) {
+			FrameGen::DestroyInputs(m_window.graphic_ctx, frame->fg);
 			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
 			if (frame->image.image != nullptr) {
 				m_window.graphic_ctx.DeleteImage(frame->image);
@@ -288,6 +292,7 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
 	[[nodiscard]] bool       IsMinimized() const noexcept { return m_minimized; }
 	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
 	bool SetHdr(bool hdr) {
@@ -640,6 +645,7 @@ void Swapchain::Destroy() {
 
 /// Destroys and re-creates the swapchain, optionally recreating the Vulkan surface first.
 void Swapchain::Recreate(bool surface_lost) {
+	FrameGen::SwapchainChanging();
 	Destroy();
 	if (surface_lost) {
 #if defined(__APPLE__)
@@ -1272,6 +1278,12 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		               vk::AccessFlagBits2::eTransferRead);
 		Vr::OpenXrQueueEyeSource(buffer, frame->image);
 	}
+	// DLSS frame generation: this guest frame's depth, motion and camera, when it had them.
+	frame->fg.valid = false;
+	if (FrameGen::Enabled()) {
+		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(), buffer,
+		                        frame->fg);
+	}
 	return *frame;
 }
 
@@ -1404,7 +1416,22 @@ void Presenter::Impl::Present() {
 				}
 			}
 		}
+		// DLSS frame generation: its constants, tags and markers around the present (Streamline
+		// makes and shows the generated frames inside vkQueuePresentKHR). A frame shown again
+		// (a repeat) has no inputs.
+		// (Requested, not Enabled: BeforePresent itself finishes DLSS-G's setup once the
+		// swapchain exists.)
+		const bool frame_gen = FrameGen::Requested();
+		if (frame_gen) {
+			auto* fg_frame = layers[0].frame;
+			FrameGen::BeforePresent(fg_frame != nullptr && fg_frame->fg.valid ? &fg_frame->fg : nullptr,
+			                        swapchain.Extent(), swapchain.Format(), swapchain.ImageCount());
+			if (fg_frame != nullptr) fg_frame->fg.valid = false;
+		}
 		status = swapchain.Present();
+		if (frame_gen) {
+			FrameGen::AfterPresent();
+		}
 		if (status == Swapchain::Status::Minimized) {
 			return;
 		}
