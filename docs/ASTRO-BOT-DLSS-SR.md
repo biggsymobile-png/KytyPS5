@@ -4,21 +4,70 @@ Set `KYTY_DLSS_SR=on` to enable it or `off` to disable it (the default).
 `1` and `0` are also accepted. Frame generation is
 independent (`KYTY_FRAMEGEN=0` disables it).
 
-## Fixed 4K SR output
+## Enable DLSS SR
 
-SR modes now default to **3840x2160 output**, independently of the scene's
-resolution patch. With the 1920x1080 scene patch, use:
+1. Use a Windows emulator build compiled with Streamline headers and an NVIDIA
+   RTX GPU supported by the DLSS SR runtime. This integration uses Streamline
+   v2.14.1 ([download and folder layout](ASTRO-BOT-DLSSG.md#setup)). Copy the
+   runtime's complete `bin/x64` contents into a `streamline`
+   folder next to `kyty_emulator.exe`, including `sl.interposer.dll`,
+   `sl.common.dll`, `sl.dlss.dll`, and `nvngx_dlss.dll`. Alternatively point
+   `KYTY_STREAMLINE_DIR` at the runtime folder. Frame-generation files alone
+   do not provide Super Resolution.
+2. For upscaling, enable one lower scene-resolution patch for Astro Bot, for example
+   **1920x1080**, in the launcher's game-patch selection. DLSS reads the actual
+   scene colour, motion, and depth images; it does not change scene resolution.
+   A fixed-resolution patch is optional: with dynamic resolution, the SDK mode
+   follows the actual scene dimensions. Native 4K input uses DLAA automatically.
+3. In `u59-preset.json` next to the launcher, add or update these entries inside
+   its existing JSON object, preserving your other settings:
 
-```json
-"KYTY_DLSS_SR": "on",
-"KYTY_DLSS_SR_OUTPUT": "4k"
+   ```json
+   "KYTY_DLSS_SR": "on",
+   "KYTY_DLSS_SR_OUTPUT": "4k",
+   "KYTY_FRAMEGEN": "0"
+   ```
+
+   The output entry is optional because `4k` is the default. `KYTY_FRAMEGEN=0`
+   requests SR alone; use your preferred frame-generation value to combine them.
+   The launcher uses the preset file when present, so put these settings in that
+   file instead of relying on inherited environment variables.
+4. Select a 3840x2160 window/display size in the launcher, then restart the game.
+   Check for the `ready`, `automatic SDK mode`, and `active` messages shown below.
+
+For direct command-line launch, set environment variables in the same terminal:
+
+```powershell
+$env:KYTY_DLSS_SR = "on"
+$env:KYTY_FRAMEGEN = "0"
+& .\kyty_emulator.exe --game "D:\Games\ASTRO BOT" --game-patch ".\_Patches\PPSA21567.json" --screen-width 3840 --screen-height 2160
 ```
 
-Add those entries to the launcher's `u59-preset.json` when that file is in use;
-otherwise set them as environment variables before launching. `4k` is the
-default; `3840x2160` is also accepted. Select the 3840x2160 window/display size
-in the launcher to present the resulting image at native 4K. Window size alone
-does not select the game's TAA or DLSS output resolution.
+Replace the example paths with your game and patch file. Enable the desired scene
+resolution in that patch file first. To disable SR, change the preset entry or
+environment variable to `off` and restart the game; frame generation is independent.
+
+## Accepted settings
+
+| Setting | Behavior |
+|---|---|
+| `KYTY_DLSS_SR=on` or `1` | Enable SR and choose the SDK mode from actual image dimensions; use DLAA when input and output are equal. |
+| `KYTY_DLSS_SR=off`, `0`, empty, or unset | Disable SR (default). |
+| `KYTY_DLSS_SR=dlaa` | Retained explicit native-grid mode; requires equal input/output and bypasses the 4K output patch. |
+| `KYTY_DLSS_SR_OUTPUT=4k`, `3840x2160`, empty, or unset | With SR enabled via `on`/`1`, apply the guarded 4K game-output patch (default). |
+| `KYTY_DLSS_SR_OUTPUT=game` | Retain the game's original output grid while enabling SR. |
+
+`quality`, `balanced`, `performance`, and `ultra-performance` are **not accepted**
+as `KYTY_DLSS_SR` values. Replace any of those old values with `on`. Unknown SR
+values print `unknown KYTY_DLSS_SR=...; using the game's TAA` and disable SR.
+Unknown output-policy values leave the output-grid patch disabled. SDK mode names
+in console diagnostics describe the automatic choice, not a user setting.
+
+## Fixed 4K SR output
+
+SR enabled with `on` defaults to **3840x2160 output**, independently of the scene's
+resolution patch. A 3840x2160 window/display presents the result at native 4K;
+window size alone does not select the game's TAA or DLSS output resolution.
 
 The rendering path is:
 
@@ -37,14 +86,11 @@ follows automatically. At equal input/output sizes, it selects DLAA. SDK queries
 are cached until the dimensions change. If no mode accepts the dimensions,
 the game retains TAA and the console reports the unsupported grid.
 
-The old `quality`, `balanced`, `performance`, and `ultra-performance` values remain
-accepted as aliases for `on`; they no longer constrain the SDK mode. These labels
-never changed the game's input resolution.
-
 To restore the game's output choice, set `KYTY_DLSS_SR_OUTPUT=game`. Unknown
 values also leave the executable unchanged. The legacy `KYTY_DLSS_SR=dlaa`
 setting explicitly retains the original game grid and requires equal input/output
-dimensions; it bypasses the 4K output override. SR off also leaves the original resolution path intact.
+dimensions; it bypasses the 4K output override. SR off also leaves the original
+resolution path intact.
 
 ## Implementation and compatibility
 
@@ -68,15 +114,17 @@ It is compiled only in Windows builds with Streamline headers.
 Expected console messages with the 1080p scene patch:
 
 ```
+DLSS SR: ready for Astro Bot's TAA pass (mode=automatic (game input resolution))
 DLSS SR: patched Astro Bot post-processing output to 3840x2160; scene resolution preset unchanged
 DLSS SR: TAA constants: render=3840x2160
+DLSS SR: automatic SDK mode=performance for game input 1920x1080 -> 3840x2160
 DLSS SR: active 1920x1080 -> 3840x2160
 ```
 
 Game TAA still executes first to maintain fallback history. If DLSS is unavailable,
 the patched game continues using its 4K TAA path, which costs more than its original
 1368p path. Use `KYTY_DLSS_SR_OUTPUT=game` to opt out. Restart the game after changing
-either the SR mode or output policy: resources and the in-memory patch are selected
+either the SR setting or output policy: resources and the in-memory patch are selected
 at startup.
 
 If evaluation reports `eWarnOutOfVRAM` (39), the runtime could not obtain enough

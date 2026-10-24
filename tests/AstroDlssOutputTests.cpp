@@ -13,16 +13,22 @@ int main() {
       ++failures;
     }
   };
-  for (const auto mode :
-       {"on", "1", "quality", "balanced", "performance", "ultra-performance"}) {
+  for (const auto mode : {"on", "1"}) {
     check(Requested(mode, ""), "SR defaults to 4K");
     check(Requested(mode, "4k") && Requested(mode, "3840x2160"), "explicit 4K");
     check(!Requested(mode, "game"), "game output opt-out");
   }
   for (const auto mode : {"", "off", "0", "dlaa", "invalid"})
     check(!Requested(mode, "4k"), "no patch without an SR mode");
-  check(!Requested("quality", "invalid"),
+  check(!Requested("on", "invalid"),
         "unknown output does not patch guest code");
+  for (const auto mode :
+       {"quality", "balanced", "performance", "ultra-performance"}) {
+    check(Common::ParseDlssSrRequest(mode) == Common::DlssSrRequest::Invalid,
+          "SDK quality-mode names are rejected as configuration values");
+    check(!Requested(mode, "4k"),
+          "rejected mode does not patch the output grid");
+  }
 
   using Common::DlssSrInputRange;
   // Fixture ranges overlap, as SDK dynamic-resolution ranges can. The actual

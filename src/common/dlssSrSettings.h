@@ -13,9 +13,7 @@ enum class DlssSrRequest { Off, Automatic, Dlaa, Invalid };
 
 inline DlssSrRequest ParseDlssSrRequest(std::string_view value) {
 	if (value.empty() || value == "off" || value == "0") return DlssSrRequest::Off;
-	if (value == "on" || value == "1" || value == "quality" || value == "balanced" ||
-	    value == "performance" || value == "ultra-performance")
-		return DlssSrRequest::Automatic;
+	if (value == "on" || value == "1") return DlssSrRequest::Automatic;
 	if (value == "dlaa") return DlssSrRequest::Dlaa; // legacy explicit native-grid mode
 	return DlssSrRequest::Invalid;
 }

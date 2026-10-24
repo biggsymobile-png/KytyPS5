@@ -16,8 +16,8 @@
 // KYTY_FRAMEGEN_MV_SIGN=1 keeps the game's motion vector sign (a comparison; default negated).
 // KYTY_DLSS_SR=on|off (default off): Astro Bot's TAA colour replacement.
 // The game patch sets input resolution; the SDK mode follows the actual input/output
-// grids (DLAA for equal sizes). Old quality/balanced/performance/ultra-performance
-// values are aliases for on; explicit legacy dlaa retains the native game grid.
+// grids (DLAA for equal sizes). 1/0 are also accepted; explicit legacy dlaa
+// retains the native game grid. SDK quality-mode names are not configuration values.
 // See docs/ASTRO-BOT-DLSS-SR.md.
 // KYTY_DLSS_SR_OUTPUT=4k (default for SR): patch recognized Astro Bot executables
 // to use 3840x2160 post-processing independently of the scene resolution patch.
