@@ -14,6 +14,14 @@
 // KYTY_STREAMLINE_DIR=<folder>: NVIDIA's Streamline runtime (sl.interposer.dll and its plugins,
 // the SDK's bin\x64). Default: a "streamline" folder next to kyty_emulator.exe.
 // KYTY_FRAMEGEN_MV_SIGN=1 keeps the game's motion vector sign (a comparison; default negated).
+// KYTY_DLSS_SR=on|off (default off): Astro Bot's TAA colour replacement.
+// The game patch sets input resolution; the SDK mode follows the actual input/output
+// grids (DLAA for equal sizes). 1/0 are also accepted; explicit legacy dlaa
+// retains the native game grid. SDK quality-mode names are not configuration values.
+// See docs/ASTRO-BOT-DLSS-SR.md.
+// KYTY_DLSS_SR_OUTPUT=4k (default for SR): patch recognized Astro Bot executables
+// to use 3840x2160 post-processing independently of the scene resolution patch.
+// =game retains the original output grid. Explicit legacy dlaa retains the game grid.
 // Windows only, and only in builds with Streamline's headers (KYTY_FRAMEGEN_STREAMLINE).
 
 #include "graphics/host_gpu/graphicContext.h"
@@ -62,7 +70,7 @@ void Initialize();
 [[nodiscard]] const char* VulkanLoaderPath();
 // The vkGetInstanceProcAddr SDL loaded: logs which DLL it is (Streamline's interposer, or not).
 void NoteVulkanLoader(void* get_instance_proc_addr);
-// Streamline is loaded and frame generation asked for.
+// Streamline is loaded and frame generation or Super Resolution asked for.
 [[nodiscard]] bool Requested();
 // Before the device: why DLSS-G cannot run with this GPU, driver and Windows (logged); empty
 // when it can or when frame generation is off.
@@ -75,9 +83,15 @@ void AddDeviceExtensions(const std::vector<vk::ExtensionProperties>& available,
 // Right after the dispatcher is loaded for the device: the command-buffer calls Streamline
 // wraps only for its state tracking (disabled) go straight to the driver.
 void BypassCommandHooks(vk::Device device);
-// After the device: DLSS-G available on it.
+// After the device: checks DLSS-G and DLSS SR independently.
 void OnDevice(vk::PhysicalDevice physical_device);
 [[nodiscard]] bool Enabled();
+
+// Opt-in Astro Bot DLSS SR/DLAA at the TAA pass, before post-processing and HUD.
+// The original draw has already maintained the game's fallback TAA history.
+// Returns true if an external pass was recorded (including a failed evaluation).
+bool ResolveTaa(CommandBuffer& command, uint64_t pixel_shader, const PreparedBindings* pixel,
+                std::span<const RenderColorInfo> colors);
 
 // GPU thread, every draw after its bindings are prepared (while Enabled()).
 void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,

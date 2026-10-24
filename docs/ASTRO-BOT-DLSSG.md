@@ -1,12 +1,17 @@
 # KytyPS5 (Jetsku U59) with DLSS frame generation for Astro Bot
 
+For Super Resolution, automatic SDK mode selection, and fixed 4K output, see
+[Astro Bot DLSS SR setup](ASTRO-BOT-DLSS-SR.md). SR is enabled separately with
+`KYTY_DLSS_SR=on`; this page describes frame generation.
+
 An **experimental, unofficial** test build of [Jetsku/KytyPS5](https://github.com/Jetsku/KytyPS5)
 that adds NVIDIA **DLSS frame generation (DLSS-G)** to **ASTRO BOT (PPSA21564)**. Everything else
 is Jetsku's emulator as it was on 22 October 2026.
 
 Frame generation only switches on where it finds Astro Bot's inputs; in other games it stays
 off. With the `streamline` folder present Streamline still sits between the emulator and the
-driver, so if another game misbehaves with this build, set `KYTY_FRAMEGEN=0` or remove the folder.
+driver, so if another game misbehaves with this build, set both `KYTY_FRAMEGEN=0`
+and `KYTY_DLSS_SR=off`, or remove the folder.
 
 ## Requirements
 

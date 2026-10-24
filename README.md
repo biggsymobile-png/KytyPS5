@@ -8,6 +8,7 @@ result is claimed.
 - [U59 feature changes and performance evidence](docs/CHANGES-U59.md)
 - [Fork commit and file catalog through U59](docs/CHANGE-CATALOG.md)
 - [Current release: what is new, launch and build guide](docs/EXPERIMENTAL.md)
+- [Astro Bot DLSS SR: setup, on/off configuration, and fixed 4K output](docs/ASTRO-BOT-DLSS-SR.md)
 
 This fork retains sanitized development history and upstream attribution.
 The badges and general project description below refer to upstream. Packaged

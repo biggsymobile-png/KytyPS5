@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
+#include "loader/astroDlssOutput.h"
 #include "loader/elf.h"
 #include "loader/gamePatchFilter.h"
 #include "loader/runtimeLinker.h"
@@ -281,6 +282,35 @@ bool ApplyWrites(Plan* plan, const Program& program, std::string* error) {
 }
 
 } // namespace
+
+void ApplyAstroDlssOutput(Program* program, uint64_t address, uint64_t size) {
+#ifdef KYTY_DLSS_OUTPUT_PATCH
+	const auto* mode   = std::getenv("KYTY_DLSS_SR");
+	const auto* output = std::getenv("KYTY_DLSS_SR_OUTPUT");
+	if (!AstroDlssOutput::Requested(mode != nullptr ? mode : "", output != nullptr ? output : "") ||
+	    !Common::EqualNoCase(program->file_name.filename().string(), "eboot.bin"))
+		return;
+	std::string title;
+	if (!SystemContentParamSfoGetString("TITLE_ID", &title) ||
+	    (title != "PPSA21564" && title != "PPSA21567"))
+		return;
+	const auto result =
+	    AstroDlssOutput::Apply({reinterpret_cast<uint8_t*>(address), static_cast<size_t>(size)});
+	if (result == AstroDlssOutput::Result::Applied) {
+		std::printf("DLSS SR: patched Astro Bot post-processing output to 3840x2160; "
+		            "scene resolution preset unchanged\n");
+	} else {
+		std::printf("DLSS SR: 4K output patch unavailable (%s); retaining game output grid\n",
+		            result == AstroDlssOutput::Result::AmbiguousSignature
+		                ? "ambiguous executable signatures"
+		                : "unrecognized executable signatures");
+	}
+#else
+	(void)program;
+	(void)address;
+	(void)size;
+#endif
+}
 
 bool Apply(const std::filesystem::path& plan_path, Program* main_program,
            const std::vector<Program*>& programs) {

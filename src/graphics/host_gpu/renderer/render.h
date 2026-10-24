@@ -367,6 +367,13 @@ public:
 	                        uint32_t count, const vk::WriteDescriptorSet* writes,
 	                        bool known_miss = false);
 	void InvalidateDescriptors(vk::PipelineBindPoint point);
+	// An external SDK recorded pipeline, descriptor and push-constant state.
+	void InvalidateExternalState() {
+		m_bound_pipelines = {};
+		InvalidateDescriptors(vk::PipelineBindPoint::eGraphics);
+		InvalidateDescriptors(vk::PipelineBindPoint::eCompute);
+		InvalidatePushConstants();
+	}
 	// Advances whenever a descriptor command is recorded for the bind point (a push or a set bind),
 	// its state is forgotten, or the command buffer begins. Unchanged since a push: the descriptors
 	// it pushed are still in effect (descriptor commands go through this class only, see

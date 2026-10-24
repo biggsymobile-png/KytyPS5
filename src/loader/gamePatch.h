@@ -15,6 +15,8 @@ namespace GamePatch {
 bool Apply(const std::filesystem::path& plan_path, Program* main_program,
            const std::vector<Program*>& programs);
 bool ApplyPending(Program* program);
+// Called while an executable segment is writable, before instruction rewriting.
+void ApplyAstroDlssOutput(Program* program, uint64_t address, uint64_t size);
 void Clear();
 
 } // namespace GamePatch
