@@ -14,9 +14,14 @@
 // KYTY_STREAMLINE_DIR=<folder>: NVIDIA's Streamline runtime (sl.interposer.dll and its plugins,
 // the SDK's bin\x64). Default: a "streamline" folder next to kyty_emulator.exe.
 // KYTY_FRAMEGEN_MV_SIGN=1 keeps the game's motion vector sign (a comparison; default negated).
-// KYTY_DLSS_SR=quality|balanced|performance|ultra-performance|dlaa (default off):
-// Astro Bot's TAA colour replacement. SR requires lower-resolution game input;
-// DLAA uses equal input/output sizes. See docs/ASTRO-BOT-DLSS-SR.md.
+// KYTY_DLSS_SR=on|off (default off): Astro Bot's TAA colour replacement.
+// The game patch sets input resolution; the SDK mode follows the actual input/output
+// grids (DLAA for equal sizes). Old quality/balanced/performance/ultra-performance
+// values are aliases for on; explicit legacy dlaa retains the native game grid.
+// See docs/ASTRO-BOT-DLSS-SR.md.
+// KYTY_DLSS_SR_OUTPUT=4k (default for SR): patch recognized Astro Bot executables
+// to use 3840x2160 post-processing independently of the scene resolution patch.
+// =game retains the original output grid. Explicit legacy dlaa retains the game grid.
 // Windows only, and only in builds with Streamline's headers (KYTY_FRAMEGEN_STREAMLINE).
 
 #include "graphics/host_gpu/graphicContext.h"

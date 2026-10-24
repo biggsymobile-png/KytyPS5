@@ -763,6 +763,8 @@ if(WIN32)
 		    PROPERTIES INCLUDE_DIRECTORIES "${KYTY_STREAMLINE_SDK}/include"
 		               COMPILE_DEFINITIONS KYTY_FRAMEGEN_STREAMLINE=1)
 		message(STATUS "DLSS frame generation and Super Resolution: Streamline headers from ${KYTY_STREAMLINE_SDK}")
+		set_source_files_properties("${KYTY_SOURCE_DIR}/loader/gamePatch.cpp"
+		    PROPERTIES COMPILE_DEFINITIONS KYTY_DLSS_OUTPUT_PATCH=1)
 	endif()
 endif()
 
@@ -1122,6 +1124,10 @@ add_executable(astro_taa_geometry_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AstroTaaGeometryTests.cpp")
 target_include_directories(astro_taa_geometry_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+add_executable(astro_dlss_output_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AstroDlssOutputTests.cpp")
+target_include_directories(astro_dlss_output_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 add_executable(cp_recorder_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/CpRecorderTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandStream.cpp"
@@ -1238,6 +1244,7 @@ if(BUILD_TESTING)
 	add_test(NAME binding_path COMMAND $<TARGET_FILE:binding_path_tests>)
 	add_test(NAME cp_recorder COMMAND $<TARGET_FILE:cp_recorder_tests>)
 	add_test(NAME astro_taa_geometry COMMAND $<TARGET_FILE:astro_taa_geometry_tests>)
+	add_test(NAME astro_dlss_output COMMAND $<TARGET_FILE:astro_dlss_output_tests>)
 	add_test(NAME cp_sequencer COMMAND $<TARGET_FILE:cp_sequencer_tests>)
 	add_test(NAME image_exact_lookup
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-exact-lookup-only)
@@ -2504,6 +2511,7 @@ if(BUILD_TESTING)
 		binding_path_tests
 		cp_recorder_tests
 		astro_taa_geometry_tests
+		astro_dlss_output_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests

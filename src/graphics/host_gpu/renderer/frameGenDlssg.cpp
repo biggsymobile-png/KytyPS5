@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/frameGenDlssg.h"
 
 #include "common/assert.h"
+#include "common/dlssSrSettings.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/astroTaaGeometry.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -221,6 +222,7 @@ Api             g_api;
 sl::FrameToken* g_token       = nullptr; // present thread: the frame being presented
 std::atomic<uint32_t> g_frame_index {0};
 sl::DLSSMode          g_sr_mode = sl::DLSSMode::eOff;
+bool                  g_sr_automatic = false;
 const char*           SrModeName() {
     switch (g_sr_mode) {
         case sl::DLSSMode::eMaxQuality: return "quality";
@@ -513,15 +515,10 @@ void Initialize() {
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (g_super_resolution) {
-		if (std::strcmp(sr, "quality") == 0)
-			g_sr_mode = sl::DLSSMode::eMaxQuality;
-		else if (std::strcmp(sr, "balanced") == 0)
-			g_sr_mode = sl::DLSSMode::eBalanced;
-		else if (std::strcmp(sr, "performance") == 0)
-			g_sr_mode = sl::DLSSMode::eMaxPerformance;
-		else if (std::strcmp(sr, "ultra-performance") == 0)
-			g_sr_mode = sl::DLSSMode::eUltraPerformance;
-		else if (std::strcmp(sr, "dlaa") == 0)
+		const auto request = Common::ParseDlssSrRequest(sr);
+		if (request == Common::DlssSrRequest::Automatic)
+			g_sr_automatic = true;
+		else if (request == Common::DlssSrRequest::Dlaa)
 			g_sr_mode = sl::DLSSMode::eDLAA;
 		else {
 			std::printf("DLSS SR: unknown KYTY_DLSS_SR=%s; using the game's TAA\n", sr);
@@ -788,7 +785,7 @@ void OnDevice(vk::PhysicalDevice physical_device) {
 		std::printf("DLSS SR: %s (mode=%s)\n",
 		            g_sr_ready ? "ready for Astro Bot's TAA pass"
 		                       : "unavailable on this device/runtime; using the game's TAA",
-		            SrModeName());
+		            g_sr_automatic ? "automatic (game input resolution)" : SrModeName());
 	}
 	if (g_generate == 0) return;
 	bool loaded              = false;
@@ -1055,8 +1052,48 @@ bool ResolveTaa(CommandBuffer& command, uint64_t pixel_shader, const PreparedBin
 	options.useAutoExposure = sl::Boolean::eTrue;
 	options.alphaUpscalingEnabled = sl::Boolean::eTrue;
 	sl::DLSSOptimalSettings optimal {};
-	if (const auto result = g_api.dlss_optimal_settings(options, optimal);
-	    result != sl::Result::eOk)
+	if (g_sr_automatic) {
+		static vk::Extent2D            selected_input {}, selected_output {};
+		static sl::DLSSOptimalSettings selected_settings {};
+		static bool                    selected = false;
+		if (selected_input != input_size || selected_output != output_size) {
+			selected_input  = input_size;
+			selected_output = output_size;
+			selected        = false;
+			constexpr std::array modes {sl::DLSSMode::eMaxQuality, sl::DLSSMode::eBalanced,
+			                            sl::DLSSMode::eMaxPerformance,
+			                            sl::DLSSMode::eUltraPerformance, sl::DLSSMode::eDLAA};
+			std::array<sl::DLSSOptimalSettings, modes.size()>  settings {};
+			std::array<Common::DlssSrInputRange, modes.size()> ranges {};
+			for (size_t i = 0; i < modes.size(); ++i) {
+				const bool native = input_size == output_size;
+				if ((modes[i] == sl::DLSSMode::eDLAA) != native ||
+				    input_size.width > output_size.width || input_size.height > output_size.height)
+					continue;
+				options.mode = modes[i];
+				if (g_api.dlss_optimal_settings(options, settings[i]) != sl::Result::eOk) continue;
+				const auto& s = settings[i];
+				ranges[i]     = {s.renderWidthMin,  s.renderHeightMin,    s.renderWidthMax,
+				                 s.renderHeightMax, s.optimalRenderWidth, s.optimalRenderHeight};
+			}
+			if (const auto best =
+			        Common::SelectDlssSrInputRange(ranges, input_size.width, input_size.height)) {
+				g_sr_mode         = modes[*best];
+				selected_settings = settings[*best];
+				selected          = true;
+				std::printf("DLSS SR: automatic SDK mode=%s for game input %ux%u -> %ux%u\n",
+				            SrModeName(), input_size.width, input_size.height, output_size.width,
+				            output_size.height);
+			}
+		}
+		if (!selected)
+			return SkipSr(SrSkip::OptimalSettings, "no SDK mode accepts game input %ux%u -> %ux%u",
+			              input_size.width, input_size.height, output_size.width,
+			              output_size.height);
+		options.mode = g_sr_mode;
+		optimal      = selected_settings;
+	} else if (const auto result = g_api.dlss_optimal_settings(options, optimal);
+	           result != sl::Result::eOk)
 		return SkipSr(SrSkip::OptimalSettings, "slDLSSGetOptimalSettings failed (%d)", int(result));
 	if ((g_sr_mode == sl::DLSSMode::eDLAA && input_size != output_size) ||
 	    (g_sr_mode != sl::DLSSMode::eDLAA &&
@@ -1200,8 +1237,8 @@ bool ResolveTaa(CommandBuffer& command, uint64_t pixel_shader, const PreparedBin
 	}
 	command.InvalidateExternalState();
 	if (result != sl::Result::eOk) {
-		std::printf("DLSS SR: evaluation failed (%d); disabled for this session\n",
-		            static_cast<int>(result));
+		std::printf("DLSS SR: evaluation failed (%s, %d); disabled for this session\n",
+		            sl::getResultAsStr(result), static_cast<int>(result));
 		g_sr_ready = false;
 	} else {
 		g_sr_history_valid      = true;

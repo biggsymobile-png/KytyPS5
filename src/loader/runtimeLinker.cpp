@@ -2019,6 +2019,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                     mode == Common::VirtualMemory::Mode::NoAccess);
 
 			if (Common::VirtualMemory::IsExecute(mode)) {
+				GamePatch::ApplyAstroDlssOutput(program, segment_addr, segment_file_size);
 				PatchProgram(program, segment_addr, segment_memory_size);
 				executable_segments.emplace_back(segment_addr, segment_file_size);
 			}

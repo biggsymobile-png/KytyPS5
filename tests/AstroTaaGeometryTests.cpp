@@ -43,6 +43,12 @@ int main() {
         "a missing input grid must be rejected");
   constants[4] = 3840;
   constants[5] = 2160;
+  check(ResolveAstroTaaGeometry(constants, projection, {1920, 1080},
+                                {3840, 2160}, jitter) == TaaGeometryStatus::Valid,
+        "1080p scene with patched 4K TAA output must be accepted");
+  check(std::fabs(jitter.x - 0.25f) < 1e-6f &&
+            std::fabs(jitter.y + 0.25f) < 1e-6f,
+        "4K output must preserve the 1080p projection jitter phase");
   projection[8] = 2.0f * 0.25f / 3840.0f;
   projection[9] = -2.0f * -0.25f / 2160.0f;
   check(ResolveAstroTaaGeometry(constants, projection, {3840, 2160},
