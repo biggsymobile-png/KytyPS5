@@ -14,11 +14,13 @@ independent (`KYTY_FRAMEGEN=0` disables it).
    `sl.common.dll`, `sl.dlss.dll`, and `nvngx_dlss.dll`. Alternatively point
    `KYTY_STREAMLINE_DIR` at the runtime folder. Frame-generation files alone
    do not provide Super Resolution.
-2. For upscaling, enable one lower scene-resolution patch for Astro Bot, for example
-   **1920x1080**, in the launcher's game-patch selection. DLSS reads the actual
-   scene colour, motion, and depth images; it does not change scene resolution.
-   A fixed-resolution patch is optional: with dynamic resolution, the SDK mode
-   follows the actual scene dimensions. Native 4K input uses DLAA automatically.
+2. Choose the Astro Bot resolution patch in the launcher's game-patch selection
+   using the table below. Enable **only one** fixed-resolution patch at a time.
+   For SR upscaling, use one of the three patches below 3840x2160. For DLAA,
+   leave the resolution patches disabled and use native 4K rendering, or select
+   `Fixed render resolution 3840x2160` to lock native resolution. DLSS reads the
+   game's actual scene colour, motion, and depth images; it does not set scene
+   resolution itself.
 3. In `u59-preset.json` next to the launcher, add or update these entries inside
    its existing JSON object, preserving your other settings:
 
@@ -34,6 +36,26 @@ independent (`KYTY_FRAMEGEN=0` disables it).
    file instead of relying on inherited environment variables.
 4. Select a 3840x2160 window/display size in the launcher, then restart the game.
    Check for the `ready`, `automatic SDK mode`, and `active` messages shown below.
+
+### Astro Bot resolution patches
+
+With `KYTY_DLSS_SR=on` and the default 4K output:
+
+| Game-patch selection | Scene input | DLSS behavior |
+|---|---|---|
+| `Fixed render resolution 1920x1080` | 1920x1080 | SR upscaling to 3840x2160. |
+| `Fixed render resolution 2432x1368` | 2432x1368 | SR upscaling to 3840x2160. |
+| `Fixed render resolution 3328x1872` | 3328x1872 | SR upscaling to 3840x2160, if accepted by the SDK's supported input ranges. |
+| `Fixed render resolution 3840x2160` | 3840x2160 | DLAA at native 4K; no upscaling. |
+| No fixed-resolution patch, native 4K rendering | 3840x2160 | DLAA at native 4K; no upscaling. |
+
+The same `on` setting enables both SR and automatic DLAA; no SDK quality-mode
+setting is needed. Without a fixed-resolution patch, any dynamic-resolution
+changes still follow the actual input grid: equal input/output selects DLAA,
+while lower input selects a supported SR mode. Use the 3840x2160 patch to keep
+DLAA fixed at 4K.
+
+### Direct command-line launch
 
 For direct command-line launch, set environment variables in the same terminal:
 
