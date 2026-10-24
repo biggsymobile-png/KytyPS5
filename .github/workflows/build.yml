@@ -11,6 +11,10 @@ on:
         description: Publish the Windows package as a pre-release of this fork with this tag (empty - none)
         type: string
         default: ''
+      draft:
+        description: Make that release a draft (only the repository's owner sees it until published)
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -561,3 +565,4 @@ jobs:
     uses: ./.github/workflows/u59-windows-release.yml
     with:
       tag: ${{ inputs.release_tag }}
+      draft: ${{ inputs.draft }}

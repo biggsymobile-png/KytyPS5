@@ -14,6 +14,9 @@ on:
       tag:
         type: string
         required: true
+      draft:
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -200,6 +203,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create '${{ inputs.tag || github.ref_name }}' 'KytyPS5-AstroBot-DLSSG-${{ inputs.tag || github.ref_name }}-Windows-x64.zip' --prerelease `
+            $(if ('${{ inputs.draft }}' -eq 'true') { '--draft' }) `
             --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA `
             --title 'Astro Bot DLSS frame generation (${{ inputs.tag || github.ref_name }}, experimental)' `
             --notes-file 'docs/ASTRO-BOT-DLSSG.md'
