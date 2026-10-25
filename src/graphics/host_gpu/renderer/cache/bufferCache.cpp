@@ -38,7 +38,6 @@
 
 #include <algorithm>
 #include <bit>
-#include <intrin.h>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -61,6 +60,13 @@
 
 #if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
 #include <xmmintrin.h>
+#endif
+
+// __rdtsc (the stream-copy probe and the lookup timers).
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>
 #endif
 
 namespace Libs::Graphics {
