@@ -32,6 +32,9 @@
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
 
+#include <ffx_api/ffx_api.h>
+#include <ffx_api/ffx_upscale.h>
+#include <ffx_api/vk/ffx_api_vk.h>
 #include <sl.h>
 #include <sl_consts.h>
 #include <sl_dlss.h>
@@ -40,7 +43,10 @@
 #include <sl_pcl.h>
 #include <sl_reflex.h>
 
+#include <chrono>
 #include <filesystem>
+#include <string>
+#include <vector>
 #endif
 
 namespace Libs::Graphics::FrameGen {
@@ -51,6 +57,7 @@ constexpr uint32_t ViewConstantsBytes = 576; // docs/RE-ASTRO-BOT-FG.md
 
 int  g_generate = 0;     // frames to generate per rendered frame (0 = off)
 bool g_upscale  = false; // KYTY_DLSS: DLSS super resolution in place of the game's TAA
+bool g_fsr      = false; // KYTY_FSR: AMD FSR 3.1 in place of the game's TAA (no Streamline needed)
 std::atomic<bool> g_sr_ready {false}; // DLSS-SR available on the device (OnDevice)
 std::atomic<uint64_t> g_flips {0};    // guest flips seen (PrepareInputs)
 bool g_loaded   = false; // Streamline loaded (Initialize)
@@ -435,6 +442,8 @@ bool IsNvidiaSigned(const std::wstring& path) {
 	return nvidia;
 }
 
+bool LoadFsr(); // (with FSR's state, below)
+
 // DLSS-G's, Reflex's and PCL's functions, then DLSS-G ready. `report`: say what is missing.
 bool FindFunctions(bool report) {
 	if (g_ready.load(std::memory_order_relaxed)) return true;
@@ -480,6 +489,11 @@ void Initialize() {
 	g_generate        = value != nullptr && value[0] != '\0' ? std::clamp(std::atoi(value), 0, 3) : 1;
 	const char* dlss  = std::getenv("KYTY_DLSS");
 	g_upscale         = dlss != nullptr && dlss[0] != '\0' && dlss[0] != '0';
+	const char* fsr   = std::getenv("KYTY_FSR");
+	g_fsr             = fsr != nullptr && fsr[0] != '\0' && fsr[0] != '0';
+	if (g_fsr) {
+		g_upscale = false; // (one upscaler: FSR, which needs no Streamline)
+	}
 	if (g_generate == 0 && !g_upscale) {
 		return;
 	}
@@ -730,6 +744,9 @@ void BypassCommandHooks(vk::Device device) {
 
 void OnDevice(vk::PhysicalDevice physical_device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (g_fsr) {
+		(void)LoadFsr();
+	}
 	if (!g_loaded) return;
 	sl::AdapterInfo adapter {};
 	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
@@ -1005,18 +1022,146 @@ sl::DLSSMode PickMode(vk::Extent2D in, vk::Extent2D out) {
 	return best;
 }
 
-void UpscaleFailed(const char* what, sl::Result result) {
+void UpscaleFailed(const char* what, const char* detail) {
+	const char* name = g_fsr ? "FSR upscaling" : "DLSS upscaling";
 	++g_sr.failures;
 	if (g_sr.failures <= 3) {
-		std::printf("DLSS upscaling: %s failed (%s); the game's TAA is used\n", what,
-		            sl::getResultAsStr(result));
+		std::printf("%s: %s failed (%s); the game's TAA is used\n", name, what, detail);
 		std::fflush(stdout);
 	}
 	if (g_sr.failures >= 60 && !g_sr.disabled) {
 		g_sr.disabled = true;
-		std::printf("DLSS upscaling: off after repeated failures; the game's TAA is used\n");
+		std::printf("%s: off after repeated failures; the game's TAA is used\n", name);
 		std::fflush(stdout);
 	}
+}
+
+// AMD FidelityFX FSR 3.1 (KYTY_FSR=1): the FidelityFX API's Vulkan runtime, amd_fidelityfx_vk.dll
+// next to the emulator (FidelityFX SDK v1.1.4, MIT), loaded at the device (LoadFsr).
+struct FsrApi {
+	HMODULE              module   = nullptr;
+	PfnFfxCreateContext  create   = nullptr;
+	PfnFfxDestroyContext destroy  = nullptr;
+	PfnFfxDispatch       dispatch = nullptr;
+	ffxContext           context  = nullptr;
+	vk::Extent2D         in {}, out {};
+	// Contexts of an earlier size, destroyed once frames in flight can no longer use them.
+	std::vector<std::pair<ffxContext, uint64_t>> retired;
+	uint64_t                                     dispatches = 0;
+	std::chrono::steady_clock::time_point        last {};
+	float                                        sharpness = 0.0f;
+};
+FsrApi g_fsr_api;
+
+void FsrMessage(uint32_t type, const wchar_t* message) {
+	static std::atomic<uint32_t> count {0};
+	if (message == nullptr || count.fetch_add(1, std::memory_order_relaxed) >= 20) return;
+	std::printf("FSR %s: %ls\n", type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", message);
+	std::fflush(stdout);
+}
+
+void RetireFsrContexts(bool all) {
+	auto& retired = g_fsr_api.retired;
+	for (auto it = retired.begin(); it != retired.end();) {
+		if (all || g_fsr_api.dispatches >= it->second + 30) {
+			(void)g_fsr_api.destroy(&it->first, nullptr);
+			it = retired.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+// The FSR context for this render and output size (made again when either changes).
+bool EnsureFsrContext(GraphicContext& graphics, vk::Extent2D in, vk::Extent2D out, bool mv_jittered) {
+	if (g_fsr_api.context != nullptr && g_fsr_api.in == in && g_fsr_api.out == out) {
+		return true;
+	}
+	if (g_fsr_api.context != nullptr) {
+		g_fsr_api.retired.emplace_back(g_fsr_api.context, g_fsr_api.dispatches);
+		g_fsr_api.context = nullptr;
+	}
+	ffxCreateBackendVKDesc backend {};
+	backend.header.type      = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+	backend.vkDevice         = static_cast<VkDevice>(graphics.device);
+	backend.vkPhysicalDevice = static_cast<VkPhysicalDevice>(graphics.physical_device);
+	backend.vkDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	ffxCreateContextDescUpscale desc {};
+	desc.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+	desc.header.pNext = &backend.header;
+	desc.flags        = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
+	             (mv_jittered ? FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION : 0u);
+	desc.maxRenderSize  = {in.width, in.height};
+	desc.maxUpscaleSize = {out.width, out.height};
+	desc.fpMessage      = FsrMessage;
+	ffxContext context  = nullptr;
+	if (const auto code = g_fsr_api.create(&context, &desc.header, nullptr);
+	    code != FFX_API_RETURN_OK || context == nullptr) {
+		UpscaleFailed("ffxCreateContext", ("error " + std::to_string(code)).c_str());
+		return false;
+	}
+	g_fsr_api.context = context;
+	g_fsr_api.in      = in;
+	g_fsr_api.out     = out;
+	g_sr.previous_valid = false;
+	const float ratio   = static_cast<float>(out.height) / static_cast<float>(std::max(in.height, 1u));
+	std::printf("FSR upscaling: %ux%u to %ux%u (%.2fx, %s)\n", in.width, in.height, out.width,
+	            out.height, ratio,
+	            ratio < 1.05f   ? "native AA"
+	            : ratio < 1.6f  ? "Quality"
+	            : ratio < 1.85f ? "Balanced"
+	            : ratio < 2.5f  ? "Performance"
+	                            : "Ultra Performance");
+	std::fflush(stdout);
+	return true;
+}
+
+FfxApiResource FsrResource(const VulkanImage& image, uint32_t state) {
+	VkImageCreateInfo info {};
+	info.sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	info.imageType   = VK_IMAGE_TYPE_2D;
+	info.format      = static_cast<VkFormat>(image.format);
+	info.extent      = {image.extent.width, image.extent.height, 1};
+	info.mipLevels   = 1;
+	info.arrayLayers = 1;
+	info.usage       = static_cast<VkImageUsageFlags>(image.usage);
+	const auto vk_image = static_cast<VkImage>(image.image);
+	return ffxApiGetResourceVK(reinterpret_cast<void*>(vk_image),
+	                           ffxApiGetImageResourceDescriptionVK(vk_image, info, 0), state);
+}
+
+bool LoadFsr() {
+	wchar_t exe[MAX_PATH] {};
+	GetModuleFileNameW(nullptr, exe, MAX_PATH);
+	const auto path   = std::filesystem::path(exe).parent_path() / "amd_fidelityfx_vk.dll";
+	HMODULE    module = LoadLibraryW(path.c_str());
+	if (module == nullptr) {
+		std::printf("FSR upscaling: amd_fidelityfx_vk.dll was not found next to kyty_emulator.exe; the "
+		            "game's TAA is used\n");
+		std::fflush(stdout);
+		return false;
+	}
+	const auto load = [&](auto& function, const char* function_name) {
+		function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
+		    reinterpret_cast<void*>(GetProcAddress(module, function_name)));
+		return function != nullptr;
+	};
+	if (!load(g_fsr_api.create, "ffxCreateContext") || !load(g_fsr_api.destroy, "ffxDestroyContext") ||
+	    !load(g_fsr_api.dispatch, "ffxDispatch")) {
+		std::printf("FSR upscaling: amd_fidelityfx_vk.dll lacks an entry point; the game's TAA is used\n");
+		std::fflush(stdout);
+		return false;
+	}
+	g_fsr_api.module = module;
+	if (const char* value = std::getenv("KYTY_FSR_SHARPNESS"); value != nullptr && value[0] != '\0') {
+		g_fsr_api.sharpness = std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f);
+	}
+	g_sr_ready.store(true, std::memory_order_relaxed);
+	std::printf("FSR upscaling: ready (AMD FidelityFX FSR 3.1); it replaces the game's TAA (sharpening "
+	            "%.2f, KYTY_FSR_SHARPNESS)\n",
+	            g_fsr_api.sharpness);
+	std::fflush(stdout);
+	return true;
 }
 
 uint64_t DescriptorAddress(std::span<const uint32_t> user_data, size_t dword) {
@@ -1092,9 +1237,9 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	    color.backing.extent.height > out0.backing.extent.height) {
 		if (!g_sr.reported) {
 			g_sr.reported = true;
-			std::printf("DLSS upscaling: the TAA pass's images are not as expected (colour %ux%u, "
+			std::printf("%s: the TAA pass's images are not as expected (colour %ux%u, "
 			            "motion %ux%u, depth %ux%u, output %ux%u); the game's TAA is used\n",
-			            color.backing.extent.width, color.backing.extent.height,
+			            g_fsr ? "FSR upscaling" : "DLSS upscaling", color.backing.extent.width, color.backing.extent.height,
 			            motion.backing.extent.width, motion.backing.extent.height,
 			            depth.backing.extent.width, depth.backing.extent.height,
 			            out0.backing.extent.width, out0.backing.extent.height);
@@ -1112,36 +1257,10 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	Configure(graphics, g_sr.depth, g_sr.depth_view, depth.backing);
 	Configure(graphics, g_sr.motion, g_sr.motion_view, motion.backing);
 
-	std::lock_guard sl_lock(g_sl_mutex);
-	const sl::ViewportHandle viewport {UpscaleViewport};
-	if (!g_sr.options_set || g_sr.options_in != in || g_sr.options_out != out) {
-		sl::DLSSOptions options {};
-		options.mode            = PickMode(in, out);
-		options.outputWidth     = out.width;
-		options.outputHeight    = out.height;
-		options.colorBuffersHDR = sl::Boolean::eTrue;
-		options.useAutoExposure = sl::Boolean::eTrue;
-		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
-			UpscaleFailed("slDLSSSetOptions", result);
-			return false;
-		}
-		g_sr.options_set    = true;
-		g_sr.options_in     = in;
-		g_sr.options_out    = out;
-		g_sr.previous_valid = false;
-		std::printf("DLSS upscaling: %ux%u to %ux%u (%s)\n", in.width, in.height, out.width,
-		            out.height, ModeName(options.mode));
-		std::fflush(stdout);
-	}
+	const bool  fsr  = g_fsr;
+	const char* name = fsr ? "FSR upscaling" : "DLSS upscaling";
 
-	sl::FrameToken* token = nullptr;
-	// (Indices apart from the presents' DLSS-G frames, on their own viewport.)
-	uint32_t index = 0x40000000u + ++g_sr.frames;
-	if (const auto result = g_api.get_new_frame_token(token, &index);
-	    result != sl::Result::eOk || token == nullptr) {
-		UpscaleFailed("slGetNewFrameToken", result);
-		return false;
-	}
+	// The camera: Streamline's constants, also FSR's source (near, far, field of view, jitter).
 	sl::Constants constants {};
 	DefaultConstants(constants);
 	const uint64_t flip = g_flips.load(std::memory_order_relaxed);
@@ -1151,7 +1270,8 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	reset = reset || flip > g_sr.last_flip + 4;
 	g_sr.last_flip = flip;
 	// The TAA's own unjitter offset (UV, added to the sample position): the jitter in pixels is
-	// minus it (it agrees with the projection's).
+	// minus it (it agrees with the projection's). DLSS and FSR take the same convention: the
+	// projection's offset in pixels (NDC x * width / 2, -NDC y * height / 2).
 	float taa_jitter_x = 0.0f, taa_jitter_y = 0.0f;
 	std::memcpy(&taa_jitter_x, &taa[0], sizeof(float));
 	std::memcpy(&taa_jitter_y, &taa[1], sizeof(float));
@@ -1170,9 +1290,45 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	}();
 	constants.motionVectorsJittered = mv_jittered ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	constants.reset                 = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-	if (const auto result = g_api.set_constants(constants, *token, viewport); result != sl::Result::eOk) {
-		UpscaleFailed("slSetConstants", result);
-		return false;
+
+	std::unique_lock sl_lock(g_sl_mutex, std::defer_lock);
+	const sl::ViewportHandle viewport {UpscaleViewport};
+	sl::FrameToken*          token = nullptr;
+	if (fsr) {
+		if (!EnsureFsrContext(graphics, in, out, mv_jittered)) {
+			return false;
+		}
+	} else {
+		sl_lock.lock();
+		if (!g_sr.options_set || g_sr.options_in != in || g_sr.options_out != out) {
+			sl::DLSSOptions options {};
+			options.mode            = PickMode(in, out);
+			options.outputWidth     = out.width;
+			options.outputHeight    = out.height;
+			options.colorBuffersHDR = sl::Boolean::eTrue;
+			options.useAutoExposure = sl::Boolean::eTrue;
+			if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
+				UpscaleFailed("slDLSSSetOptions", sl::getResultAsStr(result));
+				return false;
+			}
+			g_sr.options_set    = true;
+			g_sr.options_in     = in;
+			g_sr.options_out    = out;
+			std::printf("DLSS upscaling: %ux%u to %ux%u (%s)\n", in.width, in.height, out.width,
+			            out.height, ModeName(options.mode));
+			std::fflush(stdout);
+		}
+		// (Indices apart from the presents' DLSS-G frames, on their own viewport.)
+		uint32_t index = 0x40000000u + ++g_sr.frames;
+		if (const auto result = g_api.get_new_frame_token(token, &index);
+		    result != sl::Result::eOk || token == nullptr) {
+			UpscaleFailed("slGetNewFrameToken", sl::getResultAsStr(result));
+			return false;
+		}
+		if (const auto result = g_api.set_constants(constants, *token, viewport); result != sl::Result::eOk) {
+			UpscaleFailed("slSetConstants", sl::getResultAsStr(result));
+			return false;
+		}
 	}
 
 	// Outside rendering, natively at this point of the frame.
@@ -1186,44 +1342,85 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	Transition(vk_command, g_sr.output, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
 	           vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite,
 	           vk::PipelineStageFlagBits2::eComputeShader);
-	const auto resource = [](VulkanImage& image, vk::ImageView view, vk::ImageLayout layout) {
-		sl::Resource r(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr,
-		               static_cast<VkImageView>(view), static_cast<uint32_t>(layout));
-		r.width        = image.extent.width;
-		r.height       = image.extent.height;
-		r.nativeFormat = static_cast<uint32_t>(image.format);
-		r.mipLevels    = 1;
-		r.arrayLayers  = 1;
-		r.flags        = 0;
-		r.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
-		return r;
-	};
-	sl::Resource color_resource  = resource(g_sr.color, g_sr.color_view, vk::ImageLayout::eShaderReadOnlyOptimal);
-	sl::Resource depth_resource  = resource(g_sr.depth, g_sr.depth_view, vk::ImageLayout::eShaderReadOnlyOptimal);
-	sl::Resource motion_resource = resource(g_sr.motion, g_sr.motion_view, vk::ImageLayout::eShaderReadOnlyOptimal);
-	sl::Resource output_resource = resource(g_sr.output, g_sr.output_view, vk::ImageLayout::eGeneral);
-	const sl::Extent in_extent {0, 0, in.width, in.height};
-	const sl::Extent out_extent {0, 0, out.width, out.height};
-	const sl::ResourceTag color_tag(&color_resource, sl::kBufferTypeScalingInputColor,
-	                                sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent);
-	const sl::ResourceTag depth_tag(&depth_resource, sl::kBufferTypeDepth,
-	                                sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent);
-	const sl::ResourceTag motion_tag(&motion_resource, sl::kBufferTypeMotionVectors,
-	                                 sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent);
-	const sl::ResourceTag output_tag(&output_resource, sl::kBufferTypeScalingOutputColor,
-	                                 sl::ResourceLifecycle::eValidUntilEvaluate, &out_extent);
-	const sl::BaseStructure* inputs[] {&viewport, &color_tag, &depth_tag, &motion_tag, &output_tag};
-	const auto result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, inputs,
-	                                           static_cast<uint32_t>(std::size(inputs)),
-	                                           static_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(vk_command)));
-	// (Streamline leaves the command buffer's bindings as DLSS left them.)
+	bool        ok = false;
+	std::string failure;
+	if (fsr) {
+		const auto now = std::chrono::steady_clock::now();
+		const float frame_ms =
+		    g_fsr_api.dispatches == 0
+		        ? 16.7f
+		        : std::clamp(std::chrono::duration<float, std::milli>(now - g_fsr_api.last).count(), 1.0f, 100.0f);
+		g_fsr_api.last = now;
+		ffxDispatchDescUpscale dispatch {};
+		dispatch.header.type       = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+		dispatch.commandList       = static_cast<VkCommandBuffer>(vk_command);
+		dispatch.color             = FsrResource(g_sr.color, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+		dispatch.depth             = FsrResource(g_sr.depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+		dispatch.motionVectors     = FsrResource(g_sr.motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+		dispatch.output            = FsrResource(g_sr.output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+		dispatch.jitterOffset      = {constants.jitterOffset.x, constants.jitterOffset.y};
+		// The game's UV-unit vectors (current minus previous) to FSR's render-size pixels.
+		dispatch.motionVectorScale = {MotionVectorSign() * static_cast<float>(in.width),
+		                              MotionVectorSign() * static_cast<float>(in.height)};
+		dispatch.renderSize        = {in.width, in.height};
+		dispatch.upscaleSize       = {out.width, out.height};
+		dispatch.enableSharpening  = g_fsr_api.sharpness > 0.0f;
+		dispatch.sharpness         = g_fsr_api.sharpness;
+		dispatch.frameTimeDelta    = frame_ms;
+		dispatch.preExposure       = 1.0f;
+		dispatch.reset             = reset;
+		dispatch.cameraNear        = constants.cameraNear;
+		dispatch.cameraFar         = constants.cameraFar;
+		dispatch.cameraFovAngleVertical  = constants.cameraFOV;
+		dispatch.viewSpaceToMetersFactor = 1.0f;
+		dispatch.flags                   = 0;
+		const auto code = g_fsr_api.dispatch(&g_fsr_api.context, &dispatch.header);
+		ok              = code == FFX_API_RETURN_OK;
+		if (!ok) failure = "ffxDispatch error " + std::to_string(code);
+		g_fsr_api.dispatches++;
+		RetireFsrContexts(false);
+	} else {
+		const auto resource = [](VulkanImage& image, vk::ImageView view, vk::ImageLayout layout) {
+			sl::Resource r(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr,
+			               static_cast<VkImageView>(view), static_cast<uint32_t>(layout));
+			r.width        = image.extent.width;
+			r.height       = image.extent.height;
+			r.nativeFormat = static_cast<uint32_t>(image.format);
+			r.mipLevels    = 1;
+			r.arrayLayers  = 1;
+			r.flags        = 0;
+			r.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
+			return r;
+		};
+		sl::Resource color_resource  = resource(g_sr.color, g_sr.color_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+		sl::Resource depth_resource  = resource(g_sr.depth, g_sr.depth_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+		sl::Resource motion_resource = resource(g_sr.motion, g_sr.motion_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+		sl::Resource output_resource = resource(g_sr.output, g_sr.output_view, vk::ImageLayout::eGeneral);
+		const sl::Extent in_extent {0, 0, in.width, in.height};
+		const sl::Extent out_extent {0, 0, out.width, out.height};
+		const sl::ResourceTag color_tag(&color_resource, sl::kBufferTypeScalingInputColor,
+		                                sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent);
+		const sl::ResourceTag depth_tag(&depth_resource, sl::kBufferTypeDepth,
+		                                sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent);
+		const sl::ResourceTag motion_tag(&motion_resource, sl::kBufferTypeMotionVectors,
+		                                 sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent);
+		const sl::ResourceTag output_tag(&output_resource, sl::kBufferTypeScalingOutputColor,
+		                                 sl::ResourceLifecycle::eValidUntilEvaluate, &out_extent);
+		const sl::BaseStructure* inputs[] {&viewport, &color_tag, &depth_tag, &motion_tag, &output_tag};
+		const auto result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, inputs,
+		                                           static_cast<uint32_t>(std::size(inputs)),
+		                                           static_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(vk_command)));
+		ok = result == sl::Result::eOk;
+		if (!ok) failure = std::string("slEvaluateFeature ") + sl::getResultAsStr(result);
+	}
+	// (Streamline and FSR leave the command buffer's bindings as their passes left them.)
 	command.ForgetBoundState();
-	if (result != sl::Result::eOk) {
+	if (!ok) {
 		// The game's TAA draws after all: its textures as its bindings expect them.
 		color.Transit(keep_color.layout, keep_color.access_mask, {}, vk_command);
 		motion.Transit(keep_motion.layout, keep_motion.access_mask, {}, vk_command);
 		depth.Transit(keep_depth.layout, keep_depth.access_mask, {}, vk_command);
-		UpscaleFailed("slEvaluateFeature", result);
+		UpscaleFailed("evaluation", failure.c_str());
 		return false;
 	}
 	g_sr.failures = 0;
@@ -1242,21 +1439,21 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		                     target->backing.image, vk::ImageLayout::eTransferDstOptimal, copy);
 		target->NoteContentWrite();
 	}
-	// The jitter's spread over the last status interval: a still camera jitter (0) means DLSS has
-	// no sub-pixel samples to accumulate.
+	// The jitter's spread over the last status interval: a still camera jitter (0) means the
+	// upscaler has no sub-pixel samples to accumulate.
 	g_sr.jitter_min_x = std::min(g_sr.jitter_min_x, constants.jitterOffset.x);
 	g_sr.jitter_max_x = std::max(g_sr.jitter_max_x, constants.jitterOffset.x);
 	g_sr.jitter_min_y = std::min(g_sr.jitter_min_y, constants.jitterOffset.y);
 	g_sr.jitter_max_y = std::max(g_sr.jitter_max_y, constants.jitterOffset.y);
 	g_sr.resets += reset ? 1u : 0u;
 	if (++g_sr.evaluated == 1) {
-		std::printf("DLSS upscaling: on (jitter %.3f, %.3f px; projection's %.3f, %.3f)\n",
+		std::printf("%s: on (jitter %.3f, %.3f px; projection's %.3f, %.3f)\n", name,
 		            constants.jitterOffset.x, constants.jitterOffset.y, projection_x, projection_y);
 		std::fflush(stdout);
 	} else if (g_sr.evaluated % 600 == 0) {
-		std::printf("DLSS upscaling: %ux%u to %ux%u, last 600 frames: jitter x %.3f..%.3f, y %.3f..%.3f "
+		std::printf("%s: %ux%u to %ux%u, last 600 frames: jitter x %.3f..%.3f, y %.3f..%.3f "
 		            "px, %u history reset(s)\n",
-		            in.width, in.height, out.width, out.height, g_sr.jitter_min_x, g_sr.jitter_max_x,
+		            name, in.width, in.height, out.width, out.height, g_sr.jitter_min_x, g_sr.jitter_max_x,
 		            g_sr.jitter_min_y, g_sr.jitter_max_y, g_sr.resets);
 		std::fflush(stdout);
 		g_sr.jitter_min_x = g_sr.jitter_min_y = 1e9f;

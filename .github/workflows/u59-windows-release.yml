@@ -186,6 +186,11 @@ jobs:
           Copy-Item -LiteralPath 'docs/EXPERIMENTAL.md' -Destination (Join-Path $release 'U59-README.md')
           Copy-Item -LiteralPath 'docs/ASTRO-BOT-DLSSG.md' -Destination (Join-Path $release 'README-DLSSG.md')
           Copy-Item -LiteralPath 'LICENSE' -Destination $release
+          # AMD FidelityFX FSR 3.1's Vulkan runtime (FidelityFX SDK v1.1.4, MIT; KYTY_FSR=1), next to the emulator.
+          $ffx = Join-Path $release 'amd_fidelityfx_vk.dll'
+          Invoke-WebRequest -UseBasicParsing -OutFile $ffx -Uri 'https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/c6efa6bf7f2027b3ec94f28578bb5965eabb9e55/PrebuiltSignedDLL/amd_fidelityfx_vk.dll'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $ffx).Hash -ne 'A1624CC4238FEF046F30C4D80CE3F47BE63FC5F5373F49E3EE9EDB9960F54C78') { throw 'amd_fidelityfx_vk.dll checksum mismatch' }
+          Copy-Item -LiteralPath '3rdparty/ffx-api/LICENSE.txt' -Destination (Join-Path $release 'LICENSE-AMD-FidelityFX.txt')
           # libFont's fallback font: the emulator looks for it under its working directory (the launcher starts it
           # in its own folder) when the build-time source path does not exist, as on every user's PC.
           $fonts = Join-Path $release '3rdparty/tracy/profiler/src/font'

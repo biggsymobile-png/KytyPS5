@@ -17,6 +17,8 @@
 // KYTY_DLSS=1: DLSS super resolution (DLSS-SR, Streamline's sl.dlss) in place of the game's TAA
 // pass, from the render size the game draws at (a "Fixed render resolution" patch lowers it) to
 // the TAA's output size (DLAA when they are equal); with or without frame generation.
+// KYTY_FSR=1: AMD FSR 3.1 upscaling the same way (any GPU, no Streamline needed; the FidelityFX
+// API's amd_fidelityfx_vk.dll next to the emulator); KYTY_FSR_SHARPNESS=0..1 adds its sharpening.
 // KYTY_DLSS_JITTER=projection takes the jitter from the camera's projection instead of the TAA's
 // constants; KYTY_DLSS_JITTER_X=-1 / KYTY_DLSS_JITTER_Y=-1 flip it; KYTY_DLSS_MV_JITTERED=1 tells
 // DLSS the motion vectors include the jitter.
@@ -87,7 +89,7 @@ void OnDevice(vk::PhysicalDevice physical_device);
 // Frame generation or DLSS-SR is on: the draws are watched for their inputs (OnDraw) and the
 // guest flips end each frame's gathering (PrepareInputs).
 [[nodiscard]] bool Gathering();
-// DLSS-SR is on (KYTY_DLSS=1, available on the device).
+// An upscaler is on: DLSS-SR (KYTY_DLSS=1) or FSR 3.1 (KYTY_FSR=1), available on the device.
 [[nodiscard]] bool UpscaleEnabled();
 
 // GPU thread, every draw after its bindings are prepared (while Enabled()).

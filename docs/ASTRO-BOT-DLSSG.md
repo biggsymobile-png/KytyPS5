@@ -63,7 +63,7 @@ change.
 ## Settings
 
 In the launcher, a game's **Graphics & display** settings have **Frame generation** (Off, 2x, 3x,
-4x; 3x and 4x need an RTX 50 card), **Upscaling** (the game's own TAA or NVIDIA DLSS) and
+4x; 3x and 4x need an RTX 50 card), **Upscaling** (the game's own TAA, NVIDIA DLSS or AMD FSR 3.1) and
 **Render resolution** (Astro Bot's; lower is faster). They take precedence over
 `u59-preset.json`.
 
@@ -109,6 +109,15 @@ If the image shimmers or looks soft and wobbly, the camera jitter's direction ma
 `"KYTY_DLSS_JITTER_X": "-1",` and/or `"KYTY_DLSS_JITTER_Y": "-1",`, or
 `"KYTY_DLSS_JITTER": "projection",` in `u59-preset.json`; trails behind moving things:
 `"KYTY_DLSS_MV_JITTERED": "1",`. Please report which one looked right.
+
+## AMD FSR 3.1 upscaling (experimental)
+
+**Upscaling: AMD FSR 3.1** in the launcher (`KYTY_FSR=1`) does the same as DLSS upscaling with
+AMD's FidelityFX Super Resolution 3.1, on **any GPU** (AMD, Intel, older NVIDIA) and without the
+Streamline files. Its runtime, `amd_fidelityfx_vk.dll` (FidelityFX SDK v1.1.4, MIT licence), is
+included next to the emulator. The console shows `FSR upscaling: 1920x1080 to ...` and
+`FSR upscaling: on`. `"KYTY_FSR_SHARPNESS": "0.5",` in `u59-preset.json` adds FSR's sharpening
+(0 to 1; default off). The jitter switches of DLSS above apply to FSR too.
 
 ## Known issues
 

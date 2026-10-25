@@ -174,8 +174,8 @@ bool Configuration::SetGameSettings(const QJsonObject& imported_settings, QStrin
 	if (frame_generation < 0 || frame_generation > 3) {
 		return fail(tr("Frame generation must be between 0 (off) and 3 (4x)."));
 	}
-	if (upscaler < 0 || upscaler > 1) {
-		return fail(tr("Upscaler must be 0 (the game's) or 1 (DLSS)."));
+	if (upscaler < 0 || upscaler > 2) {
+		return fail(tr("Upscaler must be 0 (the game's), 1 (DLSS) or 2 (FSR)."));
 	}
 	if (render_resolution < 0 || render_resolution > 4) {
 		return fail(tr("Render resolution must be between 0 (the game's choice) and 4 (2160p)."));

@@ -755,13 +755,14 @@ add_executable(game_patch_filter_tests EXCLUDE_FROM_ALL
 target_include_directories(game_patch_filter_tests PRIVATE ${inc_headers})
 
 # DLSS frame generation (graphics/host_gpu/renderer/frameGenDlssg.cpp): NVIDIA Streamline's headers
-# when unpacked under _Build/deps/streamline/sdk (CI: .github/workflows/build.yml). Windows only.
+# when unpacked under _Build/deps/streamline/sdk (CI: .github/workflows/build.yml), and AMD's
+# FidelityFX API headers (3rdparty/ffx-api, FSR 3.1 upscaling). Windows only.
 if(WIN32)
 	set(KYTY_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline/sdk" CACHE PATH
 	    "NVIDIA Streamline SDK headers for DLSS frame generation")
 	if(EXISTS "${KYTY_STREAMLINE_SDK}/include/sl.h")
 		set_source_files_properties("${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/frameGenDlssg.cpp"
-		    PROPERTIES INCLUDE_DIRECTORIES "${KYTY_STREAMLINE_SDK}/include"
+		    PROPERTIES INCLUDE_DIRECTORIES "${KYTY_STREAMLINE_SDK}/include;${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ffx-api/include"
 		               COMPILE_DEFINITIONS KYTY_FRAMEGEN_STREAMLINE=1)
 		message(STATUS "DLSS frame generation: Streamline headers from ${KYTY_STREAMLINE_SDK}")
 	endif()
