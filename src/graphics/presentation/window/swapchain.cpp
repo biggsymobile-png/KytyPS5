@@ -1280,7 +1280,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	}
 	// DLSS frame generation: this guest frame's depth, motion and camera, when it had them.
 	frame->fg.valid = false;
-	if (FrameGen::Enabled()) {
+	if (FrameGen::Gathering()) {
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(), buffer,
 		                        frame->fg);
 	}

@@ -762,6 +762,13 @@ void CommandBuffer::BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipel
 	current = pipeline;
 }
 
+void CommandBuffer::ForgetBoundState() {
+	m_bound_pipelines = {};
+	InvalidateDescriptors(vk::PipelineBindPoint::eGraphics);
+	InvalidateDescriptors(vk::PipelineBindPoint::eCompute);
+	m_push_constants.valid = false;
+}
+
 void CommandBuffer::InvalidateDescriptors(vk::PipelineBindPoint point) {
 	auto& state     = m_descriptor_states[BindingPointIndex(point)];
 	state.layout    = nullptr;

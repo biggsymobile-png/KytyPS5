@@ -1,7 +1,8 @@
 # KytyPS5 (Jetsku U59) with DLSS frame generation for Astro Bot
 
 An **experimental, unofficial** test build of [Jetsku/KytyPS5](https://github.com/Jetsku/KytyPS5)
-that adds NVIDIA **DLSS frame generation (DLSS-G)** to **ASTRO BOT (PPSA21564)**. Everything else
+that adds NVIDIA **DLSS frame generation (DLSS-G)** and, new and experimental, **DLSS upscaling
+(DLSS super resolution)** to **ASTRO BOT (PPSA21564)**. Everything else
 is Jetsku's U59 int21 release (24 October 2026).
 
 Frame generation only switches on where it finds Astro Bot's inputs; in other games it stays
@@ -73,8 +74,33 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FRAMEGEN=0` | Frame generation off |
 | `KYTY_FRAMEGEN=1` | 2x (default) |
 | `KYTY_FRAMEGEN=2` / `3` | 3x / 4x multi frame generation (RTX 50 only) |
+| `KYTY_DLSS=1` | DLSS upscaling in place of the game's anti-aliasing (TAA), see below |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
 | `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
+
+## DLSS upscaling (experimental)
+
+Astro Bot draws its 3D image at a render resolution and its own TAA pass upscales that to the
+output resolution. With `"KYTY_DLSS": "1",` in `u59-preset.json`, NVIDIA's DLSS does that step
+instead of the game's TAA (any RTX card). The render resolution is still the game's choice, so
+pick it with one of the game's **"Fixed render resolution"** patches:
+
+| Patch | DLSS works like |
+|---|---|
+| Fixed render resolution 1920x1080 | Performance (fastest; for lower-end GPUs) |
+| Fixed render resolution 2432x1368 | Quality |
+| Fixed render resolution 3328x1872 | between Ultra Quality and DLAA |
+| none / 3840x2160 | DLAA (native resolution, best image, a little slower than the game's TAA) |
+
+The console then shows `DLSS upscaling: 1920x1080 to 3840x2160 (Performance)` and `DLSS
+upscaling: on`. It works with or without frame generation (`KYTY_FRAMEGEN=0` for upscaling only).
+Your `streamline` folder needs Streamline's `sl.dlss.dll` and `nvngx_dlss.dll` (both in the SDK's
+`bin\x64`).
+
+If the image shimmers or looks soft and wobbly, the camera jitter's direction may be wrong: try
+`"KYTY_DLSS_JITTER_X": "-1",` and/or `"KYTY_DLSS_JITTER_Y": "-1",`, or
+`"KYTY_DLSS_JITTER": "projection",`; trails behind moving things: `"KYTY_DLSS_MV_JITTERED": "1",`.
+Please report which one looked right.
 
 ## Known issues
 

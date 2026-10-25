@@ -391,6 +391,10 @@ public:
 	void PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t size,
 	                   const void* data);
 	void InvalidatePushConstants() const { m_push_constants.valid = false; }
+	// After foreign commands that bind their own pipelines, descriptors and push constants (an
+	// NVIDIA Streamline evaluation, which leaves the command buffer's state to its caller): every
+	// bind shadow of this command buffer is forgotten, so the next draw or dispatch binds again.
+	void ForgetBoundState();
 
 	// Native handle for recording any command. Records pending batched barriers first.
 	[[nodiscard]] vk::CommandBuffer Handle() const;

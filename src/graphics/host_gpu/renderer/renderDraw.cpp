@@ -3991,7 +3991,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count},
 		                        m_run_active);
 	}
-	if (FrameGen::Enabled()) {
+	if (FrameGen::Gathering()) {
 		std::array<const PreparedBindings*, 3> fg_vertex {};
 		uint32_t                               fg_vertex_count = 0;
 		for (uint32_t i = 0; i < vertex_stages.size() && fg_vertex_count < 3; i++) {
@@ -4311,6 +4311,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitStats::StepMark(CommitStats::Step::Acquire);
 	CommitStats::Mark(CommitStats::Phase::AcquireTargets);
+	// KYTY_DLSS: DLSS super resolution writes Astro Bot's TAA outputs instead of its TAA draw.
+	if (FrameGen::UpscaleEnabled() && state.ps_active && bindings.pixel &&
+	    state.ps_input_info.stage.program != nullptr &&
+	    state.ps_input_info.stage.program->shader_hash == FrameGen::TaaPixelShader &&
+	    state.ps_input_info.stage.resources != nullptr) {
+		const auto& user_data = state.ps_input_info.stage.resources->user_data;
+		if (FrameGen::UpscaleTaa(buffer.GetGraphics(), m_context.GetTextureCache(), buffer,
+		                         *bindings.pixel, std::span {user_data.data(), user_data.size()},
+		                         std::span {state.color_info, state.color_count})) {
+			// The draw is not recorded; DLSS bound its own pipelines and descriptors.
+			m_run.valid           = false;
+			m_run_active          = false;
+			m_run_targets_kept    = false;
+			m_dynamic_state.valid = false;
+			for (auto& record: m_run_kept) {
+				record.valid = false;
+			}
+			return;
+		}
+	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest

@@ -14,6 +14,12 @@
 // KYTY_STREAMLINE_DIR=<folder>: NVIDIA's Streamline runtime (sl.interposer.dll and its plugins,
 // the SDK's bin\x64). Default: a "streamline" folder next to kyty_emulator.exe.
 // KYTY_FRAMEGEN_MV_SIGN=1 keeps the game's motion vector sign (a comparison; default negated).
+// KYTY_DLSS=1: DLSS super resolution (DLSS-SR, Streamline's sl.dlss) in place of the game's TAA
+// pass, from the render size the game draws at (a "Fixed render resolution" patch lowers it) to
+// the TAA's output size (DLAA when they are equal); with or without frame generation.
+// KYTY_DLSS_JITTER=projection takes the jitter from the camera's projection instead of the TAA's
+// constants; KYTY_DLSS_JITTER_X=-1 / KYTY_DLSS_JITTER_Y=-1 flip it; KYTY_DLSS_MV_JITTERED=1 tells
+// DLSS the motion vectors include the jitter.
 // Windows only, and only in builds with Streamline's headers (KYTY_FRAMEGEN_STREAMLINE).
 
 #include "graphics/host_gpu/graphicContext.h"
@@ -78,6 +84,11 @@ void BypassCommandHooks(vk::Device device);
 // After the device: DLSS-G available on it.
 void OnDevice(vk::PhysicalDevice physical_device);
 [[nodiscard]] bool Enabled();
+// Frame generation or DLSS-SR is on: the draws are watched for their inputs (OnDraw) and the
+// guest flips end each frame's gathering (PrepareInputs).
+[[nodiscard]] bool Gathering();
+// DLSS-SR is on (KYTY_DLSS=1, available on the device).
+[[nodiscard]] bool UpscaleEnabled();
 
 // GPU thread, every draw after its bindings are prepared (while Enabled()).
 void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
@@ -89,6 +100,14 @@ void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
+// GPU thread, at Astro Bot's TAA draw (TaaPixelShader) with its colour targets acquired, before
+// anything of the draw is recorded: DLSS-SR writes the TAA's two outputs (the frame and the next
+// frame's history) from its colour, depth and motion vectors. True: done, the draw is skipped;
+// false: the game's TAA draws (DLSS-SR off or unavailable, unexpected images, a failure).
+// `user_data`: the pixel shader's user data (its T#s).
+[[nodiscard]] bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
+                              const PreparedBindings& pixel, std::span<const uint32_t> user_data,
+                              std::span<const RenderColorInfo> colors);
 
 // Present thread, around vkQueuePresentKHR (null `inputs`: a frame without them, a menu).
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Format format,
