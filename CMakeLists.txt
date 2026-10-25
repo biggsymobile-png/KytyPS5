@@ -566,6 +566,11 @@ if (WIN32 AND KYTY_AFTERMATH_SDK AND EXISTS "${KYTY_AFTERMATH_SDK}/include/GFSDK
 endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus libzstd_static OpenXR::openxr_loader)
+# FSR 3 upscaling from the built-in FidelityFX sources on Linux and macOS (frameGenDlssg.cpp,
+# KYTY_FSR_NATIVE): every target built from the emulator's sources, tests included.
+if(NOT WIN32 AND TARGET kyty_fidelityfx)
+	list(APPEND kyty_emulator_link_libraries kyty_fidelityfx)
+endif()
 
 # Linux system libraries.
 if(LINUX)
@@ -2591,10 +2596,6 @@ add_dependencies(kyty_emulator kyty_touch_cursors)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
-if(NOT WIN32 AND TARGET kyty_fidelityfx)
-	# FSR 3 upscaling from the built-in FidelityFX sources (frameGenDlssg.cpp, KYTY_FSR_NATIVE).
-	target_link_libraries(kyty_emulator kyty_fidelityfx)
-endif()
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)
