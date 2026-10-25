@@ -356,6 +356,14 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_smooth_frame_pacing->setChecked(info.smooth_frame_pacing);
 	// (The spin box's minimum, 19, shows "Off".)
 	m_ui->spinBox_frame_rate_limit->setValue(info.frame_rate_limit == 0 ? 19 : info.frame_rate_limit);
+#if !defined(_WIN32)
+	// NVIDIA Streamline (frame generation, DLSS, Reflex) and AMD's FSR runtime are Windows only.
+	for (QWidget* field: std::initializer_list<QWidget*> {m_ui->comboBox_frame_generation,
+	                                                      m_ui->comboBox_upscaler,
+	                                                      m_ui->spinBox_frame_rate_limit}) {
+		m_ui->graphicsLayout->setRowVisible(field, false);
+	}
+#endif
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
 	m_ui->comboBox_console_language->setCurrentIndex(

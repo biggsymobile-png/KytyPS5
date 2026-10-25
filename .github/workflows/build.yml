@@ -317,7 +317,8 @@ jobs:
 
   linux:
     name: Build KytyPS5 (Linux)
-    if: ${{ !inputs.windows_only && inputs.release_tag == '' }}
+    # (Also for this fork's releases unless windows_only: fork-release-linux adds it to the release.)
+    if: ${{ !inputs.windows_only }}
     needs: metadata
     runs-on: ubuntu-24.04
 
@@ -566,3 +567,46 @@ jobs:
     with:
       tag: ${{ inputs.release_tag }}
       draft: ${{ inputs.draft }}
+
+  # The Linux build added to this fork's release (windows_only off): a .tar.gz ending in
+  # Linux-x86_64.tar.gz with kyty_emulator at its top, as Linux installers (Batocera's
+  # install_ps5_kyty.sh with KYTY_URL) expect, plus the preset the emulator applies itself on a
+  # start without the launcher.
+  fork-release-linux:
+    name: Linux package for the release
+    if: ${{ inputs.release_tag != '' && !inputs.windows_only }}
+    needs: [linux, fork-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            tools/u59-preset.json
+            docs/ASTRO-BOT-DLSSG.md
+            LICENSE
+          sparse-checkout-cone-mode: false
+
+      - name: Download Linux build
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-Linux-x86_64
+          path: artifacts/KytyPS5-Linux-x86_64
+
+      - name: Package and upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          linux_dir="artifacts/KytyPS5-Linux-x86_64"
+          test -x "$linux_dir/kyty_emulator" || chmod a+x "$linux_dir/kyty_emulator"
+          chmod a+x "$linux_dir/kyty_emulator" "$linux_dir/kyty_launcher" "$linux_dir/kyty_updater" || true
+          cp tools/u59-preset.json "$linux_dir/"
+          cp docs/ASTRO-BOT-DLSSG.md "$linux_dir/README-DLSSG.md"
+          cp LICENSE "$linux_dir/"
+          archive="KytyPS5-AstroBot-DLSSG-${TAG}-Linux-x86_64.tar.gz"
+          tar -C "$linux_dir" -czf "$archive" .
+          gh release upload "$TAG" "$archive" --clobber --repo "$GITHUB_REPOSITORY"

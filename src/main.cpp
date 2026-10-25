@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/u59Preset.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
@@ -795,7 +796,50 @@ static void InitCudaEarly() {
 }
 #endif
 
+// Started without the launcher (a frontend such as Batocera runs kyty_emulator directly):
+// u59-preset.json in the working directory or next to the emulator fills the settings the
+// environment does not already have, as the launcher does with the whole file. A launcher start
+// already has them all, so nothing changes there. KYTY_PRESET_AUTO=0 turns this off.
+static void ApplyPresetForDirectStart(const char* argv0) {
+	if (const char* off = std::getenv("KYTY_PRESET_AUTO"); off != nullptr && std::strcmp(off, "0") == 0) {
+		return;
+	}
+	std::vector<std::filesystem::path> dirs;
+	std::error_code                    error;
+	if (auto cwd = std::filesystem::current_path(error); !error) {
+		dirs.push_back(cwd);
+	}
+	if (argv0 != nullptr && argv0[0] != '\0') {
+		error.clear();
+		if (auto exe = std::filesystem::absolute(argv0, error); !error) {
+			dirs.push_back(exe.parent_path());
+		}
+	}
+	const auto result = Common::U59Preset::Load(dirs);
+	if (result.status != Common::U59Preset::Status::Loaded) {
+		return;
+	}
+	size_t applied = 0;
+	for (const auto& entry: result.entries) {
+		if (std::getenv(entry.key.c_str()) != nullptr) {
+			continue;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		(void)_putenv_s(entry.key.c_str(), entry.value.c_str());
+#else
+		(void)setenv(entry.key.c_str(), entry.value.c_str(), 0);
+#endif
+		applied++;
+	}
+	if (applied != 0) {
+		std::printf("u59-preset.json: %zu setting(s) applied from %s (started without the launcher)\n",
+		            applied, result.path.string().c_str());
+		std::fflush(stdout);
+	}
+}
+
 static int Main(int argc, char* argv[]) {
+	ApplyPresetForDirectStart(argc > 0 ? argv[0] : nullptr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	InitCudaEarly();
 #endif

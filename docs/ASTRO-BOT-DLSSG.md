@@ -124,6 +124,17 @@ included next to the emulator. The console shows `FSR upscaling: 1920x1080 to ..
 `FSR upscaling: on`. `"KYTY_FSR_SHARPNESS": "0.5",` in `u59-preset.json` adds FSR's sharpening
 (0 to 1; default off). The jitter switches of DLSS above apply to FSR too.
 
+## Linux and Batocera / Steam Deck
+
+The release also has a **Linux build** (`...-Linux-x86_64.tar.gz`). DLSS, frame generation, Reflex
+and FSR are Windows only and not in it; the built-in **render resolution** (`KYTY_ASTRO_RENDER_RES`,
+e.g. 1080) and everything else from Jetsku's int21 are. Started without the launcher (as frontends
+do), the emulator applies `u59-preset.json` from its folder itself, so add settings there, e.g.
+`"KYTY_ASTRO_RENDER_RES": "1080",`.
+
+Batocera: run the community `install_ps5_kyty.sh` with this release's Linux file:
+`KYTY_URL=<the .tar.gz's download link> bash install_ps5_kyty.sh`.
+
 ## Known issues
 
 - **Game patches are separate and up to you.** Frame generation does not depend on them: it works
