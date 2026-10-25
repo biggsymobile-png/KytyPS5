@@ -1079,6 +1079,31 @@ void RetireFsrContexts(bool all) {
 	}
 }
 
+// vkGetDeviceProcAddr for FSR's runtime: an entry point the device does not give under its
+// extension name (a KHR/EXT name of a core function whose extension is not enabled, e.g.
+// vkGetBufferMemoryRequirements2KHR) is looked up under its core name; one missing even so is
+// logged (FSR's runtime calls some without checking).
+PFN_vkVoidFunction VKAPI_CALL FsrGetDeviceProcAddr(VkDevice device, const char* name) {
+	auto* const real = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	if (real == nullptr || name == nullptr) return nullptr;
+	if (auto* function = real(device, name); function != nullptr) return function;
+	std::string core(name);
+	for (const char* suffix: {"KHR", "EXT"}) {
+		if (core.size() > 3 && core.compare(core.size() - 3, 3, suffix) == 0) {
+			core.resize(core.size() - 3);
+			if (auto* function = real(device, core.c_str()); function != nullptr) {
+				std::printf("FSR upscaling: %s taken as %s\n", name, core.c_str());
+				std::fflush(stdout);
+				return function;
+			}
+			break;
+		}
+	}
+	std::printf("FSR upscaling: the device has no %s\n", name);
+	std::fflush(stdout);
+	return nullptr;
+}
+
 // The FSR context for this render and output size (made again when either changes).
 bool EnsureFsrContext(GraphicContext& graphics, vk::Extent2D in, vk::Extent2D out, bool mv_jittered) {
 	if (g_fsr_api.context != nullptr && g_fsr_api.in == in && g_fsr_api.out == out) {
@@ -1092,7 +1117,7 @@ bool EnsureFsrContext(GraphicContext& graphics, vk::Extent2D in, vk::Extent2D ou
 	backend.header.type      = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
 	backend.vkDevice         = static_cast<VkDevice>(graphics.device);
 	backend.vkPhysicalDevice = static_cast<VkPhysicalDevice>(graphics.physical_device);
-	backend.vkDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+	backend.vkDeviceProcAddr = FsrGetDeviceProcAddr;
 	ffxCreateContextDescUpscale desc {};
 	desc.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
 	desc.header.pNext = &backend.header;
@@ -1102,6 +1127,9 @@ bool EnsureFsrContext(GraphicContext& graphics, vk::Extent2D in, vk::Extent2D ou
 	desc.maxUpscaleSize = {out.width, out.height};
 	desc.fpMessage      = FsrMessage;
 	ffxContext context  = nullptr;
+	std::printf("FSR upscaling: making its context (%ux%u to %ux%u)\n", in.width, in.height, out.width,
+	            out.height);
+	std::fflush(stdout);
 	if (const auto code = g_fsr_api.create(&context, &desc.header, nullptr);
 	    code != FFX_API_RETURN_OK || context == nullptr) {
 		UpscaleFailed("ffxCreateContext", ("error " + std::to_string(code)).c_str());
