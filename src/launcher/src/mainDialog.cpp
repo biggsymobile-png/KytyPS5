@@ -23,6 +23,9 @@
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
+#include <QProcessEnvironment>
+
+#include <algorithm>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -532,6 +535,21 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->setArguments(args);
 #endif
 	process->setWorkingDirectory(dir.path());
+	{
+		// DLSS frame generation and upscaling (Graphics settings), over the bundled preset's
+		// values, which the launcher put in its own environment at start.
+		auto environment = QProcessEnvironment::systemEnvironment();
+		environment.insert(QStringLiteral("KYTY_FRAMEGEN"), QString::number(info.frame_generation));
+		environment.insert(QStringLiteral("KYTY_DLSS"), QString::number(info.upscaler == 1 ? 1 : 0));
+		static constexpr int kRenderHeights[] = {0, 1080, 1368, 1872, 2160};
+		const int render = kRenderHeights[std::clamp(info.render_resolution, 0, 4)];
+		if (render != 0) {
+			environment.insert(QStringLiteral("KYTY_ASTRO_RENDER_RES"), QString::number(render));
+		} else {
+			environment.remove(QStringLiteral("KYTY_ASTRO_RENDER_RES"));
+		}
+		process->setProcessEnvironment(environment);
+	}
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);

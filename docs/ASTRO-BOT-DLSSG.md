@@ -62,6 +62,11 @@ change.
 
 ## Settings
 
+In the launcher, a game's **Graphics & display** settings have **Frame generation** (Off, 2x, 3x,
+4x; 3x and 4x need an RTX 50 card), **Upscaling** (the game's own TAA or NVIDIA DLSS) and
+**Render resolution** (Astro Bot's; lower is faster). They take precedence over
+`u59-preset.json`.
+
 This build is made like Jetsku's U59 releases (profile-guided optimisation trained on Astro Bot,
 the emulator's diagnostics compiled out) and ships Jetsku's tuned **`u59-preset.json`** next to
 the launcher. While that file is there, the launcher **ignores `KYTY_...` environment variables**
@@ -74,33 +79,36 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FRAMEGEN=0` | Frame generation off |
 | `KYTY_FRAMEGEN=1` | 2x (default) |
 | `KYTY_FRAMEGEN=2` / `3` | 3x / 4x multi frame generation (RTX 50 only) |
-| `KYTY_DLSS=1` | DLSS upscaling in place of the game's anti-aliasing (TAA), see below |
+| `KYTY_DLSS=1` | DLSS upscaling in place of the game's anti-aliasing (TAA), see below (launcher: Upscaling) |
+| `KYTY_ASTRO_RENDER_RES=1080` | Astro Bot's render resolution: 1080, 1368, 1872 or 2160 (launcher: Render resolution) |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
 | `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
 
 ## DLSS upscaling (experimental)
 
 Astro Bot draws its 3D image at a render resolution and its own TAA pass upscales that to the
-output resolution. With `"KYTY_DLSS": "1",` in `u59-preset.json`, NVIDIA's DLSS does that step
-instead of the game's TAA (any RTX card). The render resolution is still the game's choice, so
-pick it with one of the game's **"Fixed render resolution"** patches:
+output resolution. With DLSS upscaling on, NVIDIA's DLSS does that step instead of the game's TAA
+(any RTX card), from the render resolution the launcher's **Render resolution** picks:
 
-| Patch | DLSS works like |
+| Render resolution | DLSS works like |
 |---|---|
-| Fixed render resolution 1920x1080 | Performance (fastest; for lower-end GPUs) |
-| Fixed render resolution 2432x1368 | Quality |
-| Fixed render resolution 3328x1872 | between Ultra Quality and DLAA |
-| none / 3840x2160 | DLAA (native resolution, best image, a little slower than the game's TAA) |
+| 1920x1080 | Performance/Quality (fastest; for lower-end GPUs) |
+| 2432x1368 | Quality |
+| 3328x1872 | between Ultra Quality and DLAA |
+| Game's choice / 3840x2160 | DLAA (native resolution, best image, a little slower than the game's TAA) |
 
-The console then shows `DLSS upscaling: 1920x1080 to 3840x2160 (Performance)` and `DLSS
-upscaling: on`. It works with or without frame generation (`KYTY_FRAMEGEN=0` for upscaling only).
-Your `streamline` folder needs Streamline's `sl.dlss.dll` and `nvngx_dlss.dll` (both in the SDK's
-`bin\x64`).
+The render resolution needs no patch file: the emulator applies it itself (Astro Bot 01.018, and
+other versions where it finds the game's resolution code; the console says which). An enabled
+"Fixed render resolution" patch in a patch file takes precedence.
+
+The console shows `DLSS upscaling: 1920x1080 to ...` and `DLSS upscaling: on`, then a status line
+every 600 frames. It works with or without frame generation. Your `streamline` folder needs
+Streamline's `sl.dlss.dll` and `nvngx_dlss.dll` (both in the SDK's `bin\x64`).
 
 If the image shimmers or looks soft and wobbly, the camera jitter's direction may be wrong: try
 `"KYTY_DLSS_JITTER_X": "-1",` and/or `"KYTY_DLSS_JITTER_Y": "-1",`, or
-`"KYTY_DLSS_JITTER": "projection",`; trails behind moving things: `"KYTY_DLSS_MV_JITTERED": "1",`.
-Please report which one looked right.
+`"KYTY_DLSS_JITTER": "projection",` in `u59-preset.json`; trails behind moving things:
+`"KYTY_DLSS_MV_JITTERED": "1",`. Please report which one looked right.
 
 ## Known issues
 

@@ -5,6 +5,8 @@
 #include "mandatoryLineEdit.h"
 #include <SDL3/SDL.h>
 
+#include <algorithm>
+
 #include <QAbstractItemView>
 #include <QCheckBox>
 #include <QColorDialog>
@@ -339,6 +341,17 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->spinBox_trophy_duration->setValue(info.trophy_duration_seconds);
 	m_ui->checkBox_perf_overlay->setChecked(info.perf_overlay_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
+	m_ui->comboBox_frame_generation->clear();
+	m_ui->comboBox_frame_generation->addItems(
+	    {tr("Off"), tr("2x (DLSS-G)"), tr("3x (DLSS-G, RTX 50)"), tr("4x (DLSS-G, RTX 50)")});
+	m_ui->comboBox_frame_generation->setCurrentIndex(std::clamp(info.frame_generation, 0, 3));
+	m_ui->comboBox_upscaler->clear();
+	m_ui->comboBox_upscaler->addItems({tr("Game's own (TAA)"), tr("NVIDIA DLSS")});
+	m_ui->comboBox_upscaler->setCurrentIndex(std::clamp(info.upscaler, 0, 1));
+	m_ui->comboBox_render_resolution->clear();
+	m_ui->comboBox_render_resolution->addItems({tr("Game's choice"), tr("1920x1080 (fastest)"),
+	                                            tr("2432x1368"), tr("3328x1872"), tr("3840x2160")});
+	m_ui->comboBox_render_resolution->setCurrentIndex(std::clamp(info.render_resolution, 0, 4));
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
 	m_ui->comboBox_console_language->setCurrentIndex(
@@ -543,6 +556,9 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.trophy_duration_seconds   = ui.spinBox_trophy_duration->value();
 	info.perf_overlay_enabled      = ui.checkBox_perf_overlay->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
+	info.frame_generation          = std::max(ui.comboBox_frame_generation->currentIndex(), 0);
+	info.upscaler                  = std::max(ui.comboBox_upscaler->currentIndex(), 0);
+	info.render_resolution         = std::max(ui.comboBox_render_resolution->currentIndex(), 0);
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();

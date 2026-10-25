@@ -22,6 +22,9 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(skip_notice_screen);
 	KYTY_CFG_SET(network_connected);
 	KYTY_CFG_SET(vblank_frequency);
+	KYTY_CFG_SET(frame_generation);
+	KYTY_CFG_SET(upscaler);
+	KYTY_CFG_SET(render_resolution);
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
 	KYTY_CFG_SET(shader_validation_enabled);
@@ -72,6 +75,9 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(skip_notice_screen);
 	KYTY_CFG_GET(network_connected);
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
+	frame_generation = s.value("frame_generation", frame_generation).toInt();
+	upscaler         = s.value("upscaler", upscaler).toInt();
+	render_resolution = s.value("render_resolution", render_resolution).toInt();
 	console_language = s.value("console_language", console_language).toInt();
 	if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
 		console_language = DEFAULT_CONSOLE_LANGUAGE;
@@ -164,6 +170,15 @@ bool Configuration::SetGameSettings(const QJsonObject& imported_settings, QStrin
 	}
 	if (vblank_frequency < 30 || vblank_frequency > 360) {
 		return fail(tr("Vblank frequency must be between 30 and 360."));
+	}
+	if (frame_generation < 0 || frame_generation > 3) {
+		return fail(tr("Frame generation must be between 0 (off) and 3 (4x)."));
+	}
+	if (upscaler < 0 || upscaler > 1) {
+		return fail(tr("Upscaler must be 0 (the game's) or 1 (DLSS)."));
+	}
+	if (render_resolution < 0 || render_resolution > 4) {
+		return fail(tr("Render resolution must be between 0 (the game's choice) and 4 (2160p)."));
 	}
 	if (trophy_duration_seconds < 5 || trophy_duration_seconds > 10) {
 		return fail(tr("Trophy notification duration must be between 5 and 10 seconds."));

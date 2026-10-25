@@ -188,6 +188,14 @@ public:
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
 	int                    vblank_frequency            = 60;
+	// NVIDIA DLSS (Streamline; Astro Bot): frames generated per rendered frame (0 off, 1 = 2x,
+	// 2 = 3x, 3 = 4x; KYTY_FRAMEGEN) and the upscaler in place of the game's TAA (0 the game's,
+	// 1 DLSS; KYTY_DLSS). Set in the emulator's environment, over the bundled preset.
+	int                    frame_generation            = 1;
+	int                    upscaler                    = 0;
+	// Astro Bot's fixed render resolution (KYTY_ASTRO_RENDER_RES): 0 the game's choice, 1 1080p,
+	// 2 1368p, 3 1872p, 4 2160p.
+	int                    render_resolution           = 0;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -228,6 +236,9 @@ public:
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;
 		vblank_frequency            = other.vblank_frequency;
+		frame_generation            = other.frame_generation;
+		upscaler                    = other.upscaler;
+		render_resolution           = other.render_resolution;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
 		shader_validation_enabled   = other.shader_validation_enabled;

@@ -334,9 +334,101 @@ bool ApplyPending(Program* program) {
 	return true;
 }
 
+// KYTY_ASTRO_RENDER_RES=1080|1368|1872|2160 (the launcher's "Render resolution"; unset or
+// anything else: the game's own choice): Astro Bot (PPSA21564 / PPSA21567 01.018.000) renders at
+// that fixed resolution tier, as the community "Fixed render resolution" patches do (the same
+// write: "mov eax, [rbx+0x23f0]" -> "mov eax, <tier>; nop", at 0xc62a97 in 01.018, elsewhere where
+// the instruction is the only one of its kind), without a patch file. The
+// game's TAA (or DLSS, KYTY_DLSS) upscales it. Only the original bytes are replaced: a patch file
+// that already set the tier wins.
+void ApplyAstroRenderResolution(Program* main_program, const std::string& title_id,
+                                const std::string& version) {
+	const char* value = std::getenv("KYTY_ASTRO_RENDER_RES");
+	if (value == nullptr || value[0] == '\0') {
+		return;
+	}
+	const int height = std::atoi(value);
+	int       tier   = -1;
+	switch (height) {
+		case 1080: tier = 0; break;
+		case 1368: tier = 1; break;
+		case 1872: tier = 3; break;
+		case 2160: tier = 4; break;
+		default: return;
+	}
+	// Astro Bot's title IDs (US, EU).
+	if (title_id != "PPSA21564" && title_id != "PPSA21567") {
+		::printf("Game patch: render resolution %dp is for Astro Bot only (KYTY_ASTRO_RENDER_RES)\n",
+		         height);
+		return;
+	}
+	static constexpr uint64_t kOffset    = 0xc62a97; // 01.018.000
+	static constexpr uint8_t  kOrigin[6] = {0x8b, 0x83, 0xf0, 0x23, 0x00, 0x00};
+	static constexpr uint8_t  kPatched[2] = {0xb8, 0x90}; // first and last byte of "mov eax, n; nop"
+	uint8_t* code = nullptr;
+	const auto at = [&](uint64_t address) -> uint8_t* {
+		return IsInsideProgram(*main_program, address, sizeof(kOrigin))
+		           ? reinterpret_cast<uint8_t*>(address)
+		           : nullptr;
+	};
+	if (auto* known = at(main_program->base_vaddr + kOffset); known != nullptr) {
+		if (std::memcmp(known, kOrigin, sizeof(kOrigin)) == 0) {
+			code = known;
+		} else if (known[0] == kPatched[0] && known[5] == kPatched[1] && version == "01.018.000") {
+			::printf("Game patch: render resolution left as set by a game patch (KYTY_ASTRO_RENDER_RES=%d "
+			         "not applied)\n",
+			         height);
+			return;
+		}
+	}
+	if (code == nullptr) {
+		// Another version: the instruction where it is the only one of its kind in the executable
+		// segments; none or several: left alone.
+		const auto* ehdr  = main_program->elf->GetEhdr();
+		const auto* phdr  = main_program->elf->GetPhdr();
+		uint32_t    found = 0;
+		for (Elf64_Half index = 0; index < ehdr->e_phnum && found < 2; index++) {
+			const auto& segment = phdr[index];
+			if (segment.p_type != PT_LOAD || (segment.p_flags & PF_X) == 0 ||
+			    segment.p_filesz < sizeof(kOrigin)) {
+				continue;
+			}
+			auto*       begin = reinterpret_cast<uint8_t*>(main_program->base_vaddr + segment.p_vaddr);
+			auto* const end   = begin + segment.p_filesz;
+			for (auto* current = begin; found < 2;) {
+				auto* hit = std::search(current, end, std::begin(kOrigin), std::end(kOrigin));
+				if (hit == end) break;
+				code = hit;
+				found++;
+				current = hit + 1;
+			}
+		}
+		if (found != 1) {
+			::printf("Game patch: render resolution not applied: this version of Astro Bot (%s) has %s "
+			         "(KYTY_ASTRO_RENDER_RES)\n",
+			         version.c_str(), found == 0 ? "no known resolution code" : "several candidates");
+			return;
+		}
+	}
+	const auto address = reinterpret_cast<uint64_t>(code);
+	const uint8_t patched[6] = {kPatched[0], static_cast<uint8_t>(tier), 0x00, 0x00, 0x00, kPatched[1]};
+	std::memcpy(code, patched, sizeof(patched));
+	(void)Common::VirtualMemory::FlushInstructionCache(address, sizeof(patched));
+	::printf("Game patch: Astro Bot fixed render resolution %dp (%s, KYTY_ASTRO_RENDER_RES)\n", height,
+	         version.c_str());
+}
+
 void ApplyBuiltin(Program* main_program) {
 	if (main_program == nullptr || main_program->elf == nullptr || main_program->elf->IsShared()) {
 		return;
+	}
+	{
+		std::string title_id;
+		std::string version;
+		if (SystemContentParamSfoGetString("TITLE_ID", &title_id) &&
+		    SystemContentParamSfoGetString("APP_VER", &version)) {
+			ApplyAstroRenderResolution(main_program, title_id, version);
+		}
 	}
 	// KYTY_ASTRO_CB_SCALE=<1-4> (default 2; 1 = off): Astro Bot (PPSA21567 01.018.000) sizes its
 	// five draw threads' command buffers {7, 7, 4, 4, 6} MiB (table at 0x8491510, read by
