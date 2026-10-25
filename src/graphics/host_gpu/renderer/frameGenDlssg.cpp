@@ -1083,15 +1083,29 @@ void RetireFsrContexts(bool all) {
 // extension name (a KHR/EXT name of a core function whose extension is not enabled, e.g.
 // vkGetBufferMemoryRequirements2KHR) is looked up under its core name; one missing even so is
 // logged (FSR's runtime calls some without checking).
+VkInstance g_fsr_instance = VK_NULL_HANDLE; // (FsrGetDeviceProcAddr's fallback)
+
 PFN_vkVoidFunction VKAPI_CALL FsrGetDeviceProcAddr(VkDevice device, const char* name) {
-	auto* const real = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
-	if (real == nullptr || name == nullptr) return nullptr;
-	if (auto* function = real(device, name); function != nullptr) return function;
+	if (name == nullptr) return nullptr;
+	auto&      dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto lookup     = [&](const char* entry) -> PFN_vkVoidFunction {
+		if (dispatcher.vkGetDeviceProcAddr != nullptr) {
+			if (auto* function = dispatcher.vkGetDeviceProcAddr(device, entry); function != nullptr) {
+				return function;
+			}
+		}
+		// The loader's trampolines dispatch any device's call too.
+		if (dispatcher.vkGetInstanceProcAddr != nullptr && g_fsr_instance != VK_NULL_HANDLE) {
+			return dispatcher.vkGetInstanceProcAddr(g_fsr_instance, entry);
+		}
+		return nullptr;
+	};
+	if (auto* function = lookup(name); function != nullptr) return function;
 	std::string core(name);
 	for (const char* suffix: {"KHR", "EXT"}) {
 		if (core.size() > 3 && core.compare(core.size() - 3, 3, suffix) == 0) {
 			core.resize(core.size() - 3);
-			if (auto* function = real(device, core.c_str()); function != nullptr) {
+			if (auto* function = lookup(core.c_str()); function != nullptr) {
 				std::printf("FSR upscaling: %s taken as %s\n", name, core.c_str());
 				std::fflush(stdout);
 				return function;
@@ -1099,8 +1113,12 @@ PFN_vkVoidFunction VKAPI_CALL FsrGetDeviceProcAddr(VkDevice device, const char* 
 			break;
 		}
 	}
-	std::printf("FSR upscaling: the device has no %s\n", name);
-	std::fflush(stdout);
+	static std::atomic<uint32_t> missing {0};
+	if (missing.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::printf("FSR upscaling: the device has no %s (getDeviceProcAddr %p)\n", name,
+		            reinterpret_cast<void*>(dispatcher.vkGetDeviceProcAddr));
+		std::fflush(stdout);
+	}
 	return nullptr;
 }
 
@@ -1118,6 +1136,7 @@ bool EnsureFsrContext(GraphicContext& graphics, vk::Extent2D in, vk::Extent2D ou
 	backend.vkDevice         = static_cast<VkDevice>(graphics.device);
 	backend.vkPhysicalDevice = static_cast<VkPhysicalDevice>(graphics.physical_device);
 	backend.vkDeviceProcAddr = FsrGetDeviceProcAddr;
+	g_fsr_instance           = static_cast<VkInstance>(graphics.instance);
 	ffxCreateContextDescUpscale desc {};
 	desc.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
 	desc.header.pNext = &backend.header;
