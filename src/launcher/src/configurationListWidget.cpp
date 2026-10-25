@@ -92,6 +92,57 @@ constexpr int GAME_PATH_COLUMN             = 5;
 constexpr int GAME_STATUS_COLUMN           = 6;
 constexpr int GAME_COMMENT_COLUMN          = 7;
 
+static std::unique_ptr<QSettings> OpenGlobalSettings() {
+#ifdef __linux__
+	return std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
+	                                   CONF_APP_NAME);
+#else
+	return std::make_unique<QSettings>(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
+	                                   CONF_APP_NAME);
+#endif
+}
+
+// Portable settings: this build keeps its own Kyty.ini beside the launcher, so different builds
+// stop overwriting each other's settings. The first start copies the global Kyty.ini (game
+// folders, per-game settings) into it. A Kyty.ini in the current folder still wins, as before;
+// KYTY_PORTABLE=0, or a launcher folder that cannot be written, keeps the global file.
+static std::unique_ptr<QSettings> OpenLauncherSettings() {
+	const QString cwd_file = QDir(".").absoluteFilePath(CONF_FILE_NAME);
+	if (QFileInfo::exists(cwd_file)) {
+		return std::make_unique<QSettings>(cwd_file, QSettings::IniFormat);
+	}
+	const QByteArray portable = qgetenv("KYTY_PORTABLE");
+	if (portable == "0") {
+		return OpenGlobalSettings();
+	}
+	QString app_dir = QCoreApplication::applicationDirPath();
+#if defined(__APPLE__)
+	// macOS: beside KytyPS5.app, not inside the signed bundle (KytyPS5.app/Contents/MacOS).
+	if (QDir outside(app_dir); app_dir.endsWith(QStringLiteral(".app/Contents/MacOS")) && outside.cdUp() &&
+	                           outside.cdUp() && outside.cdUp()) {
+		app_dir = outside.absolutePath();
+	}
+#endif
+	const QString local_file = QDir(app_dir).absoluteFilePath(CONF_FILE_NAME);
+	if (!QFileInfo::exists(local_file)) {
+		const QFileInfo dir_info(app_dir);
+		if (!dir_info.isWritable()) {
+			return OpenGlobalSettings();
+		}
+		const QString global_file = OpenGlobalSettings()->fileName();
+		if (QFileInfo::exists(global_file)) {
+			QFile::copy(global_file, local_file);
+		}
+		if (!QFileInfo::exists(local_file)) {
+			QFile create(local_file);
+			if (!create.open(QIODevice::WriteOnly)) {
+				return OpenGlobalSettings();
+			}
+		}
+	}
+	return std::make_unique<QSettings>(local_file, QSettings::IniFormat);
+}
+
 static QString NormalizeGameDirectory(const QString& dir) {
 	const auto trimmed = dir.trimmed();
 	if (trimmed.isEmpty()) {
@@ -382,19 +433,7 @@ void ConfigurationListWidget::UpdateToolbarIcons() {
 }
 
 void ConfigurationListWidget::WriteSettings() {
-	QFile                      file = QFile(QDir(".").absoluteFilePath(CONF_FILE_NAME));
-	std::unique_ptr<QSettings> s;
-	if (file.exists()) {
-		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
-	} else {
-#ifdef __linux__
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#else
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#endif
-	}
+	std::unique_ptr<QSettings> s = OpenLauncherSettings();
 
 	MainDialog::WriteSettings(*s);
 	ConfigurationEditDialog::WriteSettings(*s);
@@ -426,19 +465,7 @@ void ConfigurationListWidget::WriteSettings() {
 }
 
 void ConfigurationListWidget::ReadSettings() {
-	QFile                      file = QFile(QDir(".").absoluteFilePath(CONF_FILE_NAME));
-	std::unique_ptr<QSettings> s;
-	if (file.exists()) {
-		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
-	} else {
-#ifdef __linux__
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#else
-		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::SystemScope, CONF_ORG_NAME,
-		                                CONF_APP_NAME);
-#endif
-	}
+	std::unique_ptr<QSettings> s = OpenLauncherSettings();
 
 	m_settings_file = s->fileName();
 

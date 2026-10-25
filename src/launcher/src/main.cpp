@@ -22,6 +22,13 @@ static QString ApplyBundledPreset() {
 	if (QDir parent = app_dir; parent.cdUp()) {
 		dirs.emplace_back(parent.absolutePath().toStdU16String());
 	}
+#if defined(__APPLE__)
+	// macOS: the folder holding KytyPS5.app (KytyPS5.app/Contents/MacOS is the launcher's own), so
+	// the preset can be edited without touching the signed bundle.
+	if (QDir outside = app_dir; outside.cdUp() && outside.cdUp() && outside.cdUp()) {
+		dirs.emplace_back(outside.absolutePath().toStdU16String());
+	}
+#endif
 
 	const auto result = Common::U59Preset::Load(dirs);
 	if (result.status != Common::U59Preset::Status::Loaded) {

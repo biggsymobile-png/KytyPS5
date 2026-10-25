@@ -160,7 +160,7 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
-    if: ${{ !inputs.windows_only && inputs.release_tag == '' }}
+    if: ${{ !inputs.windows_only }}
     needs: metadata
     runs-on: macos-15
 
@@ -215,6 +215,7 @@ jobs:
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
+            ${{ inputs.release_tag != '' && '-DKYTY_EMULATOR_IPO=ON -DKYTY_CP_DIAGNOSTICS=OFF' || '' }} \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
@@ -610,4 +611,44 @@ jobs:
           cp LICENSE "$linux_dir/"
           archive="KytyPS5-AstroBot-DLSSG-${TAG}-Linux-x86_64.tar.gz"
           tar -C "$linux_dir" -czf "$archive" .
+          gh release upload "$TAG" "$archive" --clobber --repo "$GITHUB_REPOSITORY"
+
+  fork-release-macos:
+    name: macOS package for the release
+    if: ${{ inputs.release_tag != '' && !inputs.windows_only }}
+    needs: [macos, fork-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            tools/u59-preset.json
+            docs/ASTRO-BOT-DLSSG.md
+            LICENSE
+          sparse-checkout-cone-mode: false
+
+      - name: Download macOS build
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-macOS-x86_64
+          path: artifacts
+
+      - name: Package and upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          mac_dir="artifacts/KytyPS5-macOS"
+          mkdir -p "$mac_dir"
+          unzip -q artifacts/KytyPS5-macOS-x86_64.zip -d "$mac_dir"
+          # (Beside KytyPS5.app, outside the signed bundle: the launcher looks there too.)
+          cp tools/u59-preset.json "$mac_dir/"
+          cp docs/ASTRO-BOT-DLSSG.md "$mac_dir/README-DLSSG.md"
+          cp LICENSE "$mac_dir/"
+          archive="$PWD/KytyPS5-AstroBot-DLSSG-${TAG}-macOS-x86_64.zip"
+          (cd "$mac_dir" && zip -qry "$archive" .)
           gh release upload "$TAG" "$archive" --clobber --repo "$GITHUB_REPOSITORY"

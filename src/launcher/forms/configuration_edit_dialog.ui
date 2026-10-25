@@ -363,6 +363,12 @@
               <property name="value"><number>19</number></property>
              </widget>
             </item>
+            <item row="15" column="1">
+             <widget class="QCheckBox" name="checkBox_relaxed_shader_maths">
+              <property name="toolTip"><string>Experimental: maps the PS5 GPU's exact float rules (NaN-aware min/max, denormals, rounding) to the PC GPU's own instructions. Smaller shaders that compile and run a little faster; if you see sparkles, black or white pixels or broken effects, turn it off. The first start after changing it compiles the shaders again (KYTY_FLOAT_PROFILE=relaxed).</string></property>
+              <property name="text"><string>Relaxed shader maths (faster, experimental)</string></property>
+             </widget>
+            </item>
             <item row="13" column="1">
              <widget class="QCheckBox" name="checkBox_smooth_frame_pacing">
               <property name="toolTip"><string>Runs the emulator's virtual vblank on an absolute timeline: after a slow frame, a vblank is skipped instead of the next frames being shown back to back to catch up. Can feel smoother when the frame rate dips (KYTY_PRESENT_ABS_VBLANK).</string></property>

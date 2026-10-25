@@ -88,7 +88,7 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FRAMEGEN_FPS_CAP=40` | With frame generation: Reflex limits the rendered frames to 40 fps (launcher: Frame rate limit) |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
 | `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
-| `KYTY_FLOAT_PROFILE=relaxed` | Simpler shader maths, see below (launcher: Shader maths) |
+| `KYTY_FLOAT_PROFILE=relaxed` | Simpler shader maths, see below (launcher: Relaxed shader maths) |
 
 **Shader maths profile (`KYTY_FLOAT_PROFILE`, experimental):** `precise` (the default) copies the
 PS5 GPU's exact floating-point rules, which takes several instructions for things like min/max with
@@ -133,16 +133,30 @@ included next to the emulator. The console shows `FSR upscaling: 1920x1080 to ..
 `FSR upscaling: on`. `"KYTY_FSR_SHARPNESS": "0.5",` in `u59-preset.json` adds FSR's sharpening
 (0 to 1; default off). The jitter switches of DLSS above apply to FSR too.
 
-## Linux and Batocera / Steam Deck
+## Linux, Batocera / Steam Deck and macOS
 
-The release also has a **Linux build** (`...-Linux-x86_64.tar.gz`). DLSS, frame generation, Reflex
-and FSR are Windows only and not in it; the built-in **render resolution** (`KYTY_ASTRO_RENDER_RES`,
-e.g. 1080) and everything else from Jetsku's int21 are. Started without the launcher (as frontends
-do), the emulator applies `u59-preset.json` from its folder itself, so add settings there, e.g.
-`"KYTY_ASTRO_RENDER_RES": "1080",`.
+The release also has a **Linux build** (`...-Linux-x86_64.tar.gz`) and a **macOS build**
+(`...-macOS-x86_64.zip`, Intel Macs; Apple Silicon through Rosetta, with MoltenVK). DLSS, frame
+generation and Reflex are Windows only and not in them. **FSR upscaling is**: there it is built
+into the emulator from AMD's FidelityFX SDK 1.1.4 sources (no extra file), so **Upscaling: AMD
+FSR** in the launcher, or `"KYTY_FSR": "1",` in `u59-preset.json`, works on any Vulkan GPU. The
+built-in **render resolution** (`KYTY_ASTRO_RENDER_RES`, e.g. 1080) and everything else from
+Jetsku's int21 are in them too. FSR on Linux and macOS is new and untested by us: please report
+whether it works (and the console's `FSR upscaling:` lines if it does not).
+
+Started without the launcher (as frontends do), the emulator applies `u59-preset.json` from its
+folder itself, so add settings there, e.g. `"KYTY_ASTRO_RENDER_RES": "1080",` and
+`"KYTY_FSR": "1",`. On macOS, keep `u59-preset.json` next to `KytyPS5.app`.
 
 Batocera: run the community `install_ps5_kyty.sh` with this release's Linux file:
 `KYTY_URL=<the .tar.gz's download link> bash install_ps5_kyty.sh`.
+
+## Separate settings per build (portable)
+
+These builds keep their own `Kyty.ini` (game folders, per-game settings) next to the launcher
+(on macOS next to `KytyPS5.app`), so another Kyty build no longer overwrites them. The first start
+copies the shared one, so nothing has to be set up again. `KYTY_PORTABLE=0` goes back to the
+shared file; a folder the launcher cannot write to (e.g. Program Files) does too.
 
 
 ## Known issues

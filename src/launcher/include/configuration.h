@@ -200,6 +200,8 @@ public:
 	// KYTY_PRESENT_ABS_VBLANK: the virtual vblank on an absolute timeline (a late frame skips a
 	// vblank instead of bunching the next flips together).
 	bool                   smooth_frame_pacing         = false;
+	// KYTY_FLOAT_PROFILE=relaxed: host float instructions in place of the exact guest rules.
+	bool                   relaxed_shader_maths        = false;
 	// KYTY_FRAMEGEN_FPS_CAP: NVIDIA Reflex's limit on the rendered frame rate with frame generation
 	// (0 off; 20-240).
 	int                    frame_rate_limit            = 0;
@@ -247,6 +249,7 @@ public:
 		upscaler                    = other.upscaler;
 		render_resolution           = other.render_resolution;
 		smooth_frame_pacing         = other.smooth_frame_pacing;
+		relaxed_shader_maths        = other.relaxed_shader_maths;
 		frame_rate_limit            = other.frame_rate_limit;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
