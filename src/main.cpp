@@ -821,7 +821,9 @@ static void ApplyPresetForDirectStart(const char* argv0) {
 	}
 	size_t applied = 0;
 	for (const auto& entry: result.entries) {
-		if (std::getenv(entry.key.c_str()) != nullptr) {
+		// (An empty value is no setting: Windows keeps no empty variables, so the launcher's copy of
+		// one is missing here too.)
+		if (entry.value.empty() || std::getenv(entry.key.c_str()) != nullptr) {
 			continue;
 		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
