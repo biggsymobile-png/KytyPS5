@@ -147,6 +147,11 @@ void                     DestroySwapchain();
 // this present and, with inputs, its preparation from the frame's depth, motion and camera.
 void RecordFsrPrepare(GraphicContext& graphics, vk::CommandBuffer command, const FrameInputs* inputs,
                       vk::Extent2D backbuffer);
+// Present thread, in RecordPresentCommands when an overlay layer (the game's HUD on PS5's overlay
+// bus) is drawn over the frame: the backbuffer as it is before the overlay, `layout` its layout
+// (left in it), copied as FSR's HUD-less image, so FSR keeps the HUD out of its interpolation.
+void RecordFsrHudless(GraphicContext& graphics, vk::CommandBuffer command, vk::Image backbuffer,
+                      vk::ImageLayout layout, vk::Format format, vk::Extent2D extent);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

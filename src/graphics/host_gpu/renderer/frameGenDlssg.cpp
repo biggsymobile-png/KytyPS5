@@ -1764,8 +1764,12 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	static const float sign_x = EnvSign("KYTY_DLSS_JITTER_X"), sign_y = EnvSign("KYTY_DLSS_JITTER_Y");
 	// (Astro's Playroom: its TAA constants hold no jitter, the projection does; a TAA jitter of
 	// exactly zero with a jittered projection takes the projection's.)
-	const bool from_projection = use_projection || (taa_jitter_x == 0.0f && taa_jitter_y == 0.0f &&
-	                                                (projection_x != 0.0f || projection_y != 0.0f));
+	// (Under a thousandth of a pixel counts as none: Playroom's words there are tiny, not zero.)
+	const float taa_px_x = std::fabs(taa_jitter_x * static_cast<float>(in.width));
+	const float taa_px_y = std::fabs(taa_jitter_y * static_cast<float>(in.height));
+	const bool  from_projection =
+	    use_projection || (taa_px_x < 1e-3f && taa_px_y < 1e-3f &&
+	                       (std::fabs(projection_x) >= 1e-3f || std::fabs(projection_y) >= 1e-3f));
 	const float jitter_x = from_projection ? projection_x : -taa_jitter_x * static_cast<float>(in.width);
 	const float jitter_y = from_projection ? projection_y : -taa_jitter_y * static_cast<float>(in.height);
 	constants.jitterOffset = sl::float2(jitter_x * sign_x, jitter_y * sign_y);
@@ -2133,6 +2137,15 @@ struct FsrFg {
 	GraphicContext*                             graphics       = nullptr;
 };
 FsrFg g_fsr_fg_state;
+// FSR's HUD-less images (RecordFsrHudless): two in turn (a generated frame may still read the
+// previous one while this frame's is copied).
+struct FsrHudless {
+	std::array<VulkanImage, 2> images {};
+	uint32_t                   index = 0;
+	bool                       ready = false; // this present's copy was made
+	bool                       reported = false;
+};
+FsrHudless g_fsr_hudless;
 // (DLSS-G's: on after a run of frames with inputs, off after a run without.)
 constexpr uint32_t FsrTurnOnAfter = 10, FsrTurnOffAfter = 30;
 
@@ -2339,6 +2352,112 @@ vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& present) {
 #endif
 }
 
+void RecordFsrHudless(GraphicContext& graphics, vk::CommandBuffer command, vk::Image backbuffer,
+                      vk::ImageLayout layout, vk::Format format, vk::Extent2D extent) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	auto& h = g_fsr_hudless;
+	h.ready = false;
+	// KYTY_FSR_HUDLESS=0: no HUD-less image (FSR interpolates the HUD with the scene).
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FSR_HUDLESS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	if (!enabled || !OwnsSwapchain() || g_fsr_fg_state.fg_context == nullptr || !g_fsr_fg_state.mode_on) return;
+	h.index     = (h.index + 1u) % static_cast<uint32_t>(h.images.size());
+	auto& image = h.images[h.index];
+	if (image.image == nullptr || image.format != format || image.extent.width != extent.width ||
+	    image.extent.height != extent.height) {
+		if (image.image != nullptr) {
+			graphics.DeleteImage(image);
+		}
+		vk::ImageCreateInfo create {};
+		create.imageType     = vk::ImageType::e2D;
+		create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+		create.mipLevels     = 1;
+		create.arrayLayers   = 1;
+		create.format        = format;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage         = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+		create.sharingMode = vk::SharingMode::eExclusive;
+		create.samples     = vk::SampleCountFlagBits::e1;
+		if (!graphics.CreateImage(create, image)) {
+			std::printf("Frame generation: cannot make FSR's %ux%u HUD-less image; the HUD is interpolated\n",
+			            extent.width, extent.height);
+			std::fflush(stdout);
+			return;
+		}
+	}
+	// The backbuffer as its blit left it (`layout`), copied, then back in `layout`.
+	vk::ImageMemoryBarrier2 barriers[2] {};
+	barriers[0].srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barriers[0].srcAccessMask       = vk::AccessFlagBits2::eMemoryWrite;
+	barriers[0].dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barriers[0].dstAccessMask       = vk::AccessFlagBits2::eTransferRead;
+	barriers[0].oldLayout           = layout;
+	barriers[0].newLayout           = vk::ImageLayout::eTransferSrcOptimal;
+	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barriers[0].image               = backbuffer;
+	barriers[0].subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	barriers[1]                     = barriers[0];
+	barriers[1].srcAccessMask       = image.state.access_mask;
+	barriers[1].srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barriers[1].dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	barriers[1].oldLayout           = vk::ImageLayout::eUndefined;
+	barriers[1].newLayout           = vk::ImageLayout::eTransferDstOptimal;
+	barriers[1].image               = image.image;
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 2;
+	dependency.pImageMemoryBarriers    = barriers;
+	command.pipelineBarrier2(dependency);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {extent.width, extent.height, 1};
+	command.copyImage(backbuffer, vk::ImageLayout::eTransferSrcOptimal, image.image,
+	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	vk::ImageMemoryBarrier2 back {};
+	back.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	back.srcAccessMask       = vk::AccessFlagBits2::eTransferRead;
+	back.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	back.dstAccessMask       = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	back.oldLayout           = vk::ImageLayout::eTransferSrcOptimal;
+	back.newLayout           = layout;
+	back.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	back.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	back.image               = backbuffer;
+	back.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	// (The copy for FSR's compute passes: its "compute read" state.)
+	vk::ImageMemoryBarrier2 ready {};
+	ready.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	ready.srcAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	ready.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	ready.dstAccessMask       = vk::AccessFlagBits2::eShaderRead;
+	ready.oldLayout           = vk::ImageLayout::eTransferDstOptimal;
+	ready.newLayout           = vk::ImageLayout::eShaderReadOnlyOptimal;
+	ready.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	ready.image               = image.image;
+	ready.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::ImageMemoryBarrier2 after[2] {back, ready};
+	dependency.imageMemoryBarrierCount = 2;
+	dependency.pImageMemoryBarriers    = after;
+	command.pipelineBarrier2(dependency);
+	image.state.layout      = vk::ImageLayout::eShaderReadOnlyOptimal;
+	image.state.access_mask = vk::AccessFlagBits2::eShaderRead;
+	image.state.pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
+	h.ready                 = true;
+	if (!std::exchange(h.reported, true)) {
+		std::printf("Frame generation: the game draws a HUD layer; FSR gets the frame without it (HUD-less, "
+		            "KYTY_FSR_HUDLESS=0 off)\n");
+		std::fflush(stdout);
+	}
+#else
+	(void)graphics, (void)command, (void)backbuffer, (void)layout, (void)format, (void)extent;
+#endif
+}
+
 void RecordFsrPrepare(GraphicContext& graphics, vk::CommandBuffer command, const FrameInputs* inputs,
                       vk::Extent2D backbuffer) {
 	(void)graphics;
@@ -2385,6 +2504,12 @@ void RecordFsrPrepare(GraphicContext& graphics, vk::CommandBuffer command, const
 	config.onlyPresentGenerated               = false;
 	config.generationRect                     = {0, 0, static_cast<int32_t>(backbuffer.width),
 	                                             static_cast<int32_t>(backbuffer.height)};
+	// (This present's backbuffer before the HUD layer was drawn over it, RecordFsrHudless: FSR takes
+	// the HUD from the frame and keeps it out of the interpolation.)
+	if (std::exchange(g_fsr_hudless.ready, false)) {
+		config.HUDLessColor =
+		    FsrResource(g_fsr_hudless.images[g_fsr_hudless.index], FFX_API_RESOURCE_STATE_COMPUTE_READ);
+	}
 	config.frameID                            = id;
 	if (!FsrFgOk(g_fsr_api.configure(&s.fg_context, &config.header), "configure") || !mode_on || !usable) return;
 

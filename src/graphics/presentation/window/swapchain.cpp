@@ -1174,6 +1174,12 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           &to_present);
 	if (draw_attachment) {
 		if (draw_overlay) {
+			// AMD FSR frame generation: the frame before the game's HUD layer is drawn over it, FSR's
+			// HUD-less image (it then keeps the HUD out of the generated frames).
+			if (m_fsr_swapchain) {
+				FrameGen::RecordFsrHudless(m_window.graphic_ctx, vk_command, m_images[m_image_index],
+				                           vk::ImageLayout::eColorAttachmentOptimal, m_format, m_extent);
+			}
 			DrawOverlay(vk_command, overlay);
 			if (draw_system_overlay) {
 				to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
