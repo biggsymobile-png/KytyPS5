@@ -33,6 +33,7 @@
 #pragma comment(lib, "crypt32.lib")
 
 #include <ffx_api/ffx_api.h>
+#include <ffx_api/ffx_framegeneration.h>
 #include <ffx_api/ffx_upscale.h>
 #include <ffx_api/vk/ffx_api_vk.h>
 #include <sl.h>
@@ -604,6 +605,12 @@ bool FindFunctions(bool report) {
 #ifdef KYTY_UPSCALER_CODE
 bool LoadFsr(); // (with FSR's state, below)
 #endif
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+bool LoadFsrModule(const char* who);
+#endif
+// AMD FSR 3.1 frame generation (KYTY_FRAMEGEN_BACKEND=fsr): asked for, and ready (runtime and queues).
+bool              g_fsr_fg = false;
+std::atomic<bool> g_fsr_fg_ready {false};
 
 } // namespace
 
@@ -616,6 +623,24 @@ void Initialize() {
 	g_fsr             = fsr != nullptr && fsr[0] != '\0' && fsr[0] != '0';
 	if (g_fsr) {
 		g_upscale = false; // (one upscaler: FSR, which needs no Streamline)
+	}
+	// KYTY_FRAMEGEN_BACKEND=fsr: AMD FSR 3.1 frame generation (2x) in place of DLSS-G.
+	if (const char* backend = std::getenv("KYTY_FRAMEGEN_BACKEND");
+	    backend != nullptr && std::strcmp(backend, "fsr") == 0 && g_generate > 0) {
+		g_generate = 0; // (no Streamline frame generation)
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+		if (g_upscale) {
+			// (DLSS upscaling makes Streamline the Vulkan loader; FSR's swapchain goes to the system's.)
+			std::printf("Frame generation: FSR frame generation does not run with DLSS upscaling; use FSR "
+			            "upscaling or the game's. Frame generation off\n");
+		} else if (LoadFsrModule("FSR frame generation")) {
+			g_fsr_fg = true;
+			std::printf("Frame generation: AMD FSR 3.1 frame generation asked for (2x)\n");
+		}
+#else
+		std::printf("Frame generation: FSR frame generation is not in this build (Windows only for now)\n");
+#endif
+		std::fflush(stdout);
 	}
 	if (g_generate == 0 && !g_upscale) {
 		return;
@@ -760,7 +785,8 @@ bool Enabled() {
 }
 
 bool Gathering() {
-	return g_ready.load(std::memory_order_relaxed) || g_sr_ready.load(std::memory_order_relaxed);
+	return g_ready.load(std::memory_order_relaxed) || g_sr_ready.load(std::memory_order_relaxed) ||
+	       g_fsr_fg_ready.load(std::memory_order_relaxed);
 }
 
 bool UpscaleEnabled() {
@@ -993,7 +1019,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 		gathered   = g_gathered;
 		g_gathered = {};
 	}
-	if (!g_ready) return;
+	if (!g_ready && !g_fsr_fg_ready.load(std::memory_order_relaxed)) return;
 	if (!gathered.gbuffer || !gathered.taa || !gathered.camera.valid ||
 	    gathered.motion_address != gathered.gbuffer_motion_address) {
 		return;
@@ -1228,6 +1254,8 @@ struct FsrApi {
 	PfnFfxCreateContext  create   = nullptr;
 	PfnFfxDestroyContext destroy  = nullptr;
 	PfnFfxDispatch       dispatch = nullptr;
+	PfnFfxConfigure      configure = nullptr;
+	PfnFfxQuery          query     = nullptr;
 	ffxContext           context  = nullptr;
 	vk::Extent2D         in {}, out {};
 	// Contexts of an earlier size, destroyed once frames in flight can no longer use them.
@@ -1354,14 +1382,15 @@ FfxApiResource FsrResource(const VulkanImage& image, uint32_t state) {
 	                           ffxApiGetImageResourceDescriptionVK(vk_image, info, 0), state);
 }
 
-bool LoadFsr() {
+// AMD's runtime, once (FSR upscaling and FSR frame generation share it). `who`: for the messages.
+bool LoadFsrModule(const char* who) {
+	if (g_fsr_api.module != nullptr) return true;
 	wchar_t exe[MAX_PATH] {};
 	GetModuleFileNameW(nullptr, exe, MAX_PATH);
 	const auto path   = std::filesystem::path(exe).parent_path() / "amd_fidelityfx_vk.dll";
 	HMODULE    module = LoadLibraryW(path.c_str());
 	if (module == nullptr) {
-		std::printf("FSR upscaling: amd_fidelityfx_vk.dll was not found next to kyty_emulator.exe; the "
-		            "game's TAA is used\n");
+		std::printf("%s: amd_fidelityfx_vk.dll was not found next to kyty_emulator.exe; off\n", who);
 		std::fflush(stdout);
 		return false;
 	}
@@ -1371,12 +1400,18 @@ bool LoadFsr() {
 		return function != nullptr;
 	};
 	if (!load(g_fsr_api.create, "ffxCreateContext") || !load(g_fsr_api.destroy, "ffxDestroyContext") ||
-	    !load(g_fsr_api.dispatch, "ffxDispatch")) {
-		std::printf("FSR upscaling: amd_fidelityfx_vk.dll lacks an entry point; the game's TAA is used\n");
+	    !load(g_fsr_api.dispatch, "ffxDispatch") || !load(g_fsr_api.configure, "ffxConfigure") ||
+	    !load(g_fsr_api.query, "ffxQuery")) {
+		std::printf("%s: amd_fidelityfx_vk.dll lacks an entry point; off\n", who);
 		std::fflush(stdout);
 		return false;
 	}
-	g_fsr_api.module    = module;
+	g_fsr_api.module = module;
+	return true;
+}
+
+bool LoadFsr() {
+	if (!LoadFsrModule("FSR upscaling")) return false;
 	g_fsr_api.sharpness = FsrSharpnessFromEnv();
 	g_sr_ready.store(true, std::memory_order_relaxed);
 	std::printf("FSR upscaling: ready (AMD FidelityFX FSR 3.1); it replaces the game's TAA (sharpening "
@@ -2067,6 +2102,338 @@ void SwapchainChanging() {
 	g_run_with       = 0;
 	g_options_set    = false;
 	g_previous_valid = false;
+#endif
+}
+
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+namespace {
+
+// FSR 3.1 frame generation's state (present thread; the swapchain's calls come from it too).
+struct FsrFg {
+	ffxContext                                  swapchain_context = nullptr; // FSR's swapchain
+	ffxContext                                  fg_context        = nullptr; // frame generation
+	ffxQueryDescSwapchainReplacementFunctionsVK functions {};
+	vk::SwapchainKHR                            swapchain = nullptr;
+	vk::Extent2D                                display {};
+	vk::Format                                  format = vk::Format::eUndefined;
+	bool                                        hdr    = false;
+	vk::Extent2D                                max_render {};
+	uint64_t                                    frame_id = 0;
+	bool                                        mode_on  = false;
+	bool                                        reset    = false;
+	uint32_t                                    run_with = 0, run_without = 0;
+	std::chrono::steady_clock::time_point       last {};
+	Mat4                                        previous_view_proj;
+	bool                                        previous_valid = false;
+	GraphicContext*                             graphics       = nullptr;
+};
+FsrFg g_fsr_fg_state;
+// (DLSS-G's: on after a run of frames with inputs, off after a run without.)
+constexpr uint32_t FsrTurnOnAfter = 10, FsrTurnOffAfter = 30;
+
+// The present thread holds the graphics queue's lock in QueuePresent; FSR submits to that queue
+// from its present (generated frame) and may from other calls, which then take the lock.
+thread_local bool t_fsr_queue_locked = false;
+
+VkResult FsrGameQueueSubmit(uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+	auto& graphics = *g_fsr_fg_state.graphics;
+	if (t_fsr_queue_locked) {
+		return VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit(static_cast<VkQueue>(graphics.queue), count, submits, fence);
+	}
+	Common::LockGuard lock(graphics.queue_mutex);
+	return VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit(static_cast<VkQueue>(graphics.queue), count, submits, fence);
+}
+
+bool FsrFgOk(ffxReturnCode_t code, const char* what) {
+	if (code == FFX_API_RETURN_OK) return true;
+	std::printf("Frame generation: FSR %s failed (%u)\n", what, static_cast<uint32_t>(code));
+	std::fflush(stdout);
+	return false;
+}
+
+void FsrFgDestroyContext() {
+	auto& s = g_fsr_fg_state;
+	if (s.fg_context == nullptr) return;
+	if (s.swapchain != nullptr) {
+		// (Off before its context goes: the swapchain then presents the frames as they are.)
+		ffxConfigureDescFrameGeneration config {};
+		config.header.type            = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+		config.swapChain              = static_cast<VkSwapchainKHR>(s.swapchain);
+		config.frameGenerationEnabled = false;
+		config.frameID                = ++s.frame_id;
+		(void)g_fsr_api.configure(&s.fg_context, &config.header);
+	}
+	(void)g_fsr_api.destroy(&s.fg_context, nullptr);
+	s.fg_context = nullptr;
+	s.mode_on    = false;
+}
+
+// The frame generation context for render sizes up to `render` (made again for a larger one).
+bool FsrFgEnsureContext(vk::Extent2D render) {
+	auto& s = g_fsr_fg_state;
+	if (s.fg_context != nullptr && render.width <= s.max_render.width && render.height <= s.max_render.height) {
+		return true;
+	}
+	FsrFgDestroyContext();
+	ffxCreateBackendVKDesc backend {};
+	backend.header.type      = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+	backend.vkDevice         = static_cast<VkDevice>(s.graphics->device);
+	backend.vkPhysicalDevice = static_cast<VkPhysicalDevice>(s.graphics->physical_device);
+	backend.vkDeviceProcAddr = FsrGetDeviceProcAddr;
+	g_fsr_instance           = static_cast<VkInstance>(s.graphics->instance);
+	ffxCreateContextDescFrameGeneration create {};
+	create.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+	create.header.pNext = &backend.header;
+	// Astro Bot's depth is OpenGL-style (not reversed, a finite far plane); vectors at render size.
+	create.flags = std::getenv("KYTY_FRAMEGEN_DEBUG") != nullptr ? FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING : 0u;
+	create.displaySize      = {s.display.width, s.display.height};
+	s.max_render            = {std::max(render.width, s.display.width), std::max(render.height, s.display.height)};
+	create.maxRenderSize    = {s.max_render.width, s.max_render.height};
+	create.backBufferFormat = ffxApiGetSurfaceFormatVK(static_cast<VkFormat>(s.format));
+	if (!FsrFgOk(g_fsr_api.create(&s.fg_context, &create.header, nullptr), "frame generation context")) {
+		s.fg_context = nullptr;
+		return false;
+	}
+	std::printf("Frame generation: FSR 3.1 ready (%ux%u, render up to %ux%u)\n", s.display.width, s.display.height,
+	            s.max_render.width, s.max_render.height);
+	std::fflush(stdout);
+	return true;
+}
+
+// The swapchain calls it in its present (async workloads off: on the game queue): the generated frame.
+ffxReturnCode_t FsrFgGenerate(ffxDispatchDescFrameGeneration* params, void* context) {
+	if (std::exchange(g_fsr_fg_state.reset, false)) params->reset = true;
+	if (g_fsr_fg_state.hdr) {
+		params->backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_PQ;
+		params->minMaxLuminance[0]         = 0.0f;
+		params->minMaxLuminance[1]         = 1000.0f;
+	}
+	return g_fsr_api.dispatch(static_cast<ffxContext*>(context), &params->header);
+}
+
+} // namespace
+#endif
+
+bool FsrFrameGenRequested() {
+	return g_fsr_fg;
+}
+
+void OnFsrQueues(GraphicContext& graphics) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!g_fsr_fg) return;
+	if (graphics.fsr_present_queue == nullptr || graphics.fsr_compute_queue == nullptr ||
+	    graphics.fsr_acquire_queue == nullptr) {
+		g_fsr_fg = false;
+		return;
+	}
+	g_fsr_fg_state.graphics = &graphics;
+	g_fsr_fg_ready.store(true, std::memory_order_relaxed);
+#else
+	(void)graphics;
+#endif
+}
+
+bool OwnsSwapchain() {
+	return g_fsr_fg_ready.load(std::memory_order_relaxed);
+}
+
+vk::Result CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR& info, bool hdr,
+                           vk::SwapchainKHR* swapchain) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	auto& s = g_fsr_fg_state;
+	ffxCreateContextDescFrameGenerationSwapChainVK create {};
+	create.header.type    = FFX_API_CREATE_CONTEXT_DESC_TYPE_FGSWAPCHAIN_VK;
+	create.physicalDevice = static_cast<VkPhysicalDevice>(graphics.physical_device);
+	create.device         = static_cast<VkDevice>(graphics.device);
+	VkSwapchainKHR handle = VK_NULL_HANDLE;
+	create.swapchain      = &handle;
+	create.allocator      = nullptr;
+	create.createInfo     = static_cast<VkSwapchainCreateInfoKHR>(info);
+	create.gameQueue      = {static_cast<VkQueue>(graphics.queue), graphics.queue_family, FsrGameQueueSubmit};
+	create.asyncComputeQueue = {static_cast<VkQueue>(graphics.fsr_compute_queue), graphics.fsr_compute_family, nullptr};
+	create.presentQueue      = {static_cast<VkQueue>(graphics.fsr_present_queue), graphics.fsr_present_family, nullptr};
+	create.imageAcquireQueue = {static_cast<VkQueue>(graphics.fsr_acquire_queue), graphics.fsr_compute_family, nullptr};
+	if (!FsrFgOk(g_fsr_api.create(&s.swapchain_context, &create.header, nullptr), "swapchain")) {
+		s.swapchain_context = nullptr;
+		g_fsr_fg_ready.store(false, std::memory_order_relaxed);
+		return vk::Result::eErrorInitializationFailed;
+	}
+	s.functions             = {};
+	s.functions.header.type = FFX_API_QUERY_DESC_TYPE_FGSWAPCHAIN_FUNCTIONS_VK;
+	if (!FsrFgOk(g_fsr_api.query(&s.swapchain_context, &s.functions.header), "swapchain functions") ||
+	    s.functions.pOutAcquireNextImageKHR == nullptr || s.functions.pOutQueuePresentKHR == nullptr ||
+	    s.functions.pOutGetSwapchainImagesKHR == nullptr) {
+		(void)g_fsr_api.destroy(&s.swapchain_context, nullptr);
+		s.swapchain_context = nullptr;
+		g_fsr_fg_ready.store(false, std::memory_order_relaxed);
+		return vk::Result::eErrorInitializationFailed;
+	}
+	s.swapchain      = handle;
+	s.display        = info.imageExtent;
+	s.format         = info.imageFormat;
+	s.hdr            = hdr;
+	s.run_with       = 0;
+	s.run_without    = 0;
+	s.previous_valid = false;
+	*swapchain       = handle;
+	std::printf("Frame generation: FSR swapchain %ux%u\n", s.display.width, s.display.height);
+	std::fflush(stdout);
+	return vk::Result::eSuccess;
+#else
+	(void)graphics, (void)info, (void)hdr, (void)swapchain;
+	return vk::Result::eErrorInitializationFailed;
+#endif
+}
+
+void DestroySwapchain() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	auto& s = g_fsr_fg_state;
+	// (The frame generation context is made for the display size: again with the next swapchain.)
+	FsrFgDestroyContext();
+	if (s.swapchain_context != nullptr) {
+		(void)g_fsr_api.destroy(&s.swapchain_context, nullptr); // (and its swapchain)
+		s.swapchain_context = nullptr;
+	}
+	s.swapchain = nullptr;
+	s.functions = {};
+#endif
+}
+
+vk::Result GetSwapchainImages(vk::Device device, vk::SwapchainKHR swapchain, uint32_t* count, vk::Image* images) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	return static_cast<vk::Result>(g_fsr_fg_state.functions.pOutGetSwapchainImagesKHR(
+	    static_cast<VkDevice>(device), static_cast<VkSwapchainKHR>(swapchain), count, reinterpret_cast<VkImage*>(images)));
+#else
+	(void)device, (void)swapchain, (void)count, (void)images;
+	return vk::Result::eErrorInitializationFailed;
+#endif
+}
+
+vk::Result AcquireNextImage(vk::Device device, vk::SwapchainKHR swapchain, uint64_t timeout, vk::Semaphore semaphore,
+                            uint32_t* index) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	return static_cast<vk::Result>(g_fsr_fg_state.functions.pOutAcquireNextImageKHR(
+	    static_cast<VkDevice>(device), static_cast<VkSwapchainKHR>(swapchain), timeout, static_cast<VkSemaphore>(semaphore),
+	    VK_NULL_HANDLE, index));
+#else
+	(void)device, (void)swapchain, (void)timeout, (void)semaphore, (void)index;
+	return vk::Result::eErrorInitializationFailed;
+#endif
+}
+
+vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& present) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	const VkPresentInfoKHR& info = present;
+	t_fsr_queue_locked           = true;
+	const auto result = g_fsr_fg_state.functions.pOutQueuePresentKHR(static_cast<VkQueue>(queue), &info);
+	t_fsr_queue_locked = false;
+	return static_cast<vk::Result>(result);
+#else
+	(void)queue, (void)present;
+	return vk::Result::eErrorInitializationFailed;
+#endif
+}
+
+void RecordFsrPrepare(GraphicContext& graphics, vk::CommandBuffer command, const FrameInputs* inputs,
+                      vk::Extent2D backbuffer) {
+	(void)graphics;
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	auto& s = g_fsr_fg_state;
+	if (!OwnsSwapchain() || s.swapchain == nullptr) return;
+	const bool usable = inputs != nullptr && inputs->valid && inputs->camera.valid;
+	s.run_with        = usable ? s.run_with + 1 : 0;
+	s.run_without     = usable ? 0 : s.run_without + 1;
+	bool mode_on      = s.mode_on ? s.run_without < FsrTurnOffAfter : s.run_with >= FsrTurnOnAfter;
+	if (mode_on && usable && !FsrFgEnsureContext(inputs->render_extent)) mode_on = false;
+	if (s.fg_context == nullptr) return; // (no frame with inputs yet: the swapchain presents as it is)
+	if (mode_on != s.mode_on) {
+		std::printf("Frame generation: FSR %s\n", mode_on ? "on" : "off (no inputs)");
+		std::fflush(stdout);
+		s.mode_on        = mode_on;
+		s.reset          = true;
+		s.previous_valid = false;
+	}
+	const auto  now   = std::chrono::steady_clock::now();
+	const float delta = s.last.time_since_epoch().count() == 0
+	                        ? 16.7f
+	                        : std::clamp(std::chrono::duration<float, std::milli>(now - s.last).count(), 1.0f, 200.0f);
+	s.last            = now;
+	const uint64_t id = ++s.frame_id;
+	// KYTY_FRAMEGEN_DEBUG=1: tear and reset lines, 2: FSR's debug view.
+	static const uint32_t debug_flags = [] {
+		const char* value = std::getenv("KYTY_FRAMEGEN_DEBUG");
+		const int   level = value != nullptr ? std::atoi(value) : 0;
+		return level >= 2   ? uint32_t(FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW)
+		       : level == 1 ? uint32_t(FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES |
+		                               FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_RESET_INDICATORS)
+		                    : 0u;
+	}();
+	ffxConfigureDescFrameGeneration config {};
+	config.header.type                        = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+	config.swapChain                          = static_cast<VkSwapchainKHR>(s.swapchain);
+	config.presentCallback                    = nullptr;
+	config.frameGenerationCallback            = FsrFgGenerate;
+	config.frameGenerationCallbackUserContext = &s.fg_context;
+	config.frameGenerationEnabled             = mode_on;
+	config.allowAsyncWorkloads                = false;
+	config.flags                              = debug_flags;
+	config.onlyPresentGenerated               = false;
+	config.generationRect                     = {0, 0, static_cast<int32_t>(backbuffer.width),
+	                                             static_cast<int32_t>(backbuffer.height)};
+	config.frameID                            = id;
+	if (!FsrFgOk(g_fsr_api.configure(&s.fg_context, &config.header), "configure") || !mode_on || !usable) return;
+
+	// The camera as DLSS-G gets it (Streamline's conventions are FSR's: jitter in render pixels,
+	// vectors scaled to render pixels towards the previous position).
+	sl::Constants constants {};
+	DefaultConstants(constants);
+	const auto render = inputs->render_extent;
+	if (!CameraConstants(inputs->camera, render, s.previous_view_proj, s.previous_valid, constants)) {
+		s.reset = true;
+	}
+	ffxDispatchDescFrameGenerationPrepareCameraInfo camera_info {};
+	camera_info.header.type   = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
+	camera_info.cameraPosition[0] = constants.cameraPos.x;
+	camera_info.cameraPosition[1] = constants.cameraPos.y;
+	camera_info.cameraPosition[2] = constants.cameraPos.z;
+	camera_info.cameraUp[0]       = constants.cameraUp.x;
+	camera_info.cameraUp[1]       = constants.cameraUp.y;
+	camera_info.cameraUp[2]       = constants.cameraUp.z;
+	camera_info.cameraRight[0]    = constants.cameraRight.x;
+	camera_info.cameraRight[1]    = constants.cameraRight.y;
+	camera_info.cameraRight[2]    = constants.cameraRight.z;
+	camera_info.cameraForward[0]  = constants.cameraFwd.x;
+	camera_info.cameraForward[1]  = constants.cameraFwd.y;
+	camera_info.cameraForward[2]  = constants.cameraFwd.z;
+	ffxDispatchDescFrameGenerationPrepare prepare {};
+	prepare.header.type       = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
+	prepare.header.pNext      = &camera_info.header;
+	prepare.frameID           = id;
+	prepare.flags             = debug_flags;
+	prepare.commandList       = static_cast<VkCommandBuffer>(command);
+	prepare.renderSize        = {render.width, render.height};
+	prepare.jitterOffset      = {constants.jitterOffset.x, constants.jitterOffset.y};
+	prepare.motionVectorScale = {MotionVectorSign() * static_cast<float>(render.width),
+	                             MotionVectorSign() * static_cast<float>(render.height)};
+	prepare.frameTimeDelta          = delta;
+	prepare.cameraNear              = constants.cameraNear;
+	prepare.cameraFar               = constants.cameraFar;
+	prepare.cameraFovAngleVertical  = constants.cameraFOV;
+	prepare.viewSpaceToMetersFactor = 1.0f;
+	prepare.depth                   = FsrResource(inputs->depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+	prepare.motionVectors           = FsrResource(inputs->motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+	(void)FsrFgOk(g_fsr_api.dispatch(&s.fg_context, &prepare.header), "prepare");
+	static bool reported = false;
+	if (!reported) {
+		reported = true;
+		std::printf("Frame generation: FSR 2x on (render %ux%u, display %ux%u, jitter %.3f, %.3f px)\n", render.width,
+		            render.height, s.display.width, s.display.height, constants.jitterOffset.x,
+		            constants.jitterOffset.y);
+		std::fflush(stdout);
+	}
+#else
+	(void)command, (void)inputs, (void)backbuffer;
 #endif
 }
 

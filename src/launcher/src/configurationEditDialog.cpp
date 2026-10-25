@@ -345,7 +345,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->comboBox_frame_generation->clear();
 	m_ui->comboBox_frame_generation->addItems(
 	    {tr("Off"), tr("2x (DLSS-G)"), tr("3x (DLSS-G, RTX 50)"), tr("4x (DLSS-G, RTX 50)")});
-	m_ui->comboBox_frame_generation->setCurrentIndex(std::clamp(info.frame_generation, 0, 3));
+	m_ui->comboBox_frame_generation->addItem(tr("2x (AMD FSR 3.1, any GPU, experimental)"));
+	m_ui->comboBox_frame_generation->setCurrentIndex(std::clamp(info.frame_generation, 0, 4));
 	m_ui->comboBox_upscaler->clear();
 	m_ui->comboBox_upscaler->addItems(
 	    {tr("Game's own (TAA)"), tr("NVIDIA DLSS (RTX)"), tr("AMD FSR 3.1 (any GPU)")});

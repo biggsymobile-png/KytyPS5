@@ -141,6 +141,14 @@ struct GraphicContext {
 	// UploadDma worker submits to it. Buffers it touches are created shared by both families.
 	uint32_t                           transfer_queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          transfer_queue        = nullptr;
+	// AMD FSR 3.1 frame generation (KYTY_FRAMEGEN_BACKEND=fsr, frameGenDlssg.h): the queues its
+	// swapchain presents, computes and acquires images on (its own; `queue` is its game queue).
+	// Null when not asked for or the GPU has too few.
+	uint32_t                           fsr_present_family = static_cast<uint32_t>(-1);
+	uint32_t                           fsr_compute_family = static_cast<uint32_t>(-1);
+	vk::Queue                          fsr_present_queue  = nullptr;
+	vk::Queue                          fsr_compute_queue  = nullptr;
+	vk::Queue                          fsr_acquire_queue  = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

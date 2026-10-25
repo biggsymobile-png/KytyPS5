@@ -133,6 +133,18 @@ included next to the emulator. The console shows `FSR upscaling: 1920x1080 to ..
 `FSR upscaling: on`. `"KYTY_FSR_SHARPNESS": "0.5",` in `u59-preset.json` adds FSR's sharpening
 (0 to 1; default off). The jitter switches of DLSS above apply to FSR too.
 
+## AMD FSR 3.1 frame generation (experimental, Windows)
+
+**Frame generation: 2x (AMD FSR 3.1, any GPU)** in the launcher (`KYTY_FRAMEGEN=1` with
+`KYTY_FRAMEGEN_BACKEND=fsr`) generates frames with AMD's FSR 3.1 instead of NVIDIA's DLSS-G: on
+**any GPU** (AMD, Intel, RTX 20/30), from the same depth, motion vectors and camera. It uses the
+`amd_fidelityfx_vk.dll` already next to the emulator; no Streamline files are needed. Use it with
+**FSR upscaling or the game's own** (not with DLSS upscaling). The console shows
+`Frame generation: FSR swapchain ...`, `FSR 3.1 ready ...`, then `FSR on` and
+`FSR 2x on (render ..., display ...)` in the 3D view. `"KYTY_FRAMEGEN_DEBUG": "1",` draws FSR's
+tear and reset lines, `"2"` its debug view. The HUD is generated along with the scene (it may
+smear a little in motion).
+
 ## Astro's Playroom (experimental)
 
 Astro's Playroom (PPSA01325, version 01.905) uses the same kind of TAA pass as Astro Bot, so DLSS

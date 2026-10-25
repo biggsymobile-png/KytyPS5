@@ -663,7 +663,8 @@ static void PrintGpuCapabilities(GraphicContext& graphics, const vk::PhysicalDev
 }
 
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
-	                                 const std::vector<const char*>& device_extensions) {
+	                                 const std::vector<const char*>& device_extensions,
+	                                 vk::SurfaceKHR                  surface) {
 	const auto physical_device = graphics.physical_device;
 	const auto queue_family    = graphics.queue_family;
 	EXIT_IF(physical_device == nullptr);
@@ -692,8 +693,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	       graphics.side_queue_index != 0 ? "queue 1" : "shared with queue 0", queue_family,
 	       family_queue_count);
 
-	const std::array<float, 2> queue_priorities {1.0f, 1.0f};
-	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	const std::array<float, 4> queue_priorities {1.0f, 1.0f, 1.0f, 1.0f};
+	std::array<vk::DeviceQueueCreateInfo, 3> queue_create_infos {};
 	auto&                      queue_create_info = queue_create_infos[0];
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = graphics.side_queue_index != 0 ? 2u : 1u;
@@ -724,6 +725,57 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		transfer.queueFamilyIndex = graphics.transfer_queue_family;
 		transfer.queueCount       = 1;
 		transfer.pQueuePriorities = queue_priorities.data();
+	}
+	// FSR 3.1 frame generation (KYTY_FRAMEGEN_BACKEND=fsr): its swapchain's queues. Async compute and
+	// image acquisition on two queues of a compute-only family; presentation on a spare queue of
+	// the graphics family, else on a third compute queue that can present (AMD: one graphics queue).
+	graphics.fsr_present_family = static_cast<uint32_t>(-1);
+	graphics.fsr_compute_family = static_cast<uint32_t>(-1);
+	if (FrameGen::FsrFrameGenRequested()) {
+		uint32_t count = 0;
+		physical_device.getQueueFamilyProperties(&count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(count);
+		physical_device.getQueueFamilyProperties(&count, families.data());
+		uint32_t compute = static_cast<uint32_t>(-1);
+		for (uint32_t family = 0; family < count; family++) {
+			const auto flags = families[family].queueFlags;
+			if (family != queue_family && family != graphics.transfer_queue_family &&
+			    families[family].queueCount >= 2 && (flags & vk::QueueFlagBits::eCompute) &&
+			    !(flags & vk::QueueFlagBits::eGraphics)) {
+				compute = family;
+				break;
+			}
+		}
+		const uint32_t graphics_used = queue_create_info.queueCount;
+		const auto     presents      = [&](uint32_t family) {
+            vk::Bool32 supported = VK_FALSE;
+            return surface != nullptr &&
+                   physical_device.getSurfaceSupportKHR(family, surface, &supported) == vk::Result::eSuccess &&
+                   supported == VK_TRUE;
+		};
+		if (compute != static_cast<uint32_t>(-1)) {
+			uint32_t compute_count = 2;
+			if (family_queue_count > graphics_used) {
+				graphics.fsr_present_family = queue_family;
+				queue_create_info.queueCount = graphics_used + 1;
+			} else if (families[compute].queueCount >= 3 && presents(compute)) {
+				graphics.fsr_present_family = compute;
+				compute_count               = 3;
+			}
+			if (graphics.fsr_present_family != static_cast<uint32_t>(-1)) {
+				graphics.fsr_compute_family = compute;
+				auto& info                  = queue_create_infos[queue_create_count++];
+				info.queueFamilyIndex       = compute;
+				info.queueCount             = compute_count;
+				info.pQueuePriorities       = queue_priorities.data();
+			}
+		}
+		std::printf("Frame generation: FSR swapchain queues: %s\n",
+		            graphics.fsr_compute_family != static_cast<uint32_t>(-1)
+		                ? fmt::format("present family {}, compute and acquire family {}",
+		                              graphics.fsr_present_family, graphics.fsr_compute_family)
+		                      .c_str()
+		                : "this GPU has too few queues; FSR frame generation off");
 	}
 	std::printf("Kyty upload DMA queue: %s (KYTY_UPLOAD_DMA)\n",
 	            graphics.transfer_queue_family != static_cast<uint32_t>(-1)
@@ -2145,7 +2197,7 @@ void WindowContext::CreateVulkan() {
 	}
 
 	(void)FrameGen::SupportProblem(graphic_ctx.physical_device);
-	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
+	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions, surface);
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device.%s", FrameGen::RefusedDeviceAdvice().c_str());
 	}
@@ -2170,6 +2222,18 @@ void WindowContext::CreateVulkan() {
 		                            &graphic_ctx.transfer_queue);
 		EXIT_IF(graphic_ctx.transfer_queue == nullptr);
 	}
+	if (graphic_ctx.fsr_compute_family != static_cast<uint32_t>(-1)) {
+		// (Present: the graphics family's queue after the main and side queues, or the compute
+		// family's third.)
+		const uint32_t present_index = graphic_ctx.fsr_present_family == graphic_ctx.queue_family
+		                                   ? (graphic_ctx.side_queue_index != 0 ? 2u : 1u)
+		                                   : 2u;
+		graphic_ctx.device.getQueue(graphic_ctx.fsr_present_family, present_index,
+		                            &graphic_ctx.fsr_present_queue);
+		graphic_ctx.device.getQueue(graphic_ctx.fsr_compute_family, 0, &graphic_ctx.fsr_compute_queue);
+		graphic_ctx.device.getQueue(graphic_ctx.fsr_compute_family, 1, &graphic_ctx.fsr_acquire_queue);
+	}
+	FrameGen::OnFsrQueues(graphic_ctx);
 	if (graphic_ctx.gpu_breadcrumbs_requested) {
 		GpuBreadcrumbs::Initialize(graphic_ctx, graphic_ctx.device_coherent_memory_enabled);
 	}

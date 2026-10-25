@@ -293,6 +293,8 @@ public:
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
 	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
+	// AMD FSR 3.1 frame generation's swapchain in use (FrameGen::OwnsSwapchain at Create).
+	[[nodiscard]] bool UsesFsrSwapchain() const noexcept { return m_fsr_swapchain && m_handle != nullptr; }
 	[[nodiscard]] bool       IsMinimized() const noexcept { return m_minimized; }
 	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
 	bool SetHdr(bool hdr) {
@@ -322,6 +324,7 @@ private:
 	/// swapchain creation or Destroy().
 	bool                           m_surface_extent_zero = false;
 	bool                           m_suboptimal          = false;
+	bool                           m_fsr_swapchain       = false;
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
@@ -529,14 +532,24 @@ void Swapchain::Create() {
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
 	create_info.clipped = VK_TRUE;
-	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
-	                     "vkCreateSwapchainKHR");
+	// AMD FSR 3.1 frame generation: its swapchain in place of ours (frameGenDlssg.h); if it cannot
+	// make one, FSR frame generation is off and ours is made.
+	m_fsr_swapchain = false;
+	if (FrameGen::OwnsSwapchain()) {
+		m_fsr_swapchain =
+		    FrameGen::CreateSwapchain(graphics, create_info, m_hdr_active, &m_handle) == vk::Result::eSuccess;
+	}
+	if (!m_fsr_swapchain) {
+		RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
+		                     "vkCreateSwapchainKHR");
+	}
 	EXIT_IF(m_handle == nullptr);
 	LOGF("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
-		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
+		    return m_fsr_swapchain ? FrameGen::GetSwapchainImages(graphics.device, m_handle, count, images)
+		                           : graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
 	// Freeze reports depend on it (RTX 50 PCs froze in Mailbox, not in Fifo).
@@ -627,8 +640,13 @@ void Swapchain::Destroy() {
 		}
 	}
 	if (m_handle != nullptr) {
-		graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		if (m_fsr_swapchain) {
+			FrameGen::DestroySwapchain();
+		} else {
+			graphics.device.destroySwapchainKHR(m_handle, nullptr);
+		}
 	}
+	m_fsr_swapchain = false;
 
 	m_handle        = nullptr;
 	m_format        = vk::Format::eUndefined;
@@ -714,9 +732,13 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 		m_frame_ticks[m_frame_index] = 0;
 	}
 	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	const auto result =
+	    m_fsr_swapchain
+	        ? FrameGen::AcquireNextImage(m_window.graphic_ctx.device, m_handle, std::numeric_limits<uint64_t>::max(),
+	                                     m_image_acquired[m_frame_index], &m_image_index)
+	        : m_window.graphic_ctx.device.acquireNextImageKHR(m_handle, std::numeric_limits<uint64_t>::max(),
+	                                                          m_image_acquired[m_frame_index], nullptr,
+	                                                          &m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
@@ -1208,7 +1230,8 @@ Swapchain::Status Swapchain::Present() {
 		// texture copies: the present never waits for them, nor for a signal not yet submitted.
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		m_window.graphic_ctx.submission_queue.DrainReadyForPresentLocked();
-		result = m_window.graphic_ctx.queue.presentKHR(&present);
+		result = m_fsr_swapchain ? FrameGen::QueuePresent(m_window.graphic_ctx.queue, present)
+		                         : m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;
@@ -1409,6 +1432,15 @@ void Presenter::Impl::Present() {
 			    (overlay_visual.active || PerformanceOverlayEnabled()) && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
+			// AMD FSR 3.1 frame generation: its settings for this present and its preparation from
+			// the frame's depth, motion and camera (a repeat or a menu has none).
+			if (swapchain.UsesFsrSwapchain()) {
+				auto* fg_frame = layers[0].frame;
+				FrameGen::RecordFsrPrepare(window.graphic_ctx, command.Handle(),
+				                           fg_frame != nullptr && fg_frame->fg.valid ? &fg_frame->fg : nullptr,
+				                           swapchain.Extent());
+				if (fg_frame != nullptr) fg_frame->fg.valid = false;
+			}
 			const auto tick = swapchain.Submit(present_scheduler);
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {

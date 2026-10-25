@@ -177,8 +177,8 @@ bool Configuration::SetGameSettings(const QJsonObject& imported_settings, QStrin
 	if (vblank_frequency < 30 || vblank_frequency > 360) {
 		return fail(tr("Vblank frequency must be between 30 and 360."));
 	}
-	if (frame_generation < 0 || frame_generation > 3) {
-		return fail(tr("Frame generation must be between 0 (off) and 3 (4x)."));
+	if (frame_generation < 0 || frame_generation > 4) {
+		return fail(tr("Frame generation must be between 0 (off) and 4 (FSR 2x)."));
 	}
 	if (upscaler < 0 || upscaler > 2) {
 		return fail(tr("Upscaler must be 0 (the game's), 1 (DLSS) or 2 (FSR)."));

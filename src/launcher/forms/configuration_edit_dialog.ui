@@ -330,7 +330,7 @@
             </item>
             <item row="10" column="1">
              <widget class="QComboBox" name="comboBox_frame_generation">
-              <property name="toolTip"><string>NVIDIA DLSS frame generation (Astro Bot). Needs an RTX 40 or 50 card and the Streamline files in the "streamline" folder; 3x and 4x need an RTX 50 card.</string></property>
+              <property name="toolTip"><string>Frame generation (Astro Bot, Astro's Playroom). DLSS-G: an RTX 40 or 50 card and the Streamline files in the "streamline" folder; 3x and 4x need an RTX 50 card. AMD FSR 3.1 (experimental): any GPU, 2x, with FSR upscaling or the game's own (not with DLSS upscaling).</string></property>
              </widget>
             </item>
             <item row="11" column="0">

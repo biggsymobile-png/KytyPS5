@@ -125,6 +125,29 @@ void AfterPresent();
 // The swapchain is made again: DLSS-G off until frames with inputs turn it on again.
 void SwapchainChanging();
 
+// AMD FSR 3.1 frame generation (KYTY_FRAMEGEN_BACKEND=fsr with KYTY_FRAMEGEN=1; Windows, AMD's
+// amd_fidelityfx_vk.dll): any GPU, 2x. Its swapchain replaces the emulator's: the swapchain calls
+// below go through it, and it shows a generated frame before each real one inside the present.
+// Before the device: asked for (its queues are then requested, GraphicContext::fsr_*).
+[[nodiscard]] bool FsrFrameGenRequested();
+// After the device's queues are fetched: FSR frame generation off if it has none.
+void OnFsrQueues(GraphicContext& graphics);
+// FSR's swapchain is in use: Swapchain makes, uses and destroys it through the calls below.
+[[nodiscard]] bool OwnsSwapchain();
+[[nodiscard]] vk::Result CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR& info,
+                                         bool hdr, vk::SwapchainKHR* swapchain);
+void                     DestroySwapchain();
+[[nodiscard]] vk::Result GetSwapchainImages(vk::Device device, vk::SwapchainKHR swapchain, uint32_t* count,
+                                            vk::Image* images);
+[[nodiscard]] vk::Result AcquireNextImage(vk::Device device, vk::SwapchainKHR swapchain, uint64_t timeout,
+                                          vk::Semaphore semaphore, uint32_t* index);
+// With the graphics queue's lock held (the generated frame's work goes on that queue).
+[[nodiscard]] vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& present);
+// Present thread, into the present's command buffer before it is submitted: FSR's settings for
+// this present and, with inputs, its preparation from the frame's depth, motion and camera.
+void RecordFsrPrepare(GraphicContext& graphics, vk::CommandBuffer command, const FrameInputs* inputs,
+                      vk::Extent2D backbuffer);
+
 } // namespace FrameGen
 } // namespace Libs::Graphics
 
