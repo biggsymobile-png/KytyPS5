@@ -766,6 +766,11 @@ if(WIN32)
 		               COMPILE_DEFINITIONS KYTY_FRAMEGEN_STREAMLINE=1)
 		message(STATUS "DLSS frame generation: Streamline headers from ${KYTY_STREAMLINE_SDK}")
 	endif()
+else()
+	# Linux and macOS: FSR 3 upscaling (KYTY_FSR) from the built-in FidelityFX SDK sources.
+	set_source_files_properties("${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/frameGenDlssg.cpp"
+	    PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/fidelityfx/include"
+	               COMPILE_DEFINITIONS KYTY_FSR_NATIVE=1)
 endif()
 
 # u59-preset.json (common/u59Preset.h): parsing and lookup for the launcher, the emulator's startup
@@ -2586,6 +2591,10 @@ add_dependencies(kyty_emulator kyty_touch_cursors)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
+if(NOT WIN32 AND TARGET kyty_fidelityfx)
+	# FSR 3 upscaling from the built-in FidelityFX sources (frameGenDlssg.cpp, KYTY_FSR_NATIVE).
+	target_link_libraries(kyty_emulator kyty_fidelityfx)
+endif()
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)

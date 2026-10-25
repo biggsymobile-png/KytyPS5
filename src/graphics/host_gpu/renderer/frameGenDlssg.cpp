@@ -49,6 +49,92 @@
 #include <vector>
 #endif
 
+// The TAA upscalers' code: DLSS and FSR through AMD's runtime with Streamline (Windows), or FSR
+// from the built-in FidelityFX SDK sources (KYTY_FSR_NATIVE: Linux, macOS).
+#if defined(KYTY_FRAMEGEN_STREAMLINE) || defined(KYTY_FSR_NATIVE)
+#define KYTY_UPSCALER_CODE 1
+#include <chrono>
+#include <string>
+#include <vector>
+#endif
+
+#if defined(KYTY_FSR_NATIVE) && !defined(KYTY_FRAMEGEN_STREAMLINE)
+#include "common/threads.h"
+
+#include <FidelityFX/host/backends/vk/ffx_vk.h>
+#include <FidelityFX/host/ffx_fsr3upscaler.h>
+
+#include <cfloat>
+#include <memory>
+
+#include <stdlib.h> // posix_memalign
+
+// The FidelityFX Vulkan backend calls a few global Vulkan entry points; the emulator loads Vulkan
+// at run time, so 3rdparty/fidelityfx/src/ffx_linux_compat.h routes them here, to its dispatcher.
+extern "C" {
+void kyty_ffx_vkGetPhysicalDeviceFeatures(VkPhysicalDevice device, VkPhysicalDeviceFeatures* features) {
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures(device, features);
+}
+void kyty_ffx_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice device, VkPhysicalDeviceFeatures2* features) {
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2(device, features);
+}
+void kyty_ffx_vkGetPhysicalDeviceProperties(VkPhysicalDevice device, VkPhysicalDeviceProperties* properties) {
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties(device, properties);
+}
+void kyty_ffx_vkGetPhysicalDeviceProperties2(VkPhysicalDevice device, VkPhysicalDeviceProperties2* properties) {
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2(device, properties);
+}
+void kyty_ffx_vkGetPhysicalDeviceMemoryProperties(VkPhysicalDevice                  device,
+                                                  VkPhysicalDeviceMemoryProperties* properties) {
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMemoryProperties(device, properties);
+}
+VkResult kyty_ffx_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice device, const char* layer,
+                                                       uint32_t* count, VkExtensionProperties* properties) {
+	return VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateDeviceExtensionProperties(device, layer, count, properties);
+}
+PFN_vkVoidFunction kyty_ffx_vkGetDeviceProcAddr(VkDevice device, const char* name) {
+	return VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(device, name);
+}
+}
+
+// The parts of Streamline's types the camera code below uses (sl_consts.h), for builds without it.
+namespace sl {
+inline constexpr float INVALID_FLOAT = 3.40282346638528859811704183484516925440e38f;
+enum class Boolean : char { eFalse, eTrue };
+struct float2 {
+	float2() = default;
+	float2(float x_, float y_): x(x_), y(y_) {}
+	float x = 0.0f, y = 0.0f;
+};
+struct float3 {
+	float3() = default;
+	float3(float x_, float y_, float z_): x(x_), y(y_), z(z_) {}
+	float x = 0.0f, y = 0.0f, z = 0.0f;
+};
+struct float4 {
+	float4() = default;
+	float4(float x_, float y_, float z_, float w_): x(x_), y(y_), z(z_), w(w_) {}
+	float x = 0.0f, y = 0.0f, z = 0.0f, w = 0.0f;
+};
+struct float4x4 {
+	float4&       operator[](uint32_t i) { return row[i]; }
+	const float4& operator[](uint32_t i) const { return row[i]; }
+	float4        row[4];
+};
+struct Constants {
+	float4x4 cameraViewToClip, clipToCameraView, clipToLensClip, clipToPrevClip, prevClipToClip;
+	float2   jitterOffset, mvecScale, cameraPinholeOffset;
+	float3   cameraPos, cameraUp, cameraRight, cameraFwd;
+	float    cameraNear = 0.1f, cameraFar = 1000.0f, cameraFOV = 1.0f, cameraAspectRatio = 1.0f;
+	float    motionVectorsInvalidValue = INVALID_FLOAT;
+	Boolean  depthInverted = Boolean::eFalse, cameraMotionIncluded = Boolean::eTrue,
+	        motionVectors3D = Boolean::eFalse, orthographicProjection = Boolean::eFalse,
+	        motionVectorsDilated = Boolean::eFalse, motionVectorsJittered = Boolean::eFalse,
+	        reset = Boolean::eFalse;
+};
+} // namespace sl
+#endif
+
 namespace Libs::Graphics::FrameGen {
 
 namespace {
@@ -237,13 +323,15 @@ uint64_t        g_with_inputs    = 0;
 constexpr uint32_t TurnOffAfter = 30, TurnOnAfter = 10;
 bool               g_mode_on    = false;
 uint32_t           g_run_with = 0, g_run_without = 0;
+#endif
 
+#ifdef KYTY_UPSCALER_CODE
 // Matrices in Streamline's convention: row-major, row vectors (p' = p * M). A column-major
 // column-vector matrix in memory reads as exactly that.
 using Mat4 = sl::float4x4;
 // The previous presented frame's world-to-clip (unjittered), for clipToPrevClip.
-Mat4 g_previous_view_proj;
-bool g_previous_valid = false;
+[[maybe_unused]] Mat4 g_previous_view_proj;
+[[maybe_unused]] bool g_previous_valid = false;
 
 Mat4 FromColumnMajor(const std::array<float, 16>& m) {
 	Mat4 r;
@@ -394,7 +482,9 @@ bool CameraConstants(const Camera& camera, vk::Extent2D extent, Mat4& previous, 
 	constants.cameraAspectRatio = std::fabs(p[5] / p[0]);
 	return continuous;
 }
+#endif
 
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 void LogMessage(sl::LogType type, const char* message) {
 	static const bool verbose = std::getenv("KYTY_FRAMEGEN_VERBOSE") != nullptr;
 	// (Asked again at the first presents until DLSS-G is set up: its "not initialized yet" shown twice.)
@@ -442,8 +532,6 @@ bool IsNvidiaSigned(const std::wstring& path) {
 	return nvidia;
 }
 
-bool LoadFsr(); // (with FSR's state, below)
-
 // DLSS-G's, Reflex's and PCL's functions, then DLSS-G ready. `report`: say what is missing.
 bool FindFunctions(bool report) {
 	if (g_ready.load(std::memory_order_relaxed)) return true;
@@ -487,6 +575,10 @@ bool FindFunctions(bool report) {
 	std::fflush(stdout);
 	return true;
 }
+#endif
+
+#ifdef KYTY_UPSCALER_CODE
+bool LoadFsr(); // (with FSR's state, below)
 #endif
 
 } // namespace
@@ -766,10 +858,12 @@ void BypassCommandHooks(vk::Device device) {
 }
 
 void OnDevice(vk::PhysicalDevice physical_device) {
-#ifdef KYTY_FRAMEGEN_STREAMLINE
+#ifdef KYTY_UPSCALER_CODE
 	if (g_fsr) {
 		(void)LoadFsr();
 	}
+#endif
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (!g_loaded) return;
 	sl::AdapterInfo adapter {};
 	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
@@ -931,7 +1025,7 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 	inputs.valid = false;
 }
 
-#ifdef KYTY_FRAMEGEN_STREAMLINE
+#ifdef KYTY_UPSCALER_CODE
 namespace {
 
 // DLSS super resolution's own state (GPU thread; Streamline's viewport 1).
@@ -953,7 +1047,7 @@ struct Upscaler {
 	uint32_t      resets       = 0;
 };
 Upscaler g_sr;
-constexpr uint32_t UpscaleViewport = 1;
+[[maybe_unused]] constexpr uint32_t UpscaleViewport = 1;
 
 float EnvSign(const char* name) {
 	const char* value = std::getenv(name);
@@ -1004,6 +1098,7 @@ bool ConfigureOutput(GraphicContext& graphics, vk::Extent2D size, vk::Format for
 	return true;
 }
 
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 const char* ModeName(sl::DLSSMode mode) {
 	switch (mode) {
 		case sl::DLSSMode::eDLAA: return "DLAA";
@@ -1044,6 +1139,7 @@ sl::DLSSMode PickMode(vk::Extent2D in, vk::Extent2D out) {
 	}
 	return best;
 }
+#endif
 
 void UpscaleFailed(const char* what, const char* detail) {
 	const char* name = g_fsr ? "FSR upscaling" : "DLSS upscaling";
@@ -1059,6 +1155,48 @@ void UpscaleFailed(const char* what, const char* detail) {
 	}
 }
 
+// vkGetDeviceProcAddr for FSR's runtime: an entry point the device does not give under its
+// extension name (a KHR/EXT name of a core function whose extension is not enabled, e.g.
+// vkGetBufferMemoryRequirements2KHR) is looked up under its core name; one missing even so is
+// logged (FSR's runtime calls some without checking).
+VkInstance g_fsr_instance = VK_NULL_HANDLE; // (FsrGetDeviceProcAddr's fallback)
+
+PFN_vkVoidFunction VKAPI_CALL FsrGetDeviceProcAddr(VkDevice device, const char* name);
+
+// What FsrDispatch needs of the frame (the images are g_sr's).
+struct FsrFrame {
+	vk::CommandBuffer command;
+	vk::Extent2D      in, out;
+	float             jitter_x = 0.0f, jitter_y = 0.0f;
+	bool              reset      = false;
+	float             near_plane = 0.1f, far_plane = 1000.0f, fov = 1.0f;
+};
+
+void FsrFrameTime(std::chrono::steady_clock::time_point& last, uint64_t dispatches, float& frame_ms) {
+	const auto now = std::chrono::steady_clock::now();
+	frame_ms       = dispatches == 0
+	                     ? 16.7f
+	                     : std::clamp(std::chrono::duration<float, std::milli>(now - last).count(), 1.0f, 100.0f);
+	last = now;
+}
+
+float FsrSharpnessFromEnv() {
+	if (const char* value = std::getenv("KYTY_FSR_SHARPNESS"); value != nullptr && value[0] != '\0') {
+		return std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f);
+	}
+	return 0.0f;
+}
+
+const char* FsrQualityName(vk::Extent2D in, vk::Extent2D out) {
+	const float ratio = static_cast<float>(out.height) / static_cast<float>(std::max(in.height, 1u));
+	return ratio < 1.05f   ? "native AA"
+	       : ratio < 1.6f  ? "Quality"
+	       : ratio < 1.85f ? "Balanced"
+	       : ratio < 2.5f  ? "Performance"
+	                       : "Ultra Performance";
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 // AMD FidelityFX FSR 3.1 (KYTY_FSR=1): the FidelityFX API's Vulkan runtime, amd_fidelityfx_vk.dll
 // next to the emulator (FidelityFX SDK v1.1.4, MIT), loaded at the device (LoadFsr).
 struct FsrApi {
@@ -1095,11 +1233,7 @@ void RetireFsrContexts(bool all) {
 	}
 }
 
-// vkGetDeviceProcAddr for FSR's runtime: an entry point the device does not give under its
-// extension name (a KHR/EXT name of a core function whose extension is not enabled, e.g.
-// vkGetBufferMemoryRequirements2KHR) is looked up under its core name; one missing even so is
-// logged (FSR's runtime calls some without checking).
-VkInstance g_fsr_instance = VK_NULL_HANDLE; // (FsrGetDeviceProcAddr's fallback)
+#endif
 
 PFN_vkVoidFunction VKAPI_CALL FsrGetDeviceProcAddr(VkDevice device, const char* name) {
 	if (name == nullptr) return nullptr;
@@ -1138,6 +1272,7 @@ PFN_vkVoidFunction VKAPI_CALL FsrGetDeviceProcAddr(VkDevice device, const char* 
 	return nullptr;
 }
 
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 // The FSR context for this render and output size (made again when either changes).
 bool EnsureFsrContext(GraphicContext& graphics, vk::Extent2D in, vk::Extent2D out, bool mv_jittered) {
 	if (g_fsr_api.context != nullptr && g_fsr_api.in == in && g_fsr_api.out == out) {
@@ -1174,14 +1309,9 @@ bool EnsureFsrContext(GraphicContext& graphics, vk::Extent2D in, vk::Extent2D ou
 	g_fsr_api.in      = in;
 	g_fsr_api.out     = out;
 	g_sr.previous_valid = false;
-	const float ratio   = static_cast<float>(out.height) / static_cast<float>(std::max(in.height, 1u));
 	std::printf("FSR upscaling: %ux%u to %ux%u (%.2fx, %s)\n", in.width, in.height, out.width,
-	            out.height, ratio,
-	            ratio < 1.05f   ? "native AA"
-	            : ratio < 1.6f  ? "Quality"
-	            : ratio < 1.85f ? "Balanced"
-	            : ratio < 2.5f  ? "Performance"
-	                            : "Ultra Performance");
+	            out.height, static_cast<float>(out.height) / static_cast<float>(std::max(in.height, 1u)),
+	            FsrQualityName(in, out));
 	std::fflush(stdout);
 	return true;
 }
@@ -1222,10 +1352,8 @@ bool LoadFsr() {
 		std::fflush(stdout);
 		return false;
 	}
-	g_fsr_api.module = module;
-	if (const char* value = std::getenv("KYTY_FSR_SHARPNESS"); value != nullptr && value[0] != '\0') {
-		g_fsr_api.sharpness = std::clamp(static_cast<float>(std::atof(value)), 0.0f, 1.0f);
-	}
+	g_fsr_api.module    = module;
+	g_fsr_api.sharpness = FsrSharpnessFromEnv();
 	g_sr_ready.store(true, std::memory_order_relaxed);
 	std::printf("FSR upscaling: ready (AMD FidelityFX FSR 3.1); it replaces the game's TAA (sharpening "
 	            "%.2f, KYTY_FSR_SHARPNESS)\n",
@@ -1233,6 +1361,230 @@ bool LoadFsr() {
 	std::fflush(stdout);
 	return true;
 }
+
+bool FsrDispatch(const FsrFrame& frame, std::string& failure) {
+	float frame_ms = 16.7f;
+	FsrFrameTime(g_fsr_api.last, g_fsr_api.dispatches, frame_ms);
+	ffxDispatchDescUpscale dispatch {};
+	dispatch.header.type       = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+	dispatch.commandList       = static_cast<VkCommandBuffer>(frame.command);
+	dispatch.color             = FsrResource(g_sr.color, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+	dispatch.depth             = FsrResource(g_sr.depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+	dispatch.motionVectors     = FsrResource(g_sr.motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+	dispatch.output            = FsrResource(g_sr.output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+	dispatch.jitterOffset      = {frame.jitter_x, frame.jitter_y};
+	// The game's UV-unit vectors (current minus previous) to FSR's render-size pixels.
+	dispatch.motionVectorScale = {MotionVectorSign() * static_cast<float>(frame.in.width),
+	                              MotionVectorSign() * static_cast<float>(frame.in.height)};
+	dispatch.renderSize        = {frame.in.width, frame.in.height};
+	dispatch.upscaleSize       = {frame.out.width, frame.out.height};
+	dispatch.enableSharpening  = g_fsr_api.sharpness > 0.0f;
+	dispatch.sharpness         = g_fsr_api.sharpness;
+	dispatch.frameTimeDelta    = frame_ms;
+	dispatch.preExposure       = 1.0f;
+	dispatch.reset             = frame.reset;
+	dispatch.cameraNear        = frame.near_plane;
+	dispatch.cameraFar         = frame.far_plane;
+	dispatch.cameraFovAngleVertical  = frame.fov;
+	dispatch.viewSpaceToMetersFactor = 1.0f;
+	dispatch.flags                   = 0;
+	const auto code = g_fsr_api.dispatch(&g_fsr_api.context, &dispatch.header);
+	g_fsr_api.dispatches++;
+	RetireFsrContexts(false);
+	if (code != FFX_API_RETURN_OK) {
+		failure = "ffxDispatch error " + std::to_string(code);
+		return false;
+	}
+	return true;
+}
+#else
+// AMD FidelityFX FSR 3 (KYTY_FSR=1) built in from the FidelityFX SDK 1.1.4 sources
+// (3rdparty/fidelityfx, MIT; from chenxiao07/KytyPS5 PR #117): its native upscaler API on the
+// SDK's Vulkan backend. No runtime file is needed.
+struct FsrNative {
+	VkDeviceContext                       device_context {};
+	void*                                 scratch = nullptr;
+	FfxInterface                          backend {};
+	alignas(64) FfxFsr3UpscalerContext    context {};
+	uint32_t                              shared_context = 0;
+	FfxResourceInternal                   previous_depth {}, dilated_depth {}, dilated_motion {};
+	bool                                  created = false;
+	bool                                  failed  = false;
+	vk::Extent2D                          in {}, out {};
+	std::chrono::steady_clock::time_point last {};
+	uint64_t                              dispatches = 0;
+	float                                 sharpness  = 0.0f;
+	GraphicContext*                       graphics   = nullptr;
+};
+FsrNative g_fsr_native;
+
+void FsrNativeMessage(FfxMsgType type, const wchar_t* message) {
+	static std::atomic<uint32_t> count {0};
+	if (message == nullptr || count.fetch_add(1, std::memory_order_relaxed) >= 20) return;
+	std::printf("FSR %s: %ls\n", type == FFX_MESSAGE_TYPE_ERROR ? "error" : "warning", message);
+	std::fflush(stdout);
+}
+
+// Destroying the contexts needs the GPU done with what referenced them (a size change: rare).
+void DestroyFsrNative() {
+	auto& f = g_fsr_native;
+	if (!f.created) return;
+	if (f.graphics != nullptr) {
+		Common::LockGuard lock(f.graphics->queue_mutex);
+		(void)f.graphics->queue.waitIdle();
+	}
+	auto& b = f.backend;
+	b.fpDestroyResource(&b, f.previous_depth, f.shared_context);
+	b.fpDestroyResource(&b, f.dilated_depth, f.shared_context);
+	b.fpDestroyResource(&b, f.dilated_motion, f.shared_context);
+	b.fpDestroyBackendContext(&b, f.shared_context);
+	ffxFsr3UpscalerContextDestroy(&f.context);
+	std::free(f.scratch);
+	f.scratch = nullptr;
+	f.created = false;
+}
+
+bool EnsureFsrContext(GraphicContext& graphics, vk::Extent2D in, vk::Extent2D out, bool mv_jittered) {
+	auto& f = g_fsr_native;
+	if (f.failed) return false;
+	if (f.created && f.in == in && f.out == out) return true;
+	DestroyFsrNative();
+	f.graphics = &graphics;
+	g_fsr_instance = static_cast<VkInstance>(graphics.instance);
+	f.device_context.vkDevice         = static_cast<VkDevice>(graphics.device);
+	f.device_context.vkPhysicalDevice = static_cast<VkPhysicalDevice>(graphics.physical_device);
+	f.device_context.vkDeviceProcAddr = FsrGetDeviceProcAddr;
+	std::printf("FSR upscaling: making its context (%ux%u to %ux%u)\n", in.width, in.height, out.width,
+	            out.height);
+	std::fflush(stdout);
+	const auto fail = [&](const char* what, FfxErrorCode code) {
+		f.failed = true; // (no retry each frame: the game's TAA from now on)
+		UpscaleFailed(what, ("error 0x" + [&] {
+			char hex[16];
+			std::snprintf(hex, sizeof(hex), "%x", static_cast<unsigned>(code));
+			return std::string(hex);
+		}()).c_str());
+		return false;
+	};
+	// (The SDK keeps structures with SIMD members in its scratch memory: more than its declared
+	// alignment.)
+	const size_t size = (ffxGetScratchMemorySizeVK(f.device_context.vkPhysicalDevice, 2) + 63) & ~size_t {63};
+	f.scratch         = nullptr;
+	if (posix_memalign(&f.scratch, 64, size) != 0 || f.scratch == nullptr) {
+		f.scratch = nullptr;
+		return fail("scratch memory", FFX_ERROR_OUT_OF_MEMORY);
+	}
+	std::memset(f.scratch, 0, size);
+	if (const auto code = ffxGetInterfaceVK(&f.backend, ffxGetDeviceVK(&f.device_context), f.scratch, size, 2);
+	    code != FFX_OK) {
+		return fail("ffxGetInterfaceVK", code);
+	}
+	FfxFsr3UpscalerContextDescription description {};
+	// The game's linear HDR scene; OpenGL-style depth, not reversed (docs/RE-ASTRO-BOT-FG.md).
+	description.flags = FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE | FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE |
+	                    (mv_jittered ? FFX_FSR3UPSCALER_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION : 0u);
+	description.maxRenderSize    = {in.width, in.height};
+	description.maxUpscaleSize   = {out.width, out.height};
+	description.backendInterface = f.backend;
+	description.fpMessage        = FsrNativeMessage;
+	if (const auto code = ffxFsr3UpscalerContextCreate(&f.context, &description); code != FFX_OK) {
+		return fail("ffxFsr3UpscalerContextCreate", code);
+	}
+	auto& b = f.backend;
+	if (const auto code = b.fpCreateBackendContext(&b, FFX_EFFECT_SHAREDRESOURCES, nullptr, &f.shared_context);
+	    code != FFX_OK) {
+		ffxFsr3UpscalerContextDestroy(&f.context);
+		return fail("its shared resources", code);
+	}
+	FfxFsr3UpscalerSharedResourceDescriptions shared {};
+	FfxErrorCode code = ffxFsr3UpscalerGetSharedResourceDescriptions(&f.context, &shared);
+	if (code == FFX_OK) code = b.fpCreateResource(&b, &shared.reconstructedPrevNearestDepth, f.shared_context, &f.previous_depth);
+	if (code == FFX_OK) code = b.fpCreateResource(&b, &shared.dilatedDepth, f.shared_context, &f.dilated_depth);
+	if (code == FFX_OK) code = b.fpCreateResource(&b, &shared.dilatedMotionVectors, f.shared_context, &f.dilated_motion);
+	if (code != FFX_OK) {
+		b.fpDestroyBackendContext(&b, f.shared_context);
+		ffxFsr3UpscalerContextDestroy(&f.context);
+		return fail("its shared resources", code);
+	}
+	f.created           = true;
+	f.in                = in;
+	f.out               = out;
+	f.dispatches        = 0;
+	g_sr.previous_valid = false;
+	std::printf("FSR upscaling: %ux%u to %ux%u (%.2fx, %s)\n", in.width, in.height, out.width,
+	            out.height, static_cast<float>(out.height) / static_cast<float>(std::max(in.height, 1u)),
+	            FsrQualityName(in, out));
+	std::fflush(stdout);
+	return true;
+}
+
+FfxResource FsrNativeResource(const VulkanImage& image, const wchar_t* name, bool written) {
+	VkImageCreateInfo info {};
+	info.sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	info.imageType   = VK_IMAGE_TYPE_2D;
+	info.format      = static_cast<VkFormat>(image.format);
+	info.extent      = {image.extent.width, image.extent.height, 1};
+	info.mipLevels   = 1;
+	info.arrayLayers = 1;
+	info.samples     = VK_SAMPLE_COUNT_1_BIT;
+	info.usage       = static_cast<VkImageUsageFlags>(image.usage);
+	const auto vk_image    = static_cast<VkImage>(image.image);
+	const auto description = ffxGetImageResourceDescriptionVK(
+	    vk_image, info, written ? FFX_RESOURCE_USAGE_UAV : FFX_RESOURCE_USAGE_READ_ONLY);
+	return ffxGetResourceVK(reinterpret_cast<void*>(vk_image), description, name,
+	                        written ? FFX_RESOURCE_STATE_UNORDERED_ACCESS : FFX_RESOURCE_STATE_COMPUTE_READ);
+}
+
+bool LoadFsr() {
+	g_fsr_native.sharpness = FsrSharpnessFromEnv();
+	g_sr_ready.store(true, std::memory_order_relaxed);
+	std::printf("FSR upscaling: ready (AMD FidelityFX FSR 3, built in); it replaces the game's TAA "
+	            "(sharpening %.2f, KYTY_FSR_SHARPNESS)\n",
+	            g_fsr_native.sharpness);
+	std::fflush(stdout);
+	return true;
+}
+
+bool FsrDispatch(const FsrFrame& frame, std::string& failure) {
+	auto& f        = g_fsr_native;
+	float frame_ms = 16.7f;
+	FsrFrameTime(f.last, f.dispatches, frame_ms);
+	auto&                              b = f.backend;
+	FfxFsr3UpscalerDispatchDescription dispatch {};
+	dispatch.commandList   = ffxGetCommandListVK(static_cast<VkCommandBuffer>(frame.command));
+	dispatch.color         = FsrNativeResource(g_sr.color, L"KytyFsrColor", false);
+	dispatch.depth         = FsrNativeResource(g_sr.depth, L"KytyFsrDepth", false);
+	dispatch.motionVectors = FsrNativeResource(g_sr.motion, L"KytyFsrMotion", false);
+	dispatch.output        = FsrNativeResource(g_sr.output, L"KytyFsrOutput", true);
+	dispatch.jitterOffset  = {frame.jitter_x, frame.jitter_y};
+	// The game's UV-unit vectors (current minus previous) to FSR's render-size pixels.
+	dispatch.motionVectorScale = {MotionVectorSign() * static_cast<float>(frame.in.width),
+	                              MotionVectorSign() * static_cast<float>(frame.in.height)};
+	dispatch.renderSize        = {frame.in.width, frame.in.height};
+	dispatch.upscaleSize       = {frame.out.width, frame.out.height};
+	dispatch.enableSharpening  = f.sharpness > 0.0f;
+	dispatch.sharpness         = f.sharpness;
+	dispatch.frameTimeDelta    = frame_ms;
+	dispatch.preExposure       = 1.0f;
+	dispatch.reset             = frame.reset;
+	dispatch.cameraNear        = frame.near_plane;
+	dispatch.cameraFar         = frame.far_plane;
+	dispatch.cameraFovAngleVertical        = frame.fov;
+	dispatch.viewSpaceToMetersFactor       = 1.0f;
+	dispatch.dilatedDepth                  = b.fpGetResource(&b, f.dilated_depth);
+	dispatch.dilatedMotionVectors          = b.fpGetResource(&b, f.dilated_motion);
+	dispatch.reconstructedPrevNearestDepth = b.fpGetResource(&b, f.previous_depth);
+	const auto code = ffxFsr3UpscalerContextDispatch(&f.context, &dispatch);
+	f.dispatches++;
+	if (code != FFX_OK) {
+		char text[48];
+		std::snprintf(text, sizeof(text), "ffxFsr3UpscalerContextDispatch error 0x%x", static_cast<unsigned>(code));
+		failure = text;
+		return false;
+	}
+	return true;
+}
+#endif
 
 uint64_t DescriptorAddress(std::span<const uint32_t> user_data, size_t dword) {
 	if (dword + 1 >= user_data.size()) return 0;
@@ -1246,7 +1598,7 @@ uint64_t DescriptorAddress(std::span<const uint32_t> user_data, size_t dword) {
 bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                 const PreparedBindings& pixel, std::span<const uint32_t> user_data,
                 std::span<const RenderColorInfo> colors) {
-#ifdef KYTY_FRAMEGEN_STREAMLINE
+#ifdef KYTY_UPSCALER_CODE
 	if (!g_sr_ready.load(std::memory_order_relaxed) || g_sr.disabled) return false;
 	// Astro Bot's TAA pass (docs/RE-ASTRO-BOT-FG.md): the current colour's T# at user data 0, the
 	// history's at 8, the motion vectors' at 16, its constants buffer (80 bytes: the jitter in UV
@@ -1361,14 +1713,17 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	constants.motionVectorsJittered = mv_jittered ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	constants.reset                 = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 	std::unique_lock sl_lock(g_sl_mutex, std::defer_lock);
 	const sl::ViewportHandle viewport {UpscaleViewport};
 	sl::FrameToken*          token = nullptr;
+#endif
 	if (fsr) {
 		if (!EnsureFsrContext(graphics, in, out, mv_jittered)) {
 			return false;
 		}
 	} else {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 		sl_lock.lock();
 		if (!g_sr.options_set || g_sr.options_in != in || g_sr.options_out != out) {
 			sl::DLSSOptions options {};
@@ -1399,6 +1754,9 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 			UpscaleFailed("slSetConstants", sl::getResultAsStr(result));
 			return false;
 		}
+#else
+		return false; // (DLSS needs Streamline: Windows)
+#endif
 	}
 
 	// Outside rendering, natively at this point of the frame.
@@ -1415,41 +1773,19 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	bool        ok = false;
 	std::string failure;
 	if (fsr) {
-		const auto now = std::chrono::steady_clock::now();
-		const float frame_ms =
-		    g_fsr_api.dispatches == 0
-		        ? 16.7f
-		        : std::clamp(std::chrono::duration<float, std::milli>(now - g_fsr_api.last).count(), 1.0f, 100.0f);
-		g_fsr_api.last = now;
-		ffxDispatchDescUpscale dispatch {};
-		dispatch.header.type       = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-		dispatch.commandList       = static_cast<VkCommandBuffer>(vk_command);
-		dispatch.color             = FsrResource(g_sr.color, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-		dispatch.depth             = FsrResource(g_sr.depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-		dispatch.motionVectors     = FsrResource(g_sr.motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-		dispatch.output            = FsrResource(g_sr.output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-		dispatch.jitterOffset      = {constants.jitterOffset.x, constants.jitterOffset.y};
-		// The game's UV-unit vectors (current minus previous) to FSR's render-size pixels.
-		dispatch.motionVectorScale = {MotionVectorSign() * static_cast<float>(in.width),
-		                              MotionVectorSign() * static_cast<float>(in.height)};
-		dispatch.renderSize        = {in.width, in.height};
-		dispatch.upscaleSize       = {out.width, out.height};
-		dispatch.enableSharpening  = g_fsr_api.sharpness > 0.0f;
-		dispatch.sharpness         = g_fsr_api.sharpness;
-		dispatch.frameTimeDelta    = frame_ms;
-		dispatch.preExposure       = 1.0f;
-		dispatch.reset             = reset;
-		dispatch.cameraNear        = constants.cameraNear;
-		dispatch.cameraFar         = constants.cameraFar;
-		dispatch.cameraFovAngleVertical  = constants.cameraFOV;
-		dispatch.viewSpaceToMetersFactor = 1.0f;
-		dispatch.flags                   = 0;
-		const auto code = g_fsr_api.dispatch(&g_fsr_api.context, &dispatch.header);
-		ok              = code == FFX_API_RETURN_OK;
-		if (!ok) failure = "ffxDispatch error " + std::to_string(code);
-		g_fsr_api.dispatches++;
-		RetireFsrContexts(false);
+		FsrFrame frame;
+		frame.command    = vk_command;
+		frame.in         = in;
+		frame.out        = out;
+		frame.jitter_x   = constants.jitterOffset.x;
+		frame.jitter_y   = constants.jitterOffset.y;
+		frame.reset      = reset;
+		frame.near_plane = constants.cameraNear;
+		frame.far_plane  = constants.cameraFar;
+		frame.fov        = constants.cameraFOV;
+		ok               = FsrDispatch(frame, failure);
 	} else {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 		const auto resource = [](VulkanImage& image, vk::ImageView view, vk::ImageLayout layout) {
 			sl::Resource r(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr,
 			               static_cast<VkImageView>(view), static_cast<uint32_t>(layout));
@@ -1482,6 +1818,7 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		                                           static_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(vk_command)));
 		ok = result == sl::Result::eOk;
 		if (!ok) failure = std::string("slEvaluateFeature ") + sl::getResultAsStr(result);
+#endif
 	}
 	// (Streamline and FSR leave the command buffer's bindings as their passes left them.)
 	command.ForgetBoundState();

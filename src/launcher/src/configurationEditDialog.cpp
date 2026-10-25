@@ -27,6 +27,7 @@
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QStandardItemModel>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStyle>
@@ -349,17 +350,27 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->comboBox_upscaler->addItems(
 	    {tr("Game's own (TAA)"), tr("NVIDIA DLSS (RTX)"), tr("AMD FSR 3.1 (any GPU)")});
 	m_ui->comboBox_upscaler->setCurrentIndex(std::clamp(info.upscaler, 0, 2));
+#if !defined(_WIN32)
+	// DLSS needs NVIDIA Streamline (Windows); FSR is built into the Linux and macOS emulator.
+	if (auto* model = qobject_cast<QStandardItemModel*>(m_ui->comboBox_upscaler->model());
+	    model != nullptr && model->item(1) != nullptr) {
+		model->item(1)->setEnabled(false);
+	}
+	if (info.upscaler == 1) {
+		m_ui->comboBox_upscaler->setCurrentIndex(0);
+	}
+#endif
 	m_ui->comboBox_render_resolution->clear();
 	m_ui->comboBox_render_resolution->addItems({tr("Game's choice"), tr("1920x1080 (fastest)"),
 	                                            tr("2432x1368"), tr("3328x1872"), tr("3840x2160")});
 	m_ui->comboBox_render_resolution->setCurrentIndex(std::clamp(info.render_resolution, 0, 4));
 	m_ui->checkBox_smooth_frame_pacing->setChecked(info.smooth_frame_pacing);
+	m_ui->checkBox_relaxed_shader_maths->setChecked(info.relaxed_shader_maths);
 	// (The spin box's minimum, 19, shows "Off".)
 	m_ui->spinBox_frame_rate_limit->setValue(info.frame_rate_limit == 0 ? 19 : info.frame_rate_limit);
 #if !defined(_WIN32)
-	// NVIDIA Streamline (frame generation, DLSS, Reflex) and AMD's FSR runtime are Windows only.
+	// NVIDIA Streamline (frame generation, DLSS, Reflex) is Windows only.
 	for (QWidget* field: std::initializer_list<QWidget*> {m_ui->comboBox_frame_generation,
-	                                                      m_ui->comboBox_upscaler,
 	                                                      m_ui->spinBox_frame_rate_limit}) {
 		m_ui->graphicsLayout->setRowVisible(field, false);
 	}
@@ -572,6 +583,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.upscaler                  = std::max(ui.comboBox_upscaler->currentIndex(), 0);
 	info.render_resolution         = std::max(ui.comboBox_render_resolution->currentIndex(), 0);
 	info.smooth_frame_pacing       = ui.checkBox_smooth_frame_pacing->isChecked();
+	info.relaxed_shader_maths      = ui.checkBox_relaxed_shader_maths->isChecked();
 	info.frame_rate_limit =
 	    ui.spinBox_frame_rate_limit->value() < 20 ? 0 : ui.spinBox_frame_rate_limit->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();

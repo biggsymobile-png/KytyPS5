@@ -154,6 +154,12 @@ add_library(spirv-tools-opt ALIAS SPIRV-Tools-opt)
 
 add_subdirectory(xxHash/build/cmake)
 
+# AMD FidelityFX SDK 1.1.4 sources (FSR 3 upscaling), built in on Linux and macOS, where AMD ships
+# no runtime (Windows loads amd_fidelityfx_vk.dll instead). From chenxiao07/KytyPS5 PR #117.
+if (NOT WIN32)
+	add_subdirectory(fidelityfx)
+endif()
+
 set(FMT_DOC OFF CACHE BOOL "" FORCE)
 set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
 set(FMT_MODULE OFF CACHE BOOL "" FORCE)
