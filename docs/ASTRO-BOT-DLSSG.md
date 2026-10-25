@@ -141,7 +141,7 @@ generation and Reflex are Windows only and not in them. **FSR upscaling is**: th
 into the emulator from AMD's FidelityFX SDK 1.1.4 sources (no extra file), so **Upscaling: AMD
 FSR** in the launcher, or `"KYTY_FSR": "1",` in `u59-preset.json`, works on any Vulkan GPU. The
 built-in **render resolution** (`KYTY_ASTRO_RENDER_RES`, e.g. 1080) and everything else from
-Jetsku's int21 are in them too. FSR on Linux and macOS is new and untested by us: please report
+Jetsku's int21 are in them too. The macOS build is the first one and untested too. FSR on Linux and macOS is new and untested by us: please report
 whether it works (and the console's `FSR upscaling:` lines if it does not).
 
 Started without the launcher (as frontends do), the emulator applies `u59-preset.json` from its
