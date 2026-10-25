@@ -542,6 +542,8 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		environment.insert(QStringLiteral("KYTY_FRAMEGEN"), QString::number(info.frame_generation));
 		environment.insert(QStringLiteral("KYTY_DLSS"), QString::number(info.upscaler == 1 ? 1 : 0));
 		environment.insert(QStringLiteral("KYTY_FSR"), QString::number(info.upscaler == 2 ? 1 : 0));
+		environment.insert(QStringLiteral("KYTY_PRESENT_ABS_VBLANK"),
+		                   info.smooth_frame_pacing ? QStringLiteral("1") : QStringLiteral("0"));
 		static constexpr int kRenderHeights[] = {0, 1080, 1368, 1872, 2160};
 		const int render = kRenderHeights[std::clamp(info.render_resolution, 0, 4)];
 		if (render != 0) {

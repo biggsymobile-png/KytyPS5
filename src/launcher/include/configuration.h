@@ -197,6 +197,9 @@ public:
 	// Astro Bot's fixed render resolution (KYTY_ASTRO_RENDER_RES): 0 the game's choice, 1 1080p,
 	// 2 1368p, 3 1872p, 4 2160p.
 	int                    render_resolution           = 0;
+	// KYTY_PRESENT_ABS_VBLANK: the virtual vblank on an absolute timeline (a late frame skips a
+	// vblank instead of bunching the next flips together).
+	bool                   smooth_frame_pacing         = false;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -240,6 +243,7 @@ public:
 		frame_generation            = other.frame_generation;
 		upscaler                    = other.upscaler;
 		render_resolution           = other.render_resolution;
+		smooth_frame_pacing         = other.smooth_frame_pacing;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
 		shader_validation_enabled   = other.shader_validation_enabled;

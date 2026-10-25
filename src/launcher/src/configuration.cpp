@@ -25,6 +25,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(frame_generation);
 	KYTY_CFG_SET(upscaler);
 	KYTY_CFG_SET(render_resolution);
+	KYTY_CFG_SET(smooth_frame_pacing);
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
 	KYTY_CFG_SET(shader_validation_enabled);
@@ -78,6 +79,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	frame_generation = s.value("frame_generation", frame_generation).toInt();
 	upscaler         = s.value("upscaler", upscaler).toInt();
 	render_resolution = s.value("render_resolution", render_resolution).toInt();
+	smooth_frame_pacing = s.value("smooth_frame_pacing", smooth_frame_pacing).toBool();
 	console_language = s.value("console_language", console_language).toInt();
 	if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
 		console_language = DEFAULT_CONSOLE_LANGUAGE;

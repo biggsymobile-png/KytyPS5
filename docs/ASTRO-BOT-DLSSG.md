@@ -64,8 +64,9 @@ change.
 
 In the launcher, a game's **Graphics & display** settings have **Frame generation** (Off, 2x, 3x,
 4x; 3x and 4x need an RTX 50 card), **Upscaling** (the game's own TAA, NVIDIA DLSS or AMD FSR 3.1) and
-**Render resolution** (Astro Bot's; lower is faster). They take precedence over
-`u59-preset.json`.
+**Render resolution** (Astro Bot's; lower is faster), and **Smooth frame pacing**
+(`KYTY_PRESENT_ABS_VBLANK`: after a slow frame a vblank is skipped instead of the next frames being
+shown back to back). They take precedence over `u59-preset.json`.
 
 This build is made like Jetsku's U59 releases (profile-guided optimisation trained on Astro Bot,
 the emulator's diagnostics compiled out) and ships Jetsku's tuned **`u59-preset.json`** next to

@@ -353,6 +353,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->comboBox_render_resolution->addItems({tr("Game's choice"), tr("1920x1080 (fastest)"),
 	                                            tr("2432x1368"), tr("3328x1872"), tr("3840x2160")});
 	m_ui->comboBox_render_resolution->setCurrentIndex(std::clamp(info.render_resolution, 0, 4));
+	m_ui->checkBox_smooth_frame_pacing->setChecked(info.smooth_frame_pacing);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
 	m_ui->comboBox_console_language->setCurrentIndex(
@@ -560,6 +561,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.frame_generation          = std::max(ui.comboBox_frame_generation->currentIndex(), 0);
 	info.upscaler                  = std::max(ui.comboBox_upscaler->currentIndex(), 0);
 	info.render_resolution         = std::max(ui.comboBox_render_resolution->currentIndex(), 0);
+	info.smooth_frame_pacing       = ui.checkBox_smooth_frame_pacing->isChecked();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();

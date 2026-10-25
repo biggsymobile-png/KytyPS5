@@ -348,6 +348,12 @@
               <property name="text"><string>Render resolution:</string></property>
              </widget>
             </item>
+            <item row="13" column="1">
+             <widget class="QCheckBox" name="checkBox_smooth_frame_pacing">
+              <property name="toolTip"><string>Runs the emulator's virtual vblank on an absolute timeline: after a slow frame, a vblank is skipped instead of the next frames being shown back to back to catch up. Can feel smoother when the frame rate dips (KYTY_PRESENT_ABS_VBLANK).</string></property>
+              <property name="text"><string>Smooth frame pacing (skip missed vblanks)</string></property>
+             </widget>
+            </item>
             <item row="12" column="1">
              <widget class="QComboBox" name="comboBox_render_resolution">
               <property name="toolTip"><string>Astro Bot (01.018): the resolution the game draws its 3D image at, before its TAA or DLSS upscales it. Lower is faster; 1920x1080 with DLSS is the fastest. No patch file needed (a "Fixed render resolution" patch, if enabled, wins).</string></property>
