@@ -1762,8 +1762,12 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		return value != nullptr && std::strcmp(value, "projection") == 0;
 	}();
 	static const float sign_x = EnvSign("KYTY_DLSS_JITTER_X"), sign_y = EnvSign("KYTY_DLSS_JITTER_Y");
-	const float jitter_x = use_projection ? projection_x : -taa_jitter_x * static_cast<float>(in.width);
-	const float jitter_y = use_projection ? projection_y : -taa_jitter_y * static_cast<float>(in.height);
+	// (Astro's Playroom: its TAA constants hold no jitter, the projection does; a TAA jitter of
+	// exactly zero with a jittered projection takes the projection's.)
+	const bool from_projection = use_projection || (taa_jitter_x == 0.0f && taa_jitter_y == 0.0f &&
+	                                                (projection_x != 0.0f || projection_y != 0.0f));
+	const float jitter_x = from_projection ? projection_x : -taa_jitter_x * static_cast<float>(in.width);
+	const float jitter_y = from_projection ? projection_y : -taa_jitter_y * static_cast<float>(in.height);
 	constants.jitterOffset = sl::float2(jitter_x * sign_x, jitter_y * sign_y);
 	static const bool mv_jittered = [] {
 		const char* value = std::getenv("KYTY_DLSS_MV_JITTERED");

@@ -376,9 +376,15 @@ void ApplyPlayroomRenderResolution(Program* main_program, const std::string& ver
 		const uint64_t address = main_program->base_vaddr + edit.offset;
 		if (!IsInsideProgram(*main_program, address, edit.size) ||
 		    std::memcmp(reinterpret_cast<const void*>(address), edit.origin, edit.size) != 0) {
-			::printf("Game patch: render resolution not applied: Astro's Playroom %s is not 01.905.000, or "
-			         "a patch file already set its resolution (KYTY_ASTRO_RENDER_RES)\n",
-			         version.c_str());
+			if (version == "01.905.000") {
+				::printf("Game patch: render resolution left as set by a game patch (KYTY_ASTRO_RENDER_RES=%d "
+				         "not applied)\n",
+				         height);
+			} else {
+				::printf("Game patch: render resolution not applied: Astro's Playroom %s has no known "
+				         "resolution code (01.905.000 has; KYTY_ASTRO_RENDER_RES)\n",
+				         version.c_str());
+			}
 			return;
 		}
 	}
