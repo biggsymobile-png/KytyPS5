@@ -909,6 +909,8 @@ struct Upscaler {
 	uint64_t      evaluated      = 0;
 	bool          disabled       = false;
 	bool          reported       = false;
+	float         jitter_min_x = 1e9f, jitter_max_x = -1e9f, jitter_min_y = 1e9f, jitter_max_y = -1e9f;
+	uint32_t      resets       = 0;
 };
 Upscaler g_sr;
 constexpr uint32_t UpscaleViewport = 1;
@@ -1240,10 +1242,26 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		                     target->backing.image, vk::ImageLayout::eTransferDstOptimal, copy);
 		target->NoteContentWrite();
 	}
+	// The jitter's spread over the last status interval: a still camera jitter (0) means DLSS has
+	// no sub-pixel samples to accumulate.
+	g_sr.jitter_min_x = std::min(g_sr.jitter_min_x, constants.jitterOffset.x);
+	g_sr.jitter_max_x = std::max(g_sr.jitter_max_x, constants.jitterOffset.x);
+	g_sr.jitter_min_y = std::min(g_sr.jitter_min_y, constants.jitterOffset.y);
+	g_sr.jitter_max_y = std::max(g_sr.jitter_max_y, constants.jitterOffset.y);
+	g_sr.resets += reset ? 1u : 0u;
 	if (++g_sr.evaluated == 1) {
 		std::printf("DLSS upscaling: on (jitter %.3f, %.3f px; projection's %.3f, %.3f)\n",
 		            constants.jitterOffset.x, constants.jitterOffset.y, projection_x, projection_y);
 		std::fflush(stdout);
+	} else if (g_sr.evaluated % 600 == 0) {
+		std::printf("DLSS upscaling: %ux%u to %ux%u, last 600 frames: jitter x %.3f..%.3f, y %.3f..%.3f "
+		            "px, %u history reset(s)\n",
+		            in.width, in.height, out.width, out.height, g_sr.jitter_min_x, g_sr.jitter_max_x,
+		            g_sr.jitter_min_y, g_sr.jitter_max_y, g_sr.resets);
+		std::fflush(stdout);
+		g_sr.jitter_min_x = g_sr.jitter_min_y = 1e9f;
+		g_sr.jitter_max_x = g_sr.jitter_max_y = -1e9f;
+		g_sr.resets = 0;
 	}
 	return true;
 #else
