@@ -2226,7 +2226,8 @@ void BufferCache::ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write,
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	}
 	if (is_write) {
-		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		// (One critical section: memoryTracker.h, TakeGpuPagesForCpu.)
+		m_memory_tracker.TakeGpuPagesForCpu(vaddr, size);
 	}
 }
 

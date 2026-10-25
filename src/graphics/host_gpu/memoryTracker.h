@@ -68,6 +68,12 @@ public:
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// The guest writes the range: the GPU's claim on its pages is released and the CPU's taken in
+	// one critical section per region (KytyPS5/KytyPS5 PR #1412). As two calls, a page still
+	// GPU-dirty at the CPU claim (released between them, or never downloaded because no exact
+	// GPU-written bytes needed copying) ends the process on "CPU dirty state conflicts with GPU
+	// dirty state". The claim covers whole pages; the guest's write supersedes the GPU's bytes.
+	void               TakeGpuPagesForCpu(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Side readbacks: mark the GPU-dirty pages of a range whose dirty bytes a side copy now
 	// publishes. Any later GPU ownership change of a page cancels its mark. Unmark clears

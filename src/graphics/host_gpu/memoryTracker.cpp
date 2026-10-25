@@ -353,6 +353,18 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+void MemoryTracker::TakeGpuPagesForCpu(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::TrackerGpuUnmark);
+	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		const auto       address = manager->GetCpuAddr() + offset;
+		manager->ChangeState<DirtySource::Gpu, false>(address, bytes);
+		NotifyCpuMutation(address, bytes);
+		manager->ChangeState<DirtySource::Cpu, true>(address, bytes);
+	});
+}
+
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::TrackerGpuMark);
