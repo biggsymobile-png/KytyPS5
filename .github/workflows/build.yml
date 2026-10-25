@@ -385,6 +385,7 @@ jobs:
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            ${{ inputs.release_tag != '' && '-DKYTY_EMULATOR_IPO=ON -DKYTY_CP_DIAGNOSTICS=OFF' || '' }} \
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
@@ -413,7 +414,7 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/linux \
-            --target launcher page_manager_tests memory_tracker_tests \
+            --target launcher kyty_emulator page_manager_tests memory_tracker_tests \
               audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
