@@ -26,6 +26,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(upscaler);
 	KYTY_CFG_SET(render_resolution);
 	KYTY_CFG_SET(smooth_frame_pacing);
+	KYTY_CFG_SET(frame_rate_limit);
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
 	KYTY_CFG_SET(shader_validation_enabled);
@@ -80,6 +81,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	upscaler         = s.value("upscaler", upscaler).toInt();
 	render_resolution = s.value("render_resolution", render_resolution).toInt();
 	smooth_frame_pacing = s.value("smooth_frame_pacing", smooth_frame_pacing).toBool();
+	frame_rate_limit    = s.value("frame_rate_limit", frame_rate_limit).toInt();
 	console_language = s.value("console_language", console_language).toInt();
 	if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
 		console_language = DEFAULT_CONSOLE_LANGUAGE;
@@ -178,6 +180,9 @@ bool Configuration::SetGameSettings(const QJsonObject& imported_settings, QStrin
 	}
 	if (upscaler < 0 || upscaler > 2) {
 		return fail(tr("Upscaler must be 0 (the game's), 1 (DLSS) or 2 (FSR)."));
+	}
+	if (frame_rate_limit != 0 && (frame_rate_limit < 20 || frame_rate_limit > 240)) {
+		return fail(tr("Frame rate limit must be 0 (off) or between 20 and 240."));
 	}
 	if (render_resolution < 0 || render_resolution > 4) {
 		return fail(tr("Render resolution must be between 0 (the game's choice) and 4 (2160p)."));

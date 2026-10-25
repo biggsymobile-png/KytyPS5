@@ -354,6 +354,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	                                            tr("2432x1368"), tr("3328x1872"), tr("3840x2160")});
 	m_ui->comboBox_render_resolution->setCurrentIndex(std::clamp(info.render_resolution, 0, 4));
 	m_ui->checkBox_smooth_frame_pacing->setChecked(info.smooth_frame_pacing);
+	// (The spin box's minimum, 19, shows "Off".)
+	m_ui->spinBox_frame_rate_limit->setValue(info.frame_rate_limit == 0 ? 19 : info.frame_rate_limit);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
 	m_ui->comboBox_console_language->setCurrentIndex(
@@ -562,6 +564,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.upscaler                  = std::max(ui.comboBox_upscaler->currentIndex(), 0);
 	info.render_resolution         = std::max(ui.comboBox_render_resolution->currentIndex(), 0);
 	info.smooth_frame_pacing       = ui.checkBox_smooth_frame_pacing->isChecked();
+	info.frame_rate_limit =
+	    ui.spinBox_frame_rate_limit->value() < 20 ? 0 : ui.spinBox_frame_rate_limit->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();

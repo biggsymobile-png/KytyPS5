@@ -66,7 +66,10 @@ In the launcher, a game's **Graphics & display** settings have **Frame generatio
 4x; 3x and 4x need an RTX 50 card), **Upscaling** (the game's own TAA, NVIDIA DLSS or AMD FSR 3.1) and
 **Render resolution** (Astro Bot's; lower is faster), and **Smooth frame pacing**
 (`KYTY_PRESENT_ABS_VBLANK`: after a slow frame a vblank is skipped instead of the next frames being
-shown back to back). They take precedence over `u59-preset.json`.
+shown back to back) and **Frame rate limit** (`KYTY_FRAMEGEN_FPS_CAP`: with frame generation,
+NVIDIA Reflex holds the rendered frames to that rate so generated frames are evenly spaced; pick
+one your PC holds, e.g. 40 or 60 with Vblank frequency 120). They take precedence over
+`u59-preset.json`.
 
 This build is made like Jetsku's U59 releases (profile-guided optimisation trained on Astro Bot,
 the emulator's diagnostics compiled out) and ships Jetsku's tuned **`u59-preset.json`** next to
@@ -82,6 +85,7 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FRAMEGEN=2` / `3` | 3x / 4x multi frame generation (RTX 50 only) |
 | `KYTY_DLSS=1` | DLSS upscaling in place of the game's anti-aliasing (TAA), see below (launcher: Upscaling) |
 | `KYTY_ASTRO_RENDER_RES=1080` | Astro Bot's render resolution: 1080, 1368, 1872 or 2160 (launcher: Render resolution) |
+| `KYTY_FRAMEGEN_FPS_CAP=40` | With frame generation: Reflex limits the rendered frames to 40 fps (launcher: Frame rate limit) |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
 | `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
 

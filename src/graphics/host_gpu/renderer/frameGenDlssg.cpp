@@ -470,6 +470,13 @@ bool FindFunctions(bool report) {
 	// (Required with DLSS-G, whatever the Reflex mode: Streamline's DLSS-G and Reflex guides.)
 	sl::ReflexOptions reflex {};
 	reflex.mode = sl::ReflexMode::eLowLatency;
+	// KYTY_FRAMEGEN_FPS_CAP=<fps> (the launcher's Frame rate limit): Reflex holds the rendered
+	// (base) frames to at most this rate, so DLSS-G paces evenly spaced frames instead of the
+	// emulator's uneven ones. 0 or unset: no cap.
+	if (const char* cap = std::getenv("KYTY_FRAMEGEN_FPS_CAP"); cap != nullptr && std::atoi(cap) > 0) {
+		reflex.frameLimitUs = static_cast<uint32_t>(1'000'000 / std::atoi(cap));
+		std::printf("Frame generation: base frame rate capped at %d fps (KYTY_FRAMEGEN_FPS_CAP)\n", std::atoi(cap));
+	}
 	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
 	}
