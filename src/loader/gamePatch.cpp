@@ -334,6 +334,65 @@ bool ApplyPending(Program* program) {
 	return true;
 }
 
+// KYTY_ASTRO_RENDER_RES for Astro's Playroom (PPSA01325 01.905.000): the same tiers through the
+// community "Fixed render resolution" edits (16 immediates: the width and height of the game's 2160p
+// and 1080p render paths, at their 01.905 addresses). All original bytes must be there: another
+// version, or a patch file that already changed them, is left alone.
+void ApplyPlayroomRenderResolution(Program* main_program, const std::string& version, int height) {
+	enum class Dim : uint8_t { Width, Height };
+	struct Edit {
+		uint64_t offset;
+		uint8_t  origin[6];
+		uint8_t  size;
+		Dim      dim;
+	};
+	static constexpr Edit kEdits[] = {
+	    {0x1d59e8d, {0xbb, 0x70, 0x08, 0x00, 0x00}, 5, Dim::Height},
+	    {0x1d59e92, {0x41, 0xbc, 0x00, 0x0f, 0x00, 0x00}, 6, Dim::Width},
+	    {0x1d59e9f, {0xbb, 0x38, 0x04, 0x00, 0x00}, 5, Dim::Height},
+	    {0x1d59ea4, {0x41, 0xbc, 0x80, 0x07, 0x00, 0x00}, 6, Dim::Width},
+	    {0x1c2beb1, {0x41, 0xbc, 0x38, 0x04, 0x00, 0x00}, 6, Dim::Height},
+	    {0x1c2beb7, {0x41, 0xbe, 0x80, 0x07, 0x00, 0x00}, 6, Dim::Width},
+	    {0x1c2bec4, {0x41, 0xbc, 0x70, 0x08, 0x00, 0x00}, 6, Dim::Height},
+	    {0x1c2beca, {0x41, 0xbe, 0x00, 0x0f, 0x00, 0x00}, 6, Dim::Width},
+	    {0x1c2bf80, {0xba, 0x80, 0x07, 0x00, 0x00}, 5, Dim::Width},
+	    {0x1c2bf89, {0xb9, 0x38, 0x04, 0x00, 0x00}, 5, Dim::Height},
+	    {0x1c2bfe6, {0xba, 0x00, 0x0f, 0x00, 0x00}, 5, Dim::Width},
+	    {0x1c2bff5, {0xb9, 0x70, 0x08, 0x00, 0x00}, 5, Dim::Height},
+	    {0x1c2e5f7, {0x41, 0xbe, 0x70, 0x08, 0x00, 0x00}, 6, Dim::Height},
+	    {0x1c2e5fd, {0xbb, 0x00, 0x0f, 0x00, 0x00}, 5, Dim::Width},
+	    {0x1c2e604, {0x41, 0xbe, 0x38, 0x04, 0x00, 0x00}, 6, Dim::Height},
+	    {0x1c2e60a, {0xbb, 0x80, 0x07, 0x00, 0x00}, 5, Dim::Width},
+	};
+	uint32_t width = 0;
+	switch (height) {
+		case 1080: width = 1920; break;
+		case 1368: width = 2432; break;
+		case 1872: width = 3328; break;
+		case 2160: width = 3840; break;
+		default: return;
+	}
+	for (const auto& edit: kEdits) {
+		const uint64_t address = main_program->base_vaddr + edit.offset;
+		if (!IsInsideProgram(*main_program, address, edit.size) ||
+		    std::memcmp(reinterpret_cast<const void*>(address), edit.origin, edit.size) != 0) {
+			::printf("Game patch: render resolution not applied: Astro's Playroom %s is not 01.905.000, or "
+			         "a patch file already set its resolution (KYTY_ASTRO_RENDER_RES)\n",
+			         version.c_str());
+			return;
+		}
+	}
+	for (const auto& edit: kEdits) {
+		const uint64_t address = main_program->base_vaddr + edit.offset;
+		const uint32_t value   = edit.dim == Dim::Width ? width : static_cast<uint32_t>(height);
+		// (The immediate is the instruction's last four bytes.)
+		std::memcpy(reinterpret_cast<uint8_t*>(address) + edit.size - 4, &value, sizeof(value));
+		(void)Common::VirtualMemory::FlushInstructionCache(address, edit.size);
+	}
+	::printf("Game patch: Astro's Playroom fixed render resolution %ux%d (%s, KYTY_ASTRO_RENDER_RES)\n",
+	         width, height, version.c_str());
+}
+
 // KYTY_ASTRO_RENDER_RES=1080|1368|1872|2160 (the launcher's "Render resolution"; unset or
 // anything else: the game's own choice): Astro Bot (PPSA21564 / PPSA21567 01.018.000) renders at
 // that fixed resolution tier, as the community "Fixed render resolution" patches do (the same
@@ -356,9 +415,14 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 		case 2160: tier = 4; break;
 		default: return;
 	}
+	if (title_id == "PPSA01325") {
+		ApplyPlayroomRenderResolution(main_program, version, height);
+		return;
+	}
 	// Astro Bot's title IDs (US, EU).
 	if (title_id != "PPSA21564" && title_id != "PPSA21567") {
-		::printf("Game patch: render resolution %dp is for Astro Bot only (KYTY_ASTRO_RENDER_RES)\n",
+		::printf("Game patch: render resolution %dp is for Astro Bot and Astro's Playroom only "
+		         "(KYTY_ASTRO_RENDER_RES)\n",
 		         height);
 		return;
 	}

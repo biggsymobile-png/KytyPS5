@@ -4314,7 +4314,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// KYTY_DLSS: DLSS super resolution writes Astro Bot's TAA outputs instead of its TAA draw.
 	if (FrameGen::UpscaleEnabled() && state.ps_active && bindings.pixel &&
 	    state.ps_input_info.stage.program != nullptr &&
-	    state.ps_input_info.stage.program->shader_hash == FrameGen::TaaPixelShader &&
+	    FrameGen::IsTaaPixelShader(state.ps_input_info.stage.program->shader_hash) &&
 	    state.ps_input_info.stage.resources != nullptr) {
 		const auto& user_data = state.ps_input_info.stage.resources->user_data;
 		if (FrameGen::UpscaleTaa(buffer.GetGraphics(), m_context.GetTextureCache(), buffer,

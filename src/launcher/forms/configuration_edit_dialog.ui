@@ -377,7 +377,7 @@
             </item>
             <item row="12" column="1">
              <widget class="QComboBox" name="comboBox_render_resolution">
-              <property name="toolTip"><string>Astro Bot (01.018): the resolution the game draws its 3D image at, before its TAA or DLSS upscales it. Lower is faster; 1920x1080 with DLSS is the fastest. No patch file needed (a "Fixed render resolution" patch, if enabled, wins).</string></property>
+              <property name="toolTip"><string>Astro Bot (01.018) and Astro's Playroom (01.905): the resolution the game draws its 3D image at, before its TAA, DLSS or FSR upscales it. Lower is faster; 1920x1080 with DLSS is the fastest. No patch file needed (a "Fixed render resolution" patch, if enabled, wins).</string></property>
              </widget>
             </item>
            </layout>

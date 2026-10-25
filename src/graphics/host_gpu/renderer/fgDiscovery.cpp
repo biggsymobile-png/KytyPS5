@@ -15,6 +15,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::FgDiscovery {
 
@@ -189,10 +190,33 @@ bool Recording() {
 	return g_recording.load(std::memory_order_relaxed);
 }
 
+// KYTY_FG_DISCOVER_WATCH: more shaders to dump (hex hashes, separated by commas or spaces), e.g.
+// another game's TAA and G-buffer shaders.
+const std::vector<uint64_t>& ExtraWatched() {
+	static const std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> hashes;
+		const char* value = std::getenv("KYTY_FG_DISCOVER_WATCH");
+		for (const char* p = value; p != nullptr && *p != '\0';) {
+			char*    end  = nullptr;
+			uint64_t hash = std::strtoull(p, &end, 16);
+			if (end == p) {
+				++p;
+				continue;
+			}
+			hashes.push_back(hash);
+			p = end;
+		}
+		return hashes;
+	}();
+	return list;
+}
+
 bool Watched(uint64_t shader_hash) {
 	if (!GetSettings().enabled) return false;
+	const auto& extra = ExtraWatched();
 	return std::find(std::begin(WatchedShaders), std::end(WatchedShaders), shader_hash) !=
-	       std::end(WatchedShaders);
+	           std::end(WatchedShaders) ||
+	       std::find(extra.begin(), extra.end(), shader_hash) != extra.end();
 }
 
 void OnShaderDecoded(uint64_t shader_hash, const char* stage, const std::string& text) {

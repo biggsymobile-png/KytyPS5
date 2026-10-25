@@ -188,7 +188,23 @@ bool IsDepthFormat(vk::Format format) {
 
 // Astro Bot's per-view constants (576 bytes): view at byte 64, jittered projection at 128, both
 // column-major. A projection has col2.w = -1 and col3.w = 0; a view has col3.w = 1.
+// A view (col3.w = 1) at words[at - 16], then a perspective projection at words[at].
+bool CameraAt(const uint32_t* words, uint32_t at) {
+	const float p00 = AsFloat(words[at]), p11 = AsFloat(words[at + 5]);
+	return AsFloat(words[at + 11]) == -1.0f && words[at + 15] == 0 && AsFloat(words[at - 1]) == 1.0f &&
+	       p00 > 0.0f && p11 > 0.0f && std::isfinite(p00) && std::isfinite(p11) &&
+	       AsFloat(words[at - 13]) == 0.0f && AsFloat(words[at - 9]) == 0.0f && AsFloat(words[at - 5]) == 0.0f;
+}
+
 bool ReadCamera(const PreparedBindings& bindings, Camera& camera) {
+	const auto take = [&](const uint32_t* words, uint32_t at) {
+		for (uint32_t i = 0; i < 16; ++i) {
+			camera.view[i]       = AsFloat(words[at - 16 + i]);
+			camera.projection[i] = AsFloat(words[at + i]);
+		}
+		camera.valid = true;
+		return true;
+	};
 	for (const auto& source: bindings.buffer_sources) {
 		if (source.size != ViewConstantsBytes || source.address < 0x10000) continue;
 		// Guest memory is mapped at the same addresses in the emulator; the CPU writes these.
@@ -198,12 +214,20 @@ bool ReadCamera(const PreparedBindings& bindings, Camera& camera) {
 		    !(p00 > 0.0f) || !(p11 > 0.0f) || !std::isfinite(p00) || !std::isfinite(p11)) {
 			continue;
 		}
-		for (uint32_t i = 0; i < 16; ++i) {
-			camera.view[i]       = AsFloat(words[16 + i]);
-			camera.projection[i] = AsFloat(words[32 + i]);
+		return take(words, 32);
+	}
+	// Other layouts (Astro's Playroom: 496 bytes): the first view-then-projection pair, on 16-byte
+	// boundaries, in a per-view constants buffer.
+	for (const auto& source: bindings.buffer_sources) {
+		if (source.size < 128 || source.size > 1024 || source.size == ViewConstantsBytes ||
+		    source.address < 0x10000) {
+			continue;
 		}
-		camera.valid = true;
-		return true;
+		const auto*    words = reinterpret_cast<const uint32_t*>(source.address);
+		const uint32_t count = static_cast<uint32_t>(source.size / 4);
+		for (uint32_t at = 16; at + 16 <= count; at += 4) {
+			if (CameraAt(words, at)) return take(words, at);
+		}
 	}
 	return false;
 }
@@ -913,7 +937,7 @@ void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
             const RenderDepthInfo& depth) {
 	if (!Gathering()) return;
 	// The TAA pass: its first image is the motion vectors.
-	if (pixel_shader == TaaPixelShader) {
+	if (IsTaaPixelShader(pixel_shader)) {
 		if (pixel == nullptr || pixel->images.empty()) return;
 		const auto&       motion = pixel->images[0];
 		std::lock_guard lock(g_mutex);

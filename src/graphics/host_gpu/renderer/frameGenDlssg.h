@@ -45,6 +45,13 @@ namespace FrameGen {
 
 // Astro Bot's TAA pixel shader (docs/RE-ASTRO-BOT-FG.md): its image 0 is the motion vectors.
 constexpr uint64_t TaaPixelShader = 0x2936e5eca99d75e7ull;
+// Astro's Playroom's (PPSA01325 01.905): the same pass (colour at user data 0, history at 8, motion
+// at 16 and image 0, output and history in colour targets 0 and 1), with 64 bytes of constants.
+constexpr uint64_t TaaPixelShaderPlayroom = 0xeb87b8b7c526169dull;
+
+constexpr bool IsTaaPixelShader(uint64_t hash) {
+	return hash == TaaPixelShader || hash == TaaPixelShaderPlayroom;
+}
 
 struct Camera {
 	std::array<float, 16> view {};       // column-major, world to camera

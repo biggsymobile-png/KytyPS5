@@ -133,6 +133,15 @@ included next to the emulator. The console shows `FSR upscaling: 1920x1080 to ..
 `FSR upscaling: on`. `"KYTY_FSR_SHARPNESS": "0.5",` in `u59-preset.json` adds FSR's sharpening
 (0 to 1; default off). The jitter switches of DLSS above apply to FSR too.
 
+## Astro's Playroom (experimental)
+
+Astro's Playroom (PPSA01325, version 01.905) uses the same kind of TAA pass as Astro Bot, so DLSS
+and FSR upscaling and DLSS frame generation are set up for it too, untested so far. The launcher's
+**Render resolution** works for it as well (no patch file needed; an enabled "Fixed render
+resolution" patch wins). The console shows the same `DLSS upscaling:` / `FSR upscaling:` and
+`Frame generation:` lines; `0 of the last presents had inputs` means its camera was not found:
+please report it with the log.
+
 ## Linux, Batocera / Steam Deck and macOS
 
 The release also has a **Linux build** (`...-Linux-x86_64.tar.gz`) and a **macOS build**
