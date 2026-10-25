@@ -703,6 +703,22 @@ std::string RefusedDeviceAdvice() {
 
 void AddDeviceExtensions(const std::vector<vk::ExtensionProperties>& available,
                          std::vector<const char*>&                   extensions) {
+	if (g_fsr) {
+		// FSR's runtime looks these up under their extension names (vkGetBufferMemoryRequirements2KHR)
+		// when the GPU offers dedicated allocations, and calls them unchecked: the extensions,
+		// promoted to Vulkan 1.1, are enabled so the names exist on the device.
+		for (const char* name: {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
+		                        VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME}) {
+			const bool offered = std::any_of(available.begin(), available.end(), [&](const vk::ExtensionProperties& item) {
+				return std::strcmp(item.extensionName.data(), name) == 0;
+			});
+			const bool added = std::any_of(extensions.begin(), extensions.end(),
+			                               [&](const char* have) { return std::strcmp(have, name) == 0; });
+			if (offered && !added) {
+				extensions.push_back(name);
+			}
+		}
+	}
 	if (!Requested()) return;
 	// (Streamline adds what DLSS-G needs; VK_KHR_present_id it relies on for VK_NV_low_latency2.)
 	const auto has = [&](const char* name) {
