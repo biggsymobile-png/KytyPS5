@@ -15,6 +15,10 @@ on:
         description: Make that release a draft (only the repository's owner sees it until published)
         type: boolean
         default: false
+      macos_only:
+        description: Build only macOS (with release_tag, add its package to that existing release)
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -41,7 +45,7 @@ jobs:
 
   windows:
     name: Build KytyPS5 (Windows)
-    if: inputs.release_tag == ''
+    if: inputs.release_tag == '' && !inputs.macos_only
     needs: metadata
     runs-on: windows-2022
 
@@ -231,7 +235,18 @@ jobs:
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
-            --parallel
+            --parallel \
+            -- -k 0 2>&1 | tee _Build/macos-build.log
+          status="${PIPESTATUS[0]}"
+          if [ "$status" != 0 ]; then
+            echo "::group::Compile errors"
+            grep -E "error:|FAILED" _Build/macos-build.log | head -100 || true
+            echo "::endgroup::"
+            grep -E "^/.*error:" _Build/macos-build.log | head -40 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+          fi
+          exit "$status"
 
       - name: Test
         shell: bash
@@ -319,7 +334,7 @@ jobs:
   linux:
     name: Build KytyPS5 (Linux)
     # (Also for this fork's releases unless windows_only: fork-release-linux adds it to the release.)
-    if: ${{ !inputs.windows_only }}
+    if: ${{ !inputs.windows_only && !inputs.macos_only }}
     needs: metadata
     runs-on: ubuntu-24.04
 
@@ -562,7 +577,7 @@ jobs:
   # u59-windows-release.yml, Jetsku's release recipe (PGO, CP diagnostics off, the preset).
   fork-release:
     name: Optimised release
-    if: inputs.release_tag != ''
+    if: inputs.release_tag != '' && !inputs.macos_only
     permissions:
       contents: write
     uses: ./.github/workflows/u59-windows-release.yml
@@ -576,7 +591,7 @@ jobs:
   # start without the launcher.
   fork-release-linux:
     name: Linux package for the release
-    if: ${{ inputs.release_tag != '' && !inputs.windows_only }}
+    if: ${{ inputs.release_tag != '' && !inputs.windows_only && !inputs.macos_only }}
     needs: [linux, fork-release]
     runs-on: ubuntu-latest
     permissions:
@@ -615,7 +630,11 @@ jobs:
 
   fork-release-macos:
     name: macOS package for the release
-    if: ${{ inputs.release_tag != '' && !inputs.windows_only }}
+    # (macos_only: added to the release an earlier run made, without the Windows build.)
+    if: >-
+      ${{ always() && inputs.release_tag != '' && !inputs.windows_only &&
+          needs.macos.result == 'success' &&
+          (needs.fork-release.result == 'success' || inputs.macos_only) }}
     needs: [macos, fork-release]
     runs-on: ubuntu-latest
     permissions:

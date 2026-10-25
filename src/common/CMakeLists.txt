@@ -14,7 +14,7 @@ add_library(common STATIC ${common_src} ${common_headers})
 
 # Loading/watchdog diagnostics handle filesystem and thread-start exceptions locally.
 # Other sources retain the project's no-exceptions compilation policy.
-if(LINUX)
+if(LINUX OR APPLE)
 	set_property(SOURCE profiler.cpp hangWatchdog.cpp APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
 endif()
 set(localization_dir "${PROJECT_SOURCE_DIR}/assets/localization")

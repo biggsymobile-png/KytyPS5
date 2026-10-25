@@ -34,6 +34,9 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
 #endif
 
 namespace HangTrace {
@@ -524,6 +527,10 @@ uint64_t NowMs() {
 uint64_t OsThreadId() {
 #ifdef _WIN32
 	return GetCurrentThreadId();
+#elif defined(__APPLE__)
+	uint64_t id = 0;
+	(void)pthread_threadid_np(nullptr, &id);
+	return id;
 #else
 	return static_cast<uint64_t>(gettid());
 #endif
