@@ -334,35 +334,37 @@ bool ApplyPending(Program* program) {
 	return true;
 }
 
-// KYTY_ASTRO_RENDER_RES for Astro's Playroom (PPSA01325 01.905.000): the same tiers through the
-// community "Fixed render resolution" edits (16 immediates: the width and height of the game's 2160p
-// and 1080p render paths, at their 01.905 addresses). All original bytes must be there: another
-// version, or a patch file that already changed them, is left alone.
+// KYTY_ASTRO_RENDER_RES for Astro's Playroom (PPSA01325): the same tiers through the community
+// "Fixed render resolution" edits: 16 immediates, the width and height of the game's 2160p and
+// 1080p render paths, in five groups of instructions. Each group is looked for in the executable
+// segments by its instructions (the short jumps and stack offsets between them are wildcards, so
+// other versions match if the code is the same), and all five must be found exactly once with
+// their original values: otherwise (another build of the code, or a patch file that already set the
+// resolution) nothing is changed. 01.905.000's groups are at 0x1c2beb1-0x1d59eaa.
 void ApplyPlayroomRenderResolution(Program* main_program, const std::string& version, int height) {
 	enum class Dim : uint8_t { Width, Height };
-	struct Edit {
-		uint64_t offset;
-		uint8_t  origin[6];
-		uint8_t  size;
-		Dim      dim;
+	struct Immediate {
+		uint8_t offset; // of the instruction's last four bytes (its immediate) in the group
+		Dim     dim;
 	};
-	static constexpr Edit kEdits[] = {
-	    {0x1d59e8d, {0xbb, 0x70, 0x08, 0x00, 0x00}, 5, Dim::Height},
-	    {0x1d59e92, {0x41, 0xbc, 0x00, 0x0f, 0x00, 0x00}, 6, Dim::Width},
-	    {0x1d59e9f, {0xbb, 0x38, 0x04, 0x00, 0x00}, 5, Dim::Height},
-	    {0x1d59ea4, {0x41, 0xbc, 0x80, 0x07, 0x00, 0x00}, 6, Dim::Width},
-	    {0x1c2beb1, {0x41, 0xbc, 0x38, 0x04, 0x00, 0x00}, 6, Dim::Height},
-	    {0x1c2beb7, {0x41, 0xbe, 0x80, 0x07, 0x00, 0x00}, 6, Dim::Width},
-	    {0x1c2bec4, {0x41, 0xbc, 0x70, 0x08, 0x00, 0x00}, 6, Dim::Height},
-	    {0x1c2beca, {0x41, 0xbe, 0x00, 0x0f, 0x00, 0x00}, 6, Dim::Width},
-	    {0x1c2bf80, {0xba, 0x80, 0x07, 0x00, 0x00}, 5, Dim::Width},
-	    {0x1c2bf89, {0xb9, 0x38, 0x04, 0x00, 0x00}, 5, Dim::Height},
-	    {0x1c2bfe6, {0xba, 0x00, 0x0f, 0x00, 0x00}, 5, Dim::Width},
-	    {0x1c2bff5, {0xb9, 0x70, 0x08, 0x00, 0x00}, 5, Dim::Height},
-	    {0x1c2e5f7, {0x41, 0xbe, 0x70, 0x08, 0x00, 0x00}, 6, Dim::Height},
-	    {0x1c2e5fd, {0xbb, 0x00, 0x0f, 0x00, 0x00}, 5, Dim::Width},
-	    {0x1c2e604, {0x41, 0xbe, 0x38, 0x04, 0x00, 0x00}, 6, Dim::Height},
-	    {0x1c2e60a, {0xbb, 0x80, 0x07, 0x00, 0x00}, 5, Dim::Width},
+	struct Group {
+		const char*            pattern; // hex bytes, "??" any byte
+		std::vector<Immediate> immediates;
+	};
+	static const Group kGroups[] = {
+	    // mov ebx, 2160; mov r12d, 3840; test r12d, r12d; jnz; jmp; mov ebx, 1080; mov r12d, 1920
+	    {"bb70080000 41bc000f0000 4585e4 75?? eb?? bb38040000 41bc80070000",
+	     {{1, Dim::Height}, {7, Dim::Width}, {19, Dim::Height}, {25, Dim::Width}}},
+	    // mov r12d, 1080; mov r14d, 1920; jmp; mov rbx, [rsp+n]; mov r12d, 2160; mov r14d, 3840
+	    {"41bc38040000 41be80070000 eb?? 488b5c24?? 41bc70080000 41be000f0000",
+	     {{2, Dim::Height}, {8, Dim::Width}, {21, Dim::Height}, {27, Dim::Width}}},
+	    // mov edx, 1920; mov [rsp], rcx; mov ecx, 1080
+	    {"ba80070000 48890c24 b938040000", {{1, Dim::Width}, {10, Dim::Height}}},
+	    // mov edx, 3840; mov r8, r12; mov r9, rbx; mov [rsp], rcx; mov ecx, 2160
+	    {"ba000f0000 4d89e0 4989d9 48890c24 b970080000", {{1, Dim::Width}, {16, Dim::Height}}},
+	    // mov r14d, 2160; mov ebx, 3840; jmp; mov r14d, 1080; mov ebx, 1920
+	    {"41be70080000 bb000f0000 eb?? 41be38040000 bb80070000",
+	     {{2, Dim::Height}, {7, Dim::Width}, {15, Dim::Height}, {20, Dim::Width}}},
 	};
 	uint32_t width = 0;
 	switch (height) {
@@ -372,28 +374,66 @@ void ApplyPlayroomRenderResolution(Program* main_program, const std::string& ver
 		case 2160: width = 3840; break;
 		default: return;
 	}
-	for (const auto& edit: kEdits) {
-		const uint64_t address = main_program->base_vaddr + edit.offset;
-		if (!IsInsideProgram(*main_program, address, edit.size) ||
-		    std::memcmp(reinterpret_cast<const void*>(address), edit.origin, edit.size) != 0) {
+	const auto parse = [](const char* text, std::vector<int>& bytes) {
+		for (const char* p = text; *p != '\0';) {
+			if (*p == ' ') {
+				++p;
+				continue;
+			}
+			if (p[0] == '?' && p[1] == '?') {
+				bytes.push_back(-1);
+			} else {
+				bytes.push_back(static_cast<int>(std::strtoul(std::string(p, 2).c_str(), nullptr, 16)));
+			}
+			p += 2;
+		}
+	};
+	const auto* ehdr = main_program->elf->GetEhdr();
+	const auto* phdr = main_program->elf->GetPhdr();
+	std::vector<uint8_t*> found;
+	for (const auto& group: kGroups) {
+		std::vector<int> pattern;
+		parse(group.pattern, pattern);
+		uint8_t* hit   = nullptr;
+		uint32_t count = 0;
+		for (Elf64_Half index = 0; index < ehdr->e_phnum && count < 2; index++) {
+			const auto& segment = phdr[index];
+			if (segment.p_type != PT_LOAD || (segment.p_flags & PF_X) == 0 || segment.p_filesz < pattern.size()) {
+				continue;
+			}
+			auto* const begin = reinterpret_cast<uint8_t*>(main_program->base_vaddr + segment.p_vaddr);
+			auto* const last  = begin + segment.p_filesz - pattern.size();
+			for (auto* at = begin; at <= last && count < 2; ++at) {
+				if (*at != pattern[0]) continue;
+				size_t k = 1;
+				while (k < pattern.size() && (pattern[k] < 0 || at[k] == pattern[k])) ++k;
+				if (k == pattern.size()) {
+					hit = at;
+					++count;
+				}
+			}
+		}
+		if (count != 1) {
 			if (version == "01.905.000") {
 				::printf("Game patch: render resolution left as set by a game patch (KYTY_ASTRO_RENDER_RES=%d "
 				         "not applied)\n",
 				         height);
 			} else {
-				::printf("Game patch: render resolution not applied: Astro's Playroom %s has no known "
-				         "resolution code (01.905.000 has; KYTY_ASTRO_RENDER_RES)\n",
-				         version.c_str());
+				::printf("Game patch: render resolution not applied: Astro's Playroom %s has %s "
+				         "(KYTY_ASTRO_RENDER_RES)\n",
+				         version.c_str(), count == 0 ? "different resolution code" : "several candidates");
 			}
 			return;
 		}
+		found.push_back(hit);
 	}
-	for (const auto& edit: kEdits) {
-		const uint64_t address = main_program->base_vaddr + edit.offset;
-		const uint32_t value   = edit.dim == Dim::Width ? width : static_cast<uint32_t>(height);
-		// (The immediate is the instruction's last four bytes.)
-		std::memcpy(reinterpret_cast<uint8_t*>(address) + edit.size - 4, &value, sizeof(value));
-		(void)Common::VirtualMemory::FlushInstructionCache(address, edit.size);
+	for (size_t g = 0; g < found.size(); ++g) {
+		for (const auto& immediate: kGroups[g].immediates) {
+			uint8_t* const at    = found[g] + immediate.offset;
+			const uint32_t value = immediate.dim == Dim::Width ? width : static_cast<uint32_t>(height);
+			std::memcpy(at, &value, sizeof(value));
+			(void)Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(at), sizeof(value));
+		}
 	}
 	::printf("Game patch: Astro's Playroom fixed render resolution %ux%d (%s, KYTY_ASTRO_RENDER_RES)\n",
 	         width, height, version.c_str());
