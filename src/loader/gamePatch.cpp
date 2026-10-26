@@ -476,9 +476,9 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 		         height);
 		return;
 	}
-	// Below 1080p: tier 0 (1920x1080) made smaller. The game asks a small function for a tier's
-	// size: "mov dword [rdi], width; mov dword [rsi], height; ret" per tier (three copies in
-	// 01.018); tier 0's pair is rewritten in each, checked against tier 4's (3840x2160) pairs.
+	// Below 1080p: tier 0 (1920x1080) made smaller: its entries in the game's per-tier size tables
+	// (below) and in its tier size functions ("mov dword [rdi], width; mov dword [rsi], height;
+	// ret" per tier, three copies in 01.018, checked against tier 4's pairs).
 	const int low_height = height < 1080 ? height : 0;
 	static constexpr uint64_t kOffset    = 0xc62a97; // 01.018.000
 	static constexpr uint8_t  kOrigin[6] = {0x8b, 0x83, 0xf0, 0x23, 0x00, 0x00};
@@ -555,13 +555,53 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 				current = hit + 1;
 			}
 		}
-		if (tier0.empty() || tier0.size() != tier4 || tier0.size() > 8) {
+		// The render targets' sizes come from per-tier tables in the read-only data (width, height,
+		// width as a float; tier 2 repeats tier 1): three of each in 01.018, each read once.
+		static constexpr uint32_t kWidths[5]  = {1920, 2432, 2432, 3328, 3840};
+		static constexpr uint32_t kHeights[5] = {1080, 1368, 1368, 1872, 2160};
+		static constexpr float    kWidthsF[5] = {1920.0f, 2432.0f, 2432.0f, 3328.0f, 3840.0f};
+		std::vector<uint8_t*> widths, heights, widths_f;
+		for (Elf64_Half index = 0; index < ehdr->e_phnum; index++) {
+			const auto& segment = phdr[index];
+			if (segment.p_type != PT_LOAD || (segment.p_flags & PF_X) != 0 || segment.p_filesz < sizeof(kWidths)) {
+				continue;
+			}
+			auto*       begin = reinterpret_cast<uint8_t*>(main_program->base_vaddr + segment.p_vaddr);
+			auto* const end   = begin + segment.p_filesz;
+			const auto  find  = [&](const void* pattern, size_t size, std::vector<uint8_t*>& out) {
+				const auto* p = static_cast<const uint8_t*>(pattern);
+				for (auto* current = begin;;) {
+					auto* hit = std::search(current, end, p, p + size);
+					if (hit == end) break;
+					out.push_back(hit);
+					current = hit + 1;
+				}
+			};
+			find(kWidths, sizeof(kWidths), widths);
+			find(kHeights, sizeof(kHeights), heights);
+			find(kWidthsF, sizeof(kWidthsF), widths_f);
+		}
+		if (widths.empty() || widths.size() != heights.size() || widths.size() > 8 || widths_f.size() > 8) {
+			::printf("Game patch: Astro Bot render resolution %dp not applied: this version (%s) has %zu width and "
+			         "%zu height tables (KYTY_ASTRO_RENDER_RES); 1080p instead\n",
+			         low_height, version.c_str(), widths.size(), heights.size());
+		}
+		const bool tables_ok = !widths.empty() && widths.size() == heights.size() && widths.size() <= 8 &&
+		                       widths_f.size() <= 8;
+		if (!tables_ok) {
+			height = 1080;
+		} else if (tier0.empty() || tier0.size() != tier4 || tier0.size() > 8) {
 			::printf("Game patch: Astro Bot render resolution %dp not applied: this version (%s) has %zu tier size "
 			         "entries for 1080p and %u for 2160p (KYTY_ASTRO_RENDER_RES); 1080p instead\n",
 			         low_height, version.c_str(), tier0.size(), tier4);
 			height = 1080;
 		} else {
 			const uint32_t width = low_height == 540 ? 960u : 1280u;
+			const uint32_t h0    = static_cast<uint32_t>(low_height);
+			const float    w0f   = static_cast<float>(width);
+			for (auto* entry: widths) std::memcpy(entry, &width, sizeof(width));
+			for (auto* entry: heights) std::memcpy(entry, &h0, sizeof(h0));
+			for (auto* entry: widths_f) std::memcpy(entry, &w0f, sizeof(w0f));
 			for (auto* entry: tier0) {
 				std::memcpy(entry + 2, &width, sizeof(width));
 				const uint32_t h = static_cast<uint32_t>(low_height);
