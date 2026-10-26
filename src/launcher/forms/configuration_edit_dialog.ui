@@ -371,7 +371,7 @@
             </item>
             <item row="13" column="1">
              <widget class="QCheckBox" name="checkBox_smooth_frame_pacing">
-              <property name="toolTip"><string>Runs the emulator's virtual vblank on an absolute timeline: after a slow frame, a vblank is skipped instead of the next frames being shown back to back to catch up. Can feel smoother when the frame rate dips (KYTY_PRESENT_ABS_VBLANK).</string></property>
+              <property name="toolTip"><string>Runs the emulator's virtual vblank on an absolute timeline: after a slow frame, a vblank is skipped instead of the next frames being shown back to back to catch up. Can feel smoother when the frame rate dips (KYTY_PRESENT_ABS_VBLANK). With Present mode Immediate, frames are shown as soon as they are ready, at most one per vblank.</string></property>
               <property name="text"><string>Smooth frame pacing (skip missed vblanks)</string></property>
              </widget>
             </item>

@@ -230,6 +230,11 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   at about twice the game's frame rate and a display that refreshes that fast.
 - **Astro's Playroom at double speed:** a Vblank frequency above 60 without the decouple patch.
   Set it to 60 for Playroom (see Astro's Playroom above).
+- **Fixed in this build: Astro's Playroom too fast with Present mode Immediate and Smooth frame
+  pacing.** That combination showed every frame as soon as it was ready, so the Vblank frequency
+  no longer capped the frame rate, and Playroom's game logic (one step per frame) sped up with it.
+  It now shows at most one frame per vblank (`"KYTY_PRESENT_IMMEDIATE_UNCAPPED": "1",` restores the
+  old behaviour). With older builds: use Present mode FIFO or untick Smooth frame pacing.
 - **FSR frame generation does not work together with DLSS upscaling.** Use FSR upscaling or the
   game's TAA with it.
 - **Game patches are separate and up to you.** Frame generation and upscaling do not depend on

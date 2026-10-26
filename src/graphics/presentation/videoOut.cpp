@@ -868,7 +868,19 @@ void VideoOutDriver::Impl::VblankEnd() {
 // PresentMode::Immediate the switch also presents ready flips between vblanks (polling every
 // <= 500 us) instead of only at a vblank. The timeline restarts when the switch turns on or the
 // refresh rate changes. Independent of KYTY_PRESENT_PORT_UNLOCKED, which only changes FlipQueue::Flip.
+// (This branch: at most one flip per vblank period there, the one at the vblank or the first one
+// ready after it, so a game stepping its logic once per frame (Astro's Playroom) keeps the vblank
+// rate's speed instead of running as fast as it renders. KYTY_PRESENT_IMMEDIATE_UNCAPPED=1: every
+// ready flip, as before.)
 static Live::Switch g_present_abs_vblank("KYTY_PRESENT_ABS_VBLANK", Live::ParseDefaultOff);
+
+static bool PresentImmediateUncapped() {
+	static const bool uncapped = [] {
+		const char* value = std::getenv("KYTY_PRESENT_IMMEDIATE_UNCAPPED");
+		return value != nullptr && value[0] == '1';
+	}();
+	return uncapped;
+}
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	// A 120 Hz timer loop that blocks between vblanks; it presents and fires the flip events the
@@ -897,6 +909,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	uint32_t abs_refresh = 0;
 
 	uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 8th vblank
+	bool     period_flipped  = false; // a flip was presented in this vblank period (Immediate, absolute)
 	while (!token.stop_requested()) {
 		if ((++placement_count & 7u) == 0u) {
 			Common::SamplePlacement(Common::ThreadRole::Host);
@@ -933,7 +946,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				// Present each ready flip as it arrives; the guest's vblank events keep their clock.
 				while (!token.stop_requested() &&
 				       Common::Timer::QueryPerformanceCounter() < deadline) {
-					if (m_flip_queue.Flip(0)) {
+					if ((!period_flipped || PresentImmediateUncapped()) && m_flip_queue.Flip(0)) {
+						period_flipped = true;
 						continue;
 					}
 					const auto current = Common::Timer::QueryPerformanceCounter();
@@ -990,6 +1004,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
+		period_flipped = presented; // (a new vblank period starts with this tick)
 		if (!presented) {
 			presented = m_presenter.PresentPendingFrame();
 		}
