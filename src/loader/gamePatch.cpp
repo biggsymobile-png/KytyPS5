@@ -458,7 +458,7 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 	int       tier   = -1;
 	switch (height) {
 		case 540:
-		case 720: tier = 0; break; // (Astro's Playroom only; Astro Bot's lowest tier is 1080p)
+		case 720: tier = 0; break; // (Astro Bot: tier 0 made smaller, below)
 		case 1080: tier = 0; break;
 		case 1368: tier = 1; break;
 		case 1872: tier = 3; break;
@@ -476,12 +476,10 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 		         height);
 		return;
 	}
-	if (height < 1080) {
-		::printf("Game patch: Astro Bot's lowest render resolution tier is 1080p; 1080p instead of %dp "
-		         "(KYTY_ASTRO_RENDER_RES)\n",
-		         height);
-		height = 1080;
-	}
+	// Below 1080p: tier 0 (1920x1080) made smaller. The game asks a small function for a tier's
+	// size: "mov dword [rdi], width; mov dword [rsi], height; ret" per tier (three copies in
+	// 01.018); tier 0's pair is rewritten in each, checked against tier 4's (3840x2160) pairs.
+	const int low_height = height < 1080 ? height : 0;
 	static constexpr uint64_t kOffset    = 0xc62a97; // 01.018.000
 	static constexpr uint8_t  kOrigin[6] = {0x8b, 0x83, 0xf0, 0x23, 0x00, 0x00};
 	static constexpr uint8_t  kPatched[2] = {0xb8, 0x90}; // first and last byte of "mov eax, n; nop"
@@ -528,6 +526,49 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 			         "(KYTY_ASTRO_RENDER_RES)\n",
 			         version.c_str(), found == 0 ? "no known resolution code" : "several candidates");
 			return;
+		}
+	}
+	if (low_height != 0) {
+		static constexpr uint8_t kTier0[12] = {0xc7, 0x07, 0x80, 0x07, 0x00, 0x00, 0xc7, 0x06, 0x38, 0x04, 0x00, 0x00};
+		static constexpr uint8_t kTier4[12] = {0xc7, 0x07, 0x00, 0x0f, 0x00, 0x00, 0xc7, 0x06, 0x70, 0x08, 0x00, 0x00};
+		std::vector<uint8_t*> tier0;
+		uint32_t              tier4 = 0;
+		const auto*           ehdr  = main_program->elf->GetEhdr();
+		const auto*           phdr  = main_program->elf->GetPhdr();
+		for (Elf64_Half index = 0; index < ehdr->e_phnum; index++) {
+			const auto& segment = phdr[index];
+			if (segment.p_type != PT_LOAD || (segment.p_flags & PF_X) == 0 || segment.p_filesz < sizeof(kTier0)) {
+				continue;
+			}
+			auto*       begin = reinterpret_cast<uint8_t*>(main_program->base_vaddr + segment.p_vaddr);
+			auto* const end   = begin + segment.p_filesz;
+			for (auto* current = begin;;) {
+				auto* hit = std::search(current, end, std::begin(kTier0), std::end(kTier0));
+				if (hit == end) break;
+				tier0.push_back(hit);
+				current = hit + 1;
+			}
+			for (auto* current = begin;;) {
+				auto* hit = std::search(current, end, std::begin(kTier4), std::end(kTier4));
+				if (hit == end) break;
+				tier4++;
+				current = hit + 1;
+			}
+		}
+		if (tier0.empty() || tier0.size() != tier4 || tier0.size() > 8) {
+			::printf("Game patch: Astro Bot render resolution %dp not applied: this version (%s) has %zu tier size "
+			         "entries for 1080p and %u for 2160p (KYTY_ASTRO_RENDER_RES); 1080p instead\n",
+			         low_height, version.c_str(), tier0.size(), tier4);
+			height = 1080;
+		} else {
+			const uint32_t width = low_height == 540 ? 960u : 1280u;
+			for (auto* entry: tier0) {
+				std::memcpy(entry + 2, &width, sizeof(width));
+				const uint32_t h = static_cast<uint32_t>(low_height);
+				std::memcpy(entry + 8, &h, sizeof(h));
+				(void)Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(entry), sizeof(kTier0));
+			}
+			height = low_height;
 		}
 	}
 	const auto address = reinterpret_cast<uint64_t>(code);
