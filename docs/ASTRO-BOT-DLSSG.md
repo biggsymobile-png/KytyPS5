@@ -178,6 +178,13 @@ version 01.905). One difference: Playroom's TAA runs at the render resolution an
 its own does the upscale, so DLSS and FSR work there as **anti-aliasing at the render resolution
 (DLAA / native AA)**, not as the upscaler. The console's lines are the same as for Astro Bot.
 
+**Playroom runs at double speed with a Vblank frequency above 60** unless a "Decouple gameplay
+timers from render FPS" patch is applied (its game logic steps once per frame). Keep Playroom's
+**Vblank frequency at 60** (launcher: the game's settings, Graphics & display; frontends:
+`--vblank-frequency 60`). DLSS-G and FSR frame generation on Windows do not need more. With the
+decouple patch (the console shows `Successfully applied cheat: Decouple gameplay timers from render
+FPS`) a higher rate is fine.
+
 ## Shader maths profile (experimental)
 
 **Relaxed shader maths** (`KYTY_FLOAT_PROFILE`): `precise` (the default) copies the PS5 GPU's exact
@@ -221,6 +228,8 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   is being worked on.
 - **FSR frame generation on Linux and macOS is new and untested**: it needs the Vblank frequency
   at about twice the game's frame rate and a display that refreshes that fast.
+- **Astro's Playroom at double speed:** a Vblank frequency above 60 without the decouple patch.
+  Set it to 60 for Playroom (see Astro's Playroom above).
 - **FSR frame generation does not work together with DLSS upscaling.** Use FSR upscaling or the
   game's TAA with it.
 - **Game patches are separate and up to you.** Frame generation and upscaling do not depend on
