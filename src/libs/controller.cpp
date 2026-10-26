@@ -171,6 +171,15 @@ private:
 	// Accelerometer gravity direction in the reset frame.
 	std::array<float, 3> m_up_reference {0.0f, 1.0f, 0.0f};
 	bool                 m_up_reference_valid = false;
+	// KYTY_GYRO_CALIBRATION: the gyro's resting offset (rad/s), learned while the pad is still.
+	std::array<float, 3> m_gyro_bias {};
+	bool                 m_gyro_bias_valid  = false;
+	uint64_t             m_still_since_us   = 0;
+	uint64_t             m_still_for_us     = 0;
+	float                m_accel_jitter     = 1.0f;
+	std::array<float, 3> m_prev_accel {};
+	std::array<float, 3> m_bias_logged {};
+	uint64_t             m_bias_log_us      = 0;
 	ControllerState  m_state;
 	ControllerState  m_states[STATES_MAX];
 	bool             m_obtained[STATES_MAX] {};
@@ -548,6 +557,11 @@ void GameController::SetDevices(int active_id) {
 	m_emulated_time  = 0;
 	m_emulated_stick = {128, 128};
 	m_up_reference_valid = false;
+	m_gyro_bias          = {}; // another controller: learn its own offset
+	m_gyro_bias_valid    = false;
+	m_still_since_us     = 0;
+	m_still_for_us       = 0;
+	m_accel_jitter       = 1.0f;
 	m_states_num    = 0;
 	m_first_state   = 0;
 	m_next_touch_id = 1;
@@ -717,6 +731,22 @@ float Length(const Vec3& v) {
 	return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 }
 
+// KYTY_GYRO_CALIBRATION (default 1; 0 = off): continuous gyro calibration. Every gyro reads a small
+// rotation at rest (its zero-rate offset, often 0.2-2 degrees/s on a DualSense); passed through and
+// integrated, it makes aim and orientation creep sideways during play. The accelerometer correction
+// below fixes tilt but cannot see heading, so the offset is measured instead: while the pad is
+// still (rotation within 3 degrees/s of the current offset, gravity steady at 1 G) for half a second,
+// the offset follows the readings (time constant 2 s; 0.25 s until the first estimate), and it is
+// subtracted from every reading, both the angular velocity the game reads and the orientation the
+// emulator integrates. Per controller; a new one learns its own. Console: "Gyro calibration: ...".
+bool GyroCalibrationEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GYRO_CALIBRATION");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 } // namespace
 
 void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t time_us) {
@@ -730,6 +760,11 @@ void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t t
 		for (int i = 0; i < 3; i++) {
 			m_state.accel[i] = data[i] / SDL_STANDARD_GRAVITY;
 		}
+		// How much the measured acceleration moves between reports (still pad: sensor noise only).
+		const Vec3 change {m_state.accel[0] - m_prev_accel[0], m_state.accel[1] - m_prev_accel[1],
+		                   m_state.accel[2] - m_prev_accel[2]};
+		m_accel_jitter = Length(change);
+		m_prev_accel   = m_state.accel;
 		// Capture gravity near 1 G to limit interference from linear acceleration.
 		const float magnitude = Length(m_state.accel);
 		if (!m_up_reference_valid && magnitude > 0.9f && magnitude < 1.1f) {
@@ -740,6 +775,53 @@ void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t t
 		}
 	} else {
 		std::copy_n(data, 3, m_state.gyro.begin());
+		if (GyroCalibrationEnabled()) {
+			const Vec3 raw {data[0], data[1], data[2]};
+			const Vec3 off {raw[0] - m_gyro_bias[0], raw[1] - m_gyro_bias[1], raw[2] - m_gyro_bias[2]};
+			const float g     = Length(m_state.accel);
+			// Before the first estimate the offset is unknown: accept a larger resting reading.
+			const float limit = m_gyro_bias_valid ? 0.05f : 0.1f; // rad/s (~3 / ~6 degrees/s)
+			const bool  still = Length(off) < limit && g > 0.95f && g < 1.05f && m_accel_jitter < 0.02f;
+			const bool  in_sequence = m_gyro_time != 0 && time_us > m_gyro_time &&
+			                         time_us - m_gyro_time <= 100000;
+			if (!still || !in_sequence) {
+				m_still_since_us = still ? time_us : 0;
+				m_still_for_us   = 0;
+			} else {
+				if (m_still_since_us == 0) {
+					m_still_since_us = time_us;
+				}
+				if (time_us - m_still_since_us >= 500000) {
+					const float dt  = static_cast<float>(time_us - m_gyro_time) * 0.000001f;
+					const float tau = m_gyro_bias_valid ? 2.0f : 0.25f;
+					const float a   = std::min(1.0f, dt / tau);
+					for (int i = 0; i < 3; i++) {
+						m_gyro_bias[i] += (raw[i] - m_gyro_bias[i]) * a;
+					}
+					m_still_for_us += time_us - m_gyro_time;
+					if (!m_gyro_bias_valid && m_still_for_us >= 1000000) {
+						m_gyro_bias_valid = true;
+					}
+				}
+			}
+			if (m_gyro_bias_valid) {
+				constexpr float deg = 57.29578f;
+				const Vec3 moved {m_gyro_bias[0] - m_bias_logged[0], m_gyro_bias[1] - m_bias_logged[1],
+				                  m_gyro_bias[2] - m_bias_logged[2]};
+				if (m_bias_log_us == 0 ||
+				    (Length(moved) * deg > 0.25f && time_us - m_bias_log_us >= 60000000)) {
+					::printf("Gyro calibration: resting offset %.2f, %.2f, %.2f degrees/s removed from "
+					         "the controller's readings (KYTY_GYRO_CALIBRATION)\n",
+					         m_gyro_bias[0] * deg, m_gyro_bias[1] * deg, m_gyro_bias[2] * deg);
+					fflush(stdout);
+					m_bias_logged = m_gyro_bias;
+					m_bias_log_us = time_us != 0 ? time_us : 1;
+				}
+				for (int i = 0; i < 3; i++) {
+					m_state.gyro[i] = raw[i] - m_gyro_bias[i];
+				}
+			}
+		}
 		// Mahony tilt correction; heading is unobservable and reported gyro values stay raw.
 		auto        rate      = m_state.gyro;
 		const float magnitude = Length(m_state.accel);

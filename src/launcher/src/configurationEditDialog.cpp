@@ -362,12 +362,17 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	}
 #endif
 	m_ui->comboBox_render_resolution->clear();
-	// (Indices 5 and 6, added later, keep the saved choices of the first five.)
-	m_ui->comboBox_render_resolution->addItems({tr("Game's choice"), tr("1920x1080"),
-	                                            tr("2432x1368"), tr("3328x1872"), tr("3840x2160")});
-	m_ui->comboBox_render_resolution->addItems(
-	    {tr("1280x720"), tr("960x540 (fastest)")});
-	m_ui->comboBox_render_resolution->setCurrentIndex(std::clamp(info.render_resolution, 0, 6));
+	// Shown smallest to largest; each item carries the saved value (render_resolution), whose
+	// numbering stays as it was (5 = 720p and 6 = 540p were added later), so saved choices keep.
+	m_ui->comboBox_render_resolution->addItem(tr("Game's choice"), 0);
+	m_ui->comboBox_render_resolution->addItem(tr("960x540 (fastest)"), 6);
+	m_ui->comboBox_render_resolution->addItem(tr("1280x720"), 5);
+	m_ui->comboBox_render_resolution->addItem(tr("1920x1080"), 1);
+	m_ui->comboBox_render_resolution->addItem(tr("2432x1368"), 2);
+	m_ui->comboBox_render_resolution->addItem(tr("3328x1872"), 3);
+	m_ui->comboBox_render_resolution->addItem(tr("3840x2160"), 4);
+	m_ui->comboBox_render_resolution->setCurrentIndex(std::max(
+	    m_ui->comboBox_render_resolution->findData(std::clamp(info.render_resolution, 0, 6)), 0));
 	m_ui->checkBox_smooth_frame_pacing->setChecked(info.smooth_frame_pacing);
 	m_ui->checkBox_relaxed_shader_maths->setChecked(info.relaxed_shader_maths);
 	// (The spin box's minimum, 19, shows "Off".)
@@ -592,7 +597,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.frame_generation          = std::max(ui.comboBox_frame_generation->currentIndex(), 0);
 	info.upscaler                  = std::max(ui.comboBox_upscaler->currentIndex(), 0);
-	info.render_resolution         = std::max(ui.comboBox_render_resolution->currentIndex(), 0);
+	info.render_resolution         = std::clamp(ui.comboBox_render_resolution->currentData().toInt(), 0, 6);
 	info.smooth_frame_pacing       = ui.checkBox_smooth_frame_pacing->isChecked();
 	info.relaxed_shader_maths      = ui.checkBox_relaxed_shader_maths->isChecked();
 	info.frame_rate_limit =

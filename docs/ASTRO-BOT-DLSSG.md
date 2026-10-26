@@ -255,7 +255,14 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   at about twice the game's frame rate and a display that refreshes that fast.
 - **Astro's Playroom at double speed:** a Vblank frequency above 60 without the decouple patch.
   Set it to 60 for Playroom (see Astro's Playroom above).
-- **Fixed in this build: slow motion for a whole level below 60 fps with the decouple patch**
+- **New in this build: DualSense gyro no longer drifts.** Every gyro reads a small rotation even
+  at rest, and passed straight to the game it made aiming and tilt creep sideways during play (the
+  accelerometer correction already fixed tilt, but nothing can correct heading that way). The
+  emulator now measures that resting offset whenever the controller is held still for a moment and
+  removes it from every reading (the console shows `Gyro calibration: resting offset ...`;
+  `"KYTY_GYRO_CALIBRATION": "0",` turns it off). The launcher's render resolutions are now listed
+  smallest to largest (saved choices are kept).
+- **Fixed in build 19: slow motion for a whole level below 60 fps with the decouple patch**
   (Pumpkin Peril at Vblank 40). The community "[Fix] Bot rescue plays with the game's own 60 fps
   timing" mod switches Decouple off when a rescue starts and only back on when it ends; some levels
   start one without ending it. The emulator now applies that fix itself, automatically (no button
