@@ -71,12 +71,25 @@ In the launcher, a game's **Graphics & display** settings have:
 - **Render resolution:** the game's 3D resolution, for both Astro Bot and Playroom (lower is faster).
 - **Relaxed shader maths:** simpler shader maths, see below.
 - **Smooth frame pacing** (`KYTY_PRESENT_ABS_VBLANK`): after a slow frame a vblank is skipped
-  instead of the next frames being shown back to back.
+  instead of the next frames being shown back to back. Only the display skips it: the game still
+  counts the vblank, so its speed stays right.
 - **Frame rate limit** (`KYTY_FRAMEGEN_FPS_CAP`): with DLSS-G, NVIDIA Reflex holds the rendered
   frames to that rate so generated frames are evenly spaced; pick one your PC holds, e.g. 40 or 60
   with Vblank frequency 120.
 
 They take precedence over `u59-preset.json`.
+
+### Recommended on a G-Sync / FreeSync display
+
+**Present mode Immediate** with **Smooth frame pacing** ticked: a frame that misses its vblank is
+shown as soon as it is ready instead of a whole vblank later, which the variable refresh then
+displays evenly. In a busy Astro Bot level (Sky Garden) this cut the visible hitches by about 90%
+compared with FIFO.
+
+Then pick a **Vblank frequency your PC holds in the busiest levels**: evenly timed frames at a lower
+rate feel smoother than a higher rate that keeps dipping. Astro Bot keeps its normal speed below 60.
+A tester's smooth setup (RTX 5080): **Vblank frequency 40, Frame generation 2x, Frame rate limit
+80**. Without a variable-refresh display keep FIFO. Astro's Playroom: keep 60 (see below).
 
 This build is made like Jetsku's U59 releases (profile-guided optimisation trained on Astro Bot,
 the emulator's diagnostics compiled out) and ships Jetsku's tuned **`u59-preset.json`** next to
@@ -230,7 +243,13 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   at about twice the game's frame rate and a display that refreshes that fast.
 - **Astro's Playroom at double speed:** a Vblank frequency above 60 without the decouple patch.
   Set it to 60 for Playroom (see Astro's Playroom above).
-- **Fixed in this build: Astro's Playroom too fast with Present mode Immediate and Smooth frame
+- **Fixed in this build: slow motion with frame generation and Smooth frame pacing.** When a
+  frame took longer to present than one vblank (DLSS-G pacing its generated frames, more often at
+  3x than 2x), the skipped vblank was also lost to the game, which then ran slower, in Astro Bot
+  until the next load. The display still skips it, but the game now receives every vblank on time
+  (the console shows `Vblank catch-up: ...` when it happens; `"KYTY_VBLANK_CATCH_UP": "0",` restores
+  the old behaviour). With older builds: untick Smooth frame pacing when using frame generation.
+- **Fixed in build 17: Astro's Playroom too fast with Present mode Immediate and Smooth frame
   pacing.** That combination showed every frame as soon as it was ready, so the Vblank frequency
   no longer capped the frame rate, and Playroom's game logic (one step per frame) sped up with it.
   It now shows at most one frame per vblank (`"KYTY_PRESENT_IMMEDIATE_UNCAPPED": "1",` restores the

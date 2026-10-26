@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -874,6 +875,24 @@ void VideoOutDriver::Impl::VblankEnd() {
 // ready flip, as before.)
 static Live::Switch g_present_abs_vblank("KYTY_PRESENT_ABS_VBLANK", Live::ParseDefaultOff);
 
+// KYTY_VBLANK_CATCH_UP (default 1): on the absolute timeline (KYTY_PRESENT_ABS_VBLANK, the launcher's
+// "Smooth frame pacing"), a vblank deadline missed because the previous tick's present ran long (DLSS
+// frame generation pacing its generated frames, a driver stall) is still delivered to the guest: its
+// vblank events and counters are raised for every missed tick right away, without a present, so the
+// guest's vblank count and the time it reads keep the real rate, as on the hardware, where the vblank
+// keeps counting whatever the presentation does. Only the presentation skips the missed ticks. Before
+// this, each missed tick was lost to the guest: Astro Bot with 3x DLSS frame generation lost about one
+// tick in several and ran in slow motion until a reload. At most one second of ticks is delivered at
+// once (a longer stall is a pause). 0: missed ticks are lost to the guest too (the previous behaviour).
+// With misses, one console line per 60 s: "Vblank catch-up: ...".
+static bool VblankCatchUp() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VBLANK_CATCH_UP");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 static bool PresentImmediateUncapped() {
 	static const bool uncapped = [] {
 		const char* value = std::getenv("KYTY_PRESENT_IMMEDIATE_UNCAPPED");
@@ -910,6 +929,10 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 	uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 8th vblank
 	bool     period_flipped  = false; // a flip was presented in this vblank period (Immediate, absolute)
+	// KYTY_VBLANK_CATCH_UP: missed ticks delivered since the last report, and its time.
+	uint64_t catch_up_ticks  = 0;
+	uint64_t catch_up_events = 0;
+	uint64_t catch_up_report = Common::Timer::QueryPerformanceCounter();
 	while (!token.stop_requested()) {
 		if ((++placement_count & 7u) == 0u) {
 			Common::SamplePlacement(Common::ThreadRole::Host);
@@ -918,6 +941,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		bool       behind      = false; // a vblank deadline was missed: may present a blank frame
 		uint64_t   frame_begin = 0;
 		uint64_t   period      = 1;
+		uint64_t   missed      = 0; // absolute timeline: ticks skipped before this one
 		if (absolute) {
 			const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
 			const auto now     = Common::Timer::QueryPerformanceCounter();
@@ -934,12 +958,14 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			auto deadline = deadline_for(abs_index);
 			if (now > deadline) {
 				// Move to the next scheduled tick; never fire back-to-back vblanks to repay it.
-				behind    = true;
+				behind               = true;
+				const auto due_index = abs_index;
 				abs_index = std::max(abs_index, ((now - abs_origin) * refresh) / frequency);
 				deadline  = deadline_for(abs_index);
 				while (deadline < now) {
 					deadline = deadline_for(++abs_index);
 				}
+				missed = abs_index - due_index;
 			}
 			if (Config::GetPresentMode() == Config::PresentMode::Immediate &&
 			    !m_presenter.IsGuestPaused()) {
@@ -970,6 +996,30 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			if (m_presenter.IsGuestPaused()) {
 				(void)m_presenter.PresentLastFrame();
 				continue;
+			}
+			if (missed != 0 && VblankCatchUp()) {
+				// The ticks the presentation skipped, delivered to the guest now (no present).
+				const auto deliver = std::min<uint64_t>(missed, abs_refresh);
+				for (uint64_t i = 0; i < deliver; i++) {
+					VblankBegin();
+					VblankEnd();
+				}
+				catch_up_ticks += deliver;
+				catch_up_events++;
+			}
+			if (const auto now_report = Common::Timer::QueryPerformanceCounter();
+			    now_report - catch_up_report >= frequency * 60u) {
+				if (catch_up_ticks != 0) {
+					printf("Vblank catch-up: last 60 s, %llu vblank ticks missed by presents that ran past "
+					       "a vblank (%llu times) were delivered to the game late, so its vblank count "
+					       "stays exact (KYTY_VBLANK_CATCH_UP)\n",
+					       static_cast<unsigned long long>(catch_up_ticks),
+					       static_cast<unsigned long long>(catch_up_events));
+					fflush(stdout);
+				}
+				catch_up_ticks  = 0;
+				catch_up_events = 0;
+				catch_up_report = now_report;
 			}
 		} else {
 			if (abs_active) {
