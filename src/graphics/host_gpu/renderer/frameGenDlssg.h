@@ -53,6 +53,9 @@ constexpr uint64_t TaaPixelShaderPlayroom = 0xeb87b8b7c526169dull;
 constexpr bool IsTaaPixelShader(uint64_t hash) {
 	return hash == TaaPixelShader || hash == TaaPixelShaderPlayroom;
 }
+// Both games' last pass: the scene (image 0) and the HUD, drawn into a layer of its own (image 1;
+// a 1x1 view of it when no HUD is shown), blended into the output.
+constexpr uint64_t CompositePixelShader = 0x67008a703cf06422ull;
 
 struct Camera {
 	std::array<float, 16> view {};       // column-major, world to camera
@@ -67,6 +70,10 @@ struct FrameInputs {
 	vk::Extent2D  render_extent {};
 	Camera        camera;
 	bool          valid = false;
+	// The game's HUD layer of this frame (CompositePixelShader's image 1), when one was shown.
+	VulkanImage   hud;
+	vk::ImageView hud_view = nullptr;
+	bool          has_hud  = false;
 };
 
 // Process start, before SDL makes the Vulkan window: loads Streamline (it then becomes SDL's
@@ -146,8 +153,13 @@ void                     DestroySwapchain();
 [[nodiscard]] vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& present);
 // Present thread, into the present's command buffer before it is submitted: FSR's settings for
 // this present and, with inputs, its preparation from the frame's depth, motion and camera.
+// `hudless`: this present's HUD-less image (shader-read layout), or null.
 void RecordFsrPrepare(GraphicContext& graphics, vk::CommandBuffer command, const FrameInputs* inputs,
-                      vk::Extent2D backbuffer);
+                      vk::Extent2D backbuffer, const VulkanImage* hudless);
+// FSR frame generation is on and wants a HUD-less image of frames with a HUD (KYTY_FSR_HUDLESS=0:
+// not; the HUD is then interpolated with the scene). The presenter makes it from the frame and
+// FrameInputs::hud (Swapchain::RecordHudless).
+[[nodiscard]] bool HudlessWanted();
 // Present thread, in RecordPresentCommands when an overlay layer (the game's HUD on PS5's overlay
 // bus) is drawn over the frame: the backbuffer as it is before the overlay, `layout` its layout
 // (left in it), copied as FSR's HUD-less image, so FSR keeps the HUD out of its interpolation.
@@ -167,7 +179,7 @@ void RecordFsrHudless(GraphicContext& graphics, vk::CommandBuffer command, vk::I
 // history only (the generated frame is not put in `backbuffer`).
 [[nodiscard]] bool RecordNativeFrameGen(vk::CommandBuffer command, const FrameInputs* inputs,
                                         vk::Image backbuffer, vk::Format format, vk::Extent2D extent,
-                                        bool show);
+                                        bool show, const VulkanImage* hudless);
 // Into a newly acquired swapchain image: the game's frame RecordNativeFrameGen kept.
 void RecordNativeRealFrame(vk::CommandBuffer command, vk::Image backbuffer, vk::Extent2D extent);
 
