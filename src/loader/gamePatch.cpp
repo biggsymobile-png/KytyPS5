@@ -368,6 +368,8 @@ void ApplyPlayroomRenderResolution(Program* main_program, const std::string& ver
 	};
 	uint32_t width = 0;
 	switch (height) {
+		case 540: width = 960; break;
+		case 720: width = 1280; break;
 		case 1080: width = 1920; break;
 		case 1368: width = 2432; break;
 		case 1872: width = 3328; break;
@@ -439,7 +441,7 @@ void ApplyPlayroomRenderResolution(Program* main_program, const std::string& ver
 	         width, height, version.c_str());
 }
 
-// KYTY_ASTRO_RENDER_RES=1080|1368|1872|2160 (the launcher's "Render resolution"; unset or
+// KYTY_ASTRO_RENDER_RES=540|720|1080|1368|1872|2160 (the launcher's "Render resolution"; unset or
 // anything else: the game's own choice): Astro Bot (PPSA21564 / PPSA21567 01.018.000) renders at
 // that fixed resolution tier, as the community "Fixed render resolution" patches do (the same
 // write: "mov eax, [rbx+0x23f0]" -> "mov eax, <tier>; nop", at 0xc62a97 in 01.018, elsewhere where
@@ -452,9 +454,11 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 	if (value == nullptr || value[0] == '\0') {
 		return;
 	}
-	const int height = std::atoi(value);
+	int       height = std::atoi(value);
 	int       tier   = -1;
 	switch (height) {
+		case 540:
+		case 720: tier = 0; break; // (Astro's Playroom only; Astro Bot's lowest tier is 1080p)
 		case 1080: tier = 0; break;
 		case 1368: tier = 1; break;
 		case 1872: tier = 3; break;
@@ -471,6 +475,12 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 		         "(KYTY_ASTRO_RENDER_RES)\n",
 		         height);
 		return;
+	}
+	if (height < 1080) {
+		::printf("Game patch: Astro Bot's lowest render resolution tier is 1080p; 1080p instead of %dp "
+		         "(KYTY_ASTRO_RENDER_RES)\n",
+		         height);
+		height = 1080;
 	}
 	static constexpr uint64_t kOffset    = 0xc62a97; // 01.018.000
 	static constexpr uint8_t  kOrigin[6] = {0x8b, 0x83, 0xf0, 0x23, 0x00, 0x00};

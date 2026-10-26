@@ -362,9 +362,12 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	}
 #endif
 	m_ui->comboBox_render_resolution->clear();
-	m_ui->comboBox_render_resolution->addItems({tr("Game's choice"), tr("1920x1080 (fastest)"),
+	// (Indices 5 and 6, added later, keep the saved choices of the first five.)
+	m_ui->comboBox_render_resolution->addItems({tr("Game's choice"), tr("1920x1080"),
 	                                            tr("2432x1368"), tr("3328x1872"), tr("3840x2160")});
-	m_ui->comboBox_render_resolution->setCurrentIndex(std::clamp(info.render_resolution, 0, 4));
+	m_ui->comboBox_render_resolution->addItems(
+	    {tr("1280x720 (Astro's Playroom; Astro Bot: 1080)"), tr("960x540 (Astro's Playroom; Astro Bot: 1080)")});
+	m_ui->comboBox_render_resolution->setCurrentIndex(std::clamp(info.render_resolution, 0, 6));
 	m_ui->checkBox_smooth_frame_pacing->setChecked(info.smooth_frame_pacing);
 	m_ui->checkBox_relaxed_shader_maths->setChecked(info.relaxed_shader_maths);
 	// (The spin box's minimum, 19, shows "Off".)

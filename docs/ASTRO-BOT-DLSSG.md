@@ -10,7 +10,7 @@ that adds frame generation and modern upscaling to **ASTRO BOT (PPSA21564)** and
 | **AMD FSR 3.1 frame generation** | 2x generated frames | any GPU (AMD, Intel, RTX 20/30, ...) | Windows, Linux, macOS |
 | **NVIDIA DLSS upscaling (super resolution)** | replaces the game's TAA | any RTX | Windows |
 | **AMD FSR 3.1 upscaling** | replaces the game's TAA | any Vulkan GPU | Windows, Linux, macOS |
-| **Built-in render resolution** | 1080p / 1368p / 1872p / 2160p, no patch file needed | any | all |
+| **Built-in render resolution** | 540p / 720p (Playroom) / 1080p / 1368p / 1872p / 2160p, no patch file needed | any | all |
 
 Everything else is Jetsku's U59 int21 release (24 October 2026).
 
@@ -93,7 +93,7 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_DLSS=1` | DLSS upscaling in place of the game's TAA (launcher: Upscaling) |
 | `KYTY_FSR=1` | FSR 3.1 upscaling in place of the game's TAA (launcher: Upscaling) |
 | `KYTY_FSR_SHARPNESS=0.5` | FSR upscaling's sharpening, 0 to 1 (default off) |
-| `KYTY_ASTRO_RENDER_RES=1080` | Render resolution: 1080, 1368, 1872 or 2160, both games (launcher: Render resolution) |
+| `KYTY_ASTRO_RENDER_RES=1080` | Render resolution: 1080, 1368, 1872 or 2160, both games; 540 or 720 for Astro's Playroom (launcher: Render resolution) |
 | `KYTY_FRAMEGEN_FPS_CAP=40` | With DLSS-G: Reflex limits the rendered frames to 40 fps (launcher: Frame rate limit) |
 | `KYTY_FLOAT_PROFILE=relaxed` | Simpler shader maths (launcher: Relaxed shader maths) |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
@@ -148,7 +148,8 @@ is done by DLSS or FSR instead of the game's TAA, from the render resolution the
 
 | Render resolution | Works like |
 |---|---|
-| 1920x1080 | Performance/Quality (fastest; for lower-end GPUs) |
+| 960x540 / 1280x720 | Astro's Playroom only (Astro Bot uses 1080p instead): for low-end GPUs |
+| 1920x1080 | Performance/Quality (fastest in Astro Bot; for lower-end GPUs) |
 | 2432x1368 | Quality |
 | 3328x1872 | between Ultra Quality and DLAA |
 | Game's choice / 3840x2160 | DLAA / native AA (best image, a little slower than the game's TAA) |

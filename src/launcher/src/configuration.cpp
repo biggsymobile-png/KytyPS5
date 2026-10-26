@@ -186,7 +186,7 @@ bool Configuration::SetGameSettings(const QJsonObject& imported_settings, QStrin
 	if (frame_rate_limit != 0 && (frame_rate_limit < 20 || frame_rate_limit > 240)) {
 		return fail(tr("Frame rate limit must be 0 (off) or between 20 and 240."));
 	}
-	if (render_resolution < 0 || render_resolution > 4) {
+	if (render_resolution < 0 || render_resolution > 6) {
 		return fail(tr("Render resolution must be between 0 (the game's choice) and 4 (2160p)."));
 	}
 	if (trophy_duration_seconds < 5 || trophy_duration_seconds > 10) {
