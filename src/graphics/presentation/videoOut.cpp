@@ -32,6 +32,7 @@
 #include "libs/errno.h"
 #include "libs/hmd2.h"
 #include "libs/libs.h"
+#include "loader/gamePatch.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -1547,6 +1548,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		Graphics::GpuOpProfiler::OnGuestFlip();
 		Graphics::FgDiscovery::OnGuestFlip();
 		Graphics::GpuTiming::OnGuestFlip();
+		Loader::GamePatch::OnGuestFlip();
 		if (pace_tick != 0) {
 			PaceLog::NotePresent(group, pace_vblank, pace_tick, pace_cost);
 		}

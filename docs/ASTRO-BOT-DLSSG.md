@@ -93,11 +93,12 @@ steady, fluid picture. In the tester's words, "ultra smooth because of the perfe
    **Frame rate limit**. Lower the render resolution if your PC cannot hold 60 in the busiest
    levels: evenly timed frames feel far smoother than a rate that keeps dipping.
 
-**Below 60 is not safe for the game's speed.** A Vblank frequency of 40 or 45 gives beautifully even
-frames, and much of Astro Bot plays at normal speed there, but some levels run part of their game
-logic at a fixed 1/60 s per frame: at 40 fps they play in slow motion (seen in Pumpkin Peril, even
-with a decouple patch, while the emulator delivered a perfectly steady 40). Use 60 if you see slow
-motion.
+**Below 60** (40 or 45 gives beautifully even frames) Astro Bot needs a **"Decouple gameplay timers
+from render FPS" patch** to keep its speed. The community "[Fix] Bot rescue" mod that goes with it
+could leave Decouple switched off for a whole level (Pumpkin Peril played in slow motion until the
+level was left); this build replaces that mod with a built-in version that switches Decouple back
+on by itself (see Known issues). If you still see slow motion below 60, go back to 60 and please
+report the level.
 
 Without a variable-refresh display keep FIFO. Astro's Playroom: keep the Vblank frequency at 60
 (see below).
@@ -254,7 +255,15 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   at about twice the game's frame rate and a display that refreshes that fast.
 - **Astro's Playroom at double speed:** a Vblank frequency above 60 without the decouple patch.
   Set it to 60 for Playroom (see Astro's Playroom above).
-- **Fixed in this build: slow motion with frame generation and Smooth frame pacing.** When a
+- **Fixed in this build: slow motion for a whole level below 60 fps with the decouple patch**
+  (Pumpkin Peril at Vblank 40). The community "[Fix] Bot rescue plays with the game's own 60 fps
+  timing" mod switches Decouple off when a rescue starts and only back on when it ends; some levels
+  start one without ending it. The emulator now applies that fix itself, automatically (no button
+  combination), in place of the mod (it is skipped, enabled or not), with a safety net: if Decouple
+  stays off for 15 s, it is switched back on (the console then shows `Game patch: bot rescue fix:
+  Decouple was off ...`). Settings: `"KYTY_ASTRO_RESCUE_TIMEOUT_S": "15",`, and
+  `"KYTY_ASTRO_RESCUE_FIX": "0",` to use the patch file's mod as before.
+- **Fixed in build 18: slow motion with frame generation and Smooth frame pacing.** When a
   frame took longer to present than one vblank (DLSS-G pacing its generated frames, more often at
   3x than 2x), the skipped vblank was also lost to the game, which then ran slower, in Astro Bot
   until the next load. The display still skips it, but the game now receives every vblank on time

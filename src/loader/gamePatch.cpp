@@ -11,6 +11,8 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,6 +50,58 @@ using Json = nlohmann::json;
 std::unique_ptr<Plan> g_pending_plan;
 std::vector<uint64_t> g_applied_cave_pages;
 
+// KYTY_ASTRO_RESCUE_FIX (default 1; 0 = off): Astro Bot 01.018.000 with a "Decouple gameplay timers
+// from render FPS" patch. The community "[Fix] Bot rescue plays with the game's own 60 fps timing"
+// mod switches Decouple off when the game calls the rescue-start function (0x5074e20) and back on
+// only in the rescue-end function (0x5077e60). Some levels (Pumpkin Peril) call the start without
+// the end, so Decouple stays off until the level unloads and the game runs on its fixed 1/60 s
+// step: below 60 fps, slow motion (a tester at Vblank 40, 2026-10-26). The emulator now applies
+// that fix itself in place of the mod (the mod is skipped, enabled or not), finds Decouple's
+// on/off byte in the applied Decouple mod (its variants place it differently), and adds a
+// watchdog: if Decouple stays off for this fix longer than KYTY_ASTRO_RESCUE_TIMEOUT_S seconds
+// (default 15; a real rescue is a few seconds), it is switched back on as the rescue end does.
+constexpr const char* kRescueModName = "Bot rescue plays with the game's own 60 fps timing";
+constexpr uint64_t    kRescueStart   = 0x5074e20;
+constexpr uint64_t    kRescueEnd     = 0x5077e60;
+constexpr uint64_t    kDecoupleGetter = 0x3530; // Decouple's dt getter: cmp byte [gate], 0
+constexpr uint8_t     kPrologue[6]   = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+
+struct RescueFix {
+	bool     planned = false;
+	uint64_t gate    = 0; // source addresses until applied, then target addresses
+	uint64_t state   = 0;
+	uint64_t marker  = 0;
+};
+RescueFix g_rescue_plan;
+// Armed after the writes (target addresses); read by the flip watchdog.
+std::atomic<uint64_t> g_rescue_gate {0};
+std::atomic<uint64_t> g_rescue_state {0};
+std::atomic<uint64_t> g_rescue_marker {0};
+
+uint32_t RescueTimeoutSeconds() {
+	const auto* value = std::getenv("KYTY_ASTRO_RESCUE_TIMEOUT_S");
+	const int   s     = value != nullptr ? std::atoi(value) : 15;
+	return static_cast<uint32_t>(std::clamp(s, 2, 600));
+}
+
+bool RescueFixEnabled() {
+	const auto* value = std::getenv("KYTY_ASTRO_RESCUE_FIX");
+	return value == nullptr || value[0] != '0';
+}
+
+void AppendRel32(std::vector<uint8_t>* code, uint64_t next_ip, uint64_t target) {
+	const auto rel = static_cast<int64_t>(target) - static_cast<int64_t>(next_ip);
+	const auto v   = static_cast<int32_t>(rel);
+	for (int i = 0; i < 4; i++) {
+		code->push_back(static_cast<uint8_t>((static_cast<uint32_t>(v) >> (8 * i)) & 0xff));
+	}
+}
+
+bool FitsRel32(uint64_t from, uint64_t to) {
+	const auto rel = static_cast<int64_t>(to) - static_cast<int64_t>(from);
+	return rel >= INT32_MIN && rel <= INT32_MAX;
+}
+
 bool Fail(std::string* error, std::string message) {
 	*error = std::move(message);
 	return false;
@@ -63,6 +117,100 @@ bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 		(*bytes)[index] = static_cast<uint8_t>(std::stoul(text.substr(index * 2, 2), nullptr, 16));
 	}
 	return true;
+}
+
+// The built-in rescue fix's writes (KYTY_ASTRO_RESCUE_FIX): the same code as the community mod, in a
+// code-cave page of its own, using the applied Decouple mod's on/off byte.
+void PlanRescueFix(Plan* plan) {
+	g_rescue_plan = {};
+	// Decouple's dt getter starts with cmp byte [rip+rel32], 0 (80 3D rel32 00): its on/off byte.
+	const Write* getter = nullptr;
+	for (const auto& write: plan->writes) {
+		if (write.source_address == kDecoupleGetter && write.on.size() >= 7 && write.on[0] == 0x80 &&
+		    write.on[1] == 0x3d && write.on[6] == 0x00) {
+			getter = &write;
+		}
+	}
+	if (getter == nullptr) {
+		return; // no Decouple mod applied: nothing to switch, no fix needed
+	}
+	int32_t rel = 0;
+	std::memcpy(&rel, &getter->on[2], sizeof(rel));
+	const uint64_t gate  = kDecoupleGetter + 7 + static_cast<int64_t>(rel);
+	const uint64_t state = gate - 0x68; // Decouple's last frame timestamp (both known variants)
+	// A code-cave page no other write uses.
+	uint64_t cave = 0x12008000;
+	for (bool clash = true; clash;) {
+		clash = false;
+		for (const auto& write: plan->writes) {
+			const auto page = write.source_address & ~(kPageSize - 1);
+			if (page == cave) {
+				clash = true;
+				cave += kPageSize;
+				break;
+			}
+		}
+	}
+	const uint64_t marker = cave + 0x80;
+	for (const uint64_t target: {gate, state, marker, kRescueStart + 6, kRescueEnd + 6}) {
+		if (!FitsRel32(cave, target)) {
+			Log::WriteToConsoleAndLog("Game patch: built-in bot rescue fix not applied (addresses out "
+			                          "of range; KYTY_ASTRO_RESCUE_FIX)\n");
+			return;
+		}
+	}
+	std::vector<uint8_t> code;
+	const auto at = [&](uint64_t offset) { return cave + offset; };
+	// start: if Decouple is on, switch it off and remember doing so
+	code.insert(code.end(), {0x80, 0x3d});
+	AppendRel32(&code, at(7), gate);
+	code.push_back(0x00);
+	code.insert(code.end(), {0x75, 0x0e});
+	code.insert(code.end(), {0xc6, 0x05});
+	AppendRel32(&code, at(0x10), gate);
+	code.push_back(0x01);
+	code.insert(code.end(), {0xc6, 0x05});
+	AppendRel32(&code, at(0x17), marker);
+	code.push_back(0x01);
+	code.insert(code.end(), std::begin(kPrologue), std::end(kPrologue));
+	code.push_back(0xe9);
+	AppendRel32(&code, at(0x22), kRescueStart + 6);
+	// end: if this fix switched it off, switch it back on and reset Decouple's timestamp
+	code.insert(code.end(), {0x80, 0x3d});
+	AppendRel32(&code, at(0x29), marker);
+	code.push_back(0x00);
+	code.insert(code.end(), {0x74, 0x19});
+	code.insert(code.end(), {0xc6, 0x05});
+	AppendRel32(&code, at(0x32), marker);
+	code.push_back(0x00);
+	code.insert(code.end(), {0xc6, 0x05});
+	AppendRel32(&code, at(0x39), gate);
+	code.push_back(0x00);
+	code.insert(code.end(), {0x48, 0xc7, 0x05});
+	AppendRel32(&code, at(0x44), state);
+	code.insert(code.end(), {0x00, 0x00, 0x00, 0x00});
+	code.insert(code.end(), std::begin(kPrologue), std::end(kPrologue));
+	code.push_back(0xe9);
+	AppendRel32(&code, at(0x4f), kRescueEnd + 6);
+	EXIT_IF(code.size() != 0x4f);
+	code.resize(0x88, 0x00); // the marker byte at +0x80
+
+	Write cave_write;
+	cave_write.source_address = cave;
+	cave_write.on             = code;
+	cave_write.off.assign(code.size(), 0);
+	plan->writes.push_back(std::move(cave_write));
+	for (const auto& [hook, entry]: {std::pair {kRescueStart, cave}, std::pair {kRescueEnd, cave + 0x22}}) {
+		Write write;
+		write.source_address = hook;
+		write.off.assign(std::begin(kPrologue), std::end(kPrologue));
+		write.on.push_back(0xe9);
+		AppendRel32(&write.on, hook + 5, entry);
+		write.on.push_back(0x90);
+		plan->writes.push_back(std::move(write));
+	}
+	g_rescue_plan = {true, gate, state, marker};
+	plan->mod_names.emplace_back("[Built-in] Bot rescue fix with safety timeout (KYTY_ASTRO_RESCUE_FIX)");
 }
 
 bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error) {
@@ -113,9 +261,20 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 		}
 	}
 
+	const bool rescue_builtin = plan->title_id == "PPSA21564" && plan->version == "01.018.000" &&
+	                            RescueFixEnabled();
 	size_t mod_index = 0;
 	for (const auto& mod: root["mods"]) {
-		if (selection.decisions[mod_index++] != ModDecision::Apply) {
+		const auto decision = selection.decisions[mod_index++];
+		if (rescue_builtin && mod.contains("name") && mod["name"].is_string() &&
+		    mod["name"].get<std::string>().find(kRescueModName) != std::string::npos) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Game patch: mod {} (bot rescue fix) superseded by the built-in one, with a {} s "
+			    "safety timeout (KYTY_ASTRO_RESCUE_FIX)\n",
+			    mod_index, RescueTimeoutSeconds()));
+			continue;
+		}
+		if (decision != ModDecision::Apply) {
 			continue;
 		}
 		const auto name = mod["name"].get<std::string>();
@@ -130,6 +289,9 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 			}
 			plan->writes.push_back(std::move(write));
 		}
+	}
+	if (rescue_builtin) {
+		PlanRescueFix(plan);
 	}
 	return true;
 }
@@ -328,6 +490,16 @@ bool ApplyPending(Program* program) {
 
 	for (const auto& name: g_pending_plan->mod_names) {
 		::printf("Successfully applied cheat: %s\n", name.c_str());
+	}
+	if (g_rescue_plan.planned) {
+		uint64_t gate = 0, state = 0, marker = 0;
+		Translate(*program, source_base, g_rescue_plan.gate, &gate);
+		Translate(*program, source_base, g_rescue_plan.state, &state);
+		Translate(*program, source_base, g_rescue_plan.marker, &marker);
+		g_rescue_state.store(state);
+		g_rescue_marker.store(marker);
+		g_rescue_gate.store(gate);
+		g_rescue_plan = {};
 	}
 	g_applied_cave_pages = std::move(g_pending_plan->cave_pages);
 	g_pending_plan.reset();
@@ -671,7 +843,40 @@ void ApplyBuiltin(Program* main_program) {
 	         scale, scaled[0], scaled[1], scaled[2], scaled[3], scaled[4]);
 }
 
+void OnGuestFlip() {
+	const auto gate = g_rescue_gate.load(std::memory_order_relaxed);
+	if (gate == 0) {
+		return;
+	}
+	using Clock          = std::chrono::steady_clock;
+	static Clock::time_point since {};
+	static uint32_t          timeouts = 0;
+	auto* marker = reinterpret_cast<volatile uint8_t*>(g_rescue_marker.load(std::memory_order_relaxed));
+	if (*marker == 0) {
+		since = {};
+		return;
+	}
+	const auto now = Clock::now();
+	if (since == Clock::time_point {}) {
+		since = now;
+		return;
+	}
+	if (now - since < std::chrono::seconds(RescueTimeoutSeconds())) {
+		return;
+	}
+	// What the rescue end does: Decouple back on, its timestamp reset, the marker cleared.
+	*reinterpret_cast<volatile uint64_t*>(g_rescue_state.load(std::memory_order_relaxed)) = 0;
+	*reinterpret_cast<volatile uint8_t*>(gate) = 0;
+	*marker = 0;
+	since = {};
+	timeouts++;
+	::printf("Game patch: bot rescue fix: Decouple was off for %u s without the rescue's end; "
+	         "switched back on (%u time(s) this run; KYTY_ASTRO_RESCUE_FIX)\n",
+	         RescueTimeoutSeconds(), timeouts);
+}
+
 void Clear() {
+	g_rescue_gate.store(0);
 	if (g_pending_plan != nullptr) {
 		ReleaseCaves(&g_pending_plan->cave_pages);
 	}
