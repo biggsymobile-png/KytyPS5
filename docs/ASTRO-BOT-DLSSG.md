@@ -89,13 +89,15 @@ steady, fluid picture. In the tester's words, "ultra smooth because of the perfe
    it evenly. Measured in a busy Astro Bot level (Sky Garden) against FIFO: the visible hitches
    (doubled 33 ms frames) dropped from **97 a minute to 7**, and the slowest 1% of frames went from
    **33 ms to 23 ms**.
-2. **Vblank frequency: one your PC holds even in the busiest levels.** A lower rate that never dips
-   feels far smoother than a higher one that keeps missing it: every frame then takes exactly the
-   same time. Astro Bot keeps its normal speed below 60.
-3. **Frame generation on top**, at a matching **Frame rate limit**.
+2. **Vblank frequency 60**, with **frame generation on top** (2x: 120 fps on screen) at a matching
+   **Frame rate limit**. Lower the render resolution if your PC cannot hold 60 in the busiest
+   levels: evenly timed frames feel far smoother than a rate that keeps dipping.
 
-The tester's setup (RTX 5080), smooth all the way through: **Vblank frequency 40, Frame generation
-2x, Frame rate limit 80**, Present mode Immediate, Smooth frame pacing on, G-Sync on.
+**Below 60 is not safe for the game's speed.** A Vblank frequency of 40 or 45 gives beautifully even
+frames, and much of Astro Bot plays at normal speed there, but some levels run part of their game
+logic at a fixed 1/60 s per frame: at 40 fps they play in slow motion (seen in Pumpkin Peril, even
+with a decouple patch, while the emulator delivered a perfectly steady 40). Use 60 if you see slow
+motion.
 
 Without a variable-refresh display keep FIFO. Astro's Playroom: keep the Vblank frequency at 60
 (see below).
