@@ -462,7 +462,6 @@ add_gpu_blit_shader(gpu_blit_depth_to_color32 gpu_blit_depth_to_color32.comp)
 add_gpu_blit_shader(gpu_blit_color32_to_depth gpu_blit_color32_to_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_video_out_downscale gpu_video_out_downscale.frag)
-add_gpu_blit_shader(gpu_fsr_hudless gpu_fsr_hudless.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 

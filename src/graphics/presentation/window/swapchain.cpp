@@ -6,7 +6,6 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
-#include "gpu_blit_shaders/gpu_fsr_hudless_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -24,7 +23,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -301,11 +299,6 @@ public:
 	[[nodiscard]] bool ImagesReadable() const noexcept { return m_images_readable; }
 	// The image acquired last.
 	[[nodiscard]] vk::Image CurrentImage() const { return m_images[m_image_index]; }
-	// AMD FSR frame generation: after RecordPresentCommands (the image in the present layout), the
-	// finished frame with the pixels of the game's HUD layer (inputs.hud) changed, as FSR's HUD-less
-	// image (shader-read layout, `format`, the swapchain's size); null when there is none to make.
-	[[nodiscard]] const VulkanImage* RecordHudless(vk::CommandBuffer command, const FrameGen::FrameInputs& inputs,
-	                                               vk::Format format);
 	[[nodiscard]] bool       IsMinimized() const noexcept { return m_minimized; }
 	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
 	bool SetHdr(bool hdr) {
@@ -337,19 +330,6 @@ private:
 	bool                           m_suboptimal          = false;
 	bool                           m_fsr_swapchain       = false;
 	bool                           m_images_readable     = false;
-	// RecordHudless: a copy of the frame, and its two output images in turn (FSR may still read the
-	// previous one).
-	VulkanImage                    m_hud_frame;
-	vk::ImageView                  m_hud_frame_view = nullptr;
-	std::array<VulkanImage, 2>     m_hudless {};
-	std::array<vk::ImageView, 2>   m_hudless_views {};
-	uint32_t                       m_hudless_index       = 0;
-	vk::Sampler                    m_hudless_sampler     = nullptr;
-	vk::DescriptorSetLayout        m_hudless_descriptors = nullptr;
-	vk::PipelineLayout             m_hudless_layout      = nullptr;
-	vk::Pipeline                   m_hudless_pipeline    = nullptr;
-	vk::Format                     m_hudless_format      = vk::Format::eUndefined;
-	void                           ReleaseHudless();
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
@@ -542,9 +522,8 @@ void Swapchain::Create() {
 	create_info.imageArrayLayers = 1;
 	create_info.imageUsage =
 	    vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst;
-	// FSR frame generation copies each frame out of the swapchain image (built in: its input; both:
-	// the HUD-less image, RecordHudless).
-	m_images_readable = (FrameGen::NativeFrameGenOn() || FrameGen::OwnsSwapchain()) &&
+	// Built-in FSR frame generation copies each frame out of the swapchain image.
+	m_images_readable = FrameGen::NativeFrameGenOn() &&
 	                    static_cast<bool>(surface.capabilities.supportedUsageFlags &
 	                                      vk::ImageUsageFlagBits::eTransferSrc) &&
 	                    static_cast<bool>(graphics.GetFormatProperties(m_format).optimalTilingFeatures &
@@ -662,7 +641,6 @@ void Swapchain::Destroy() {
 	m_overlay_descriptors = nullptr;
 	m_overlay_sampler     = nullptr;
 	m_filter.Release(graphics.device);
-	ReleaseHudless();
 
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
@@ -974,231 +952,6 @@ void PresentFilter::Release(vk::Device device) {
 	m_descriptors = nullptr;
 	m_sampler     = nullptr;
 	m_format      = vk::Format::eUndefined;
-}
-
-void Swapchain::ReleaseHudless() {
-	auto device = m_window.graphic_ctx.device;
-	for (size_t i = 0; i <= m_hudless.size(); ++i) {
-		auto& image = i < m_hudless.size() ? m_hudless[i] : m_hud_frame;
-		auto& view  = i < m_hudless.size() ? m_hudless_views[i] : m_hud_frame_view;
-		if (view != nullptr) device.destroyImageView(view, nullptr);
-		view = nullptr;
-		if (image.image != nullptr) m_window.graphic_ctx.DeleteImage(image);
-	}
-	device.destroyPipeline(m_hudless_pipeline, nullptr);
-	device.destroyPipelineLayout(m_hudless_layout, nullptr);
-	device.destroyDescriptorSetLayout(m_hudless_descriptors, nullptr);
-	device.destroySampler(m_hudless_sampler, nullptr);
-	m_hudless_pipeline    = nullptr;
-	m_hudless_layout      = nullptr;
-	m_hudless_descriptors = nullptr;
-	m_hudless_sampler     = nullptr;
-	m_hudless_format      = vk::Format::eUndefined;
-}
-
-const VulkanImage* Swapchain::RecordHudless(vk::CommandBuffer command, const FrameGen::FrameInputs& inputs,
-                                            vk::Format format) {
-	if (!m_images_readable || !inputs.has_hud || inputs.hud_view == nullptr || m_handle == nullptr ||
-	    m_image_index >= m_images.size()) {
-		return nullptr;
-	}
-	auto& graphics = m_window.graphic_ctx;
-	auto  device   = graphics.device;
-	// (Images at the swapchain's size; made again for another size or format, which only a new
-	// swapchain brings, after the GPU is done with the old ones.)
-	const auto make = [&](VulkanImage& image, vk::ImageView& view, vk::Format image_format,
-	                      vk::ImageUsageFlags usage) {
-		if (image.image != nullptr && image.format == image_format && image.extent.width == m_extent.width &&
-		    image.extent.height == m_extent.height) {
-			return true;
-		}
-		if (view != nullptr) device.destroyImageView(view, nullptr);
-		view = nullptr;
-		if (image.image != nullptr) {
-			{
-				Common::LockGuard lock(graphics.queue_mutex);
-				(void)graphics.queue.waitIdle();
-			}
-			graphics.DeleteImage(image);
-		}
-		vk::ImageCreateInfo create {};
-		create.imageType     = vk::ImageType::e2D;
-		create.extent        = vk::Extent3D {m_extent.width, m_extent.height, 1};
-		create.mipLevels     = 1;
-		create.arrayLayers   = 1;
-		create.format        = image_format;
-		create.tiling        = vk::ImageTiling::eOptimal;
-		create.initialLayout = vk::ImageLayout::eUndefined;
-		create.usage         = usage;
-		create.sharingMode   = vk::SharingMode::eExclusive;
-		create.samples       = vk::SampleCountFlagBits::e1;
-		if (!graphics.CreateImage(create, image)) return false;
-		image.state.layout      = vk::ImageLayout::eUndefined;
-		image.state.access_mask = {};
-		image.state.pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
-		vk::ImageViewCreateInfo info {};
-		info.image            = image.image;
-		info.viewType         = vk::ImageViewType::e2D;
-		info.format           = image_format;
-		info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-		return device.createImageView(&info, nullptr, &view) == vk::Result::eSuccess;
-	};
-	using Usage       = vk::ImageUsageFlagBits;
-	const auto  index = m_hudless_index;
-	if (!make(m_hud_frame, m_hud_frame_view, m_format, Usage::eTransferDst | Usage::eSampled) ||
-	    !make(m_hudless[index], m_hudless_views[index], format,
-	          Usage::eColorAttachment | Usage::eSampled | Usage::eTransferSrc)) {
-		static bool reported = false;
-		if (!std::exchange(reported, true)) {
-			std::printf("Frame generation: no memory for FSR's HUD-less image; the HUD is interpolated\n");
-			std::fflush(stdout);
-		}
-		return nullptr;
-	}
-	m_hudless_index = (m_hudless_index + 1u) % static_cast<uint32_t>(m_hudless.size());
-	auto& output    = m_hudless[index];
-
-	struct Constants {
-		float inv_size[2];
-		float hud_texel[2];
-		float threshold;
-	};
-	static_assert(sizeof(Constants) == 20);
-	if (m_hudless_layout == nullptr) {
-		vk::SamplerCreateInfo sampler {};
-		sampler.magFilter    = vk::Filter::eLinear;
-		sampler.minFilter    = vk::Filter::eLinear;
-		sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
-		sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
-		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
-		RequireVulkanSuccess(device.createSampler(&sampler, nullptr, &m_hudless_sampler),
-		                     "create FSR HUD-less sampler");
-		const std::array<vk::DescriptorSetLayoutBinding, 2> bindings {
-		    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eCombinedImageSampler, 1,
-		                                    vk::ShaderStageFlagBits::eFragment},
-		    vk::DescriptorSetLayoutBinding {1, vk::DescriptorType::eCombinedImageSampler, 1,
-		                                    vk::ShaderStageFlagBits::eFragment}};
-		vk::DescriptorSetLayoutCreateInfo descriptors {};
-		descriptors.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-		descriptors.bindingCount = static_cast<uint32_t>(bindings.size());
-		descriptors.pBindings    = bindings.data();
-		RequireVulkanSuccess(device.createDescriptorSetLayout(&descriptors, nullptr, &m_hudless_descriptors),
-		                     "create FSR HUD-less descriptor layout");
-		const vk::PushConstantRange  constants {vk::ShaderStageFlagBits::eFragment, 0, sizeof(Constants)};
-		vk::PipelineLayoutCreateInfo layout {};
-		layout.setLayoutCount         = 1;
-		layout.pSetLayouts            = &m_hudless_descriptors;
-		layout.pushConstantRangeCount = 1;
-		layout.pPushConstantRanges    = &constants;
-		RequireVulkanSuccess(device.createPipelineLayout(&layout, nullptr, &m_hudless_layout),
-		                     "create FSR HUD-less pipeline layout");
-	}
-	if (m_hudless_pipeline != nullptr && m_hudless_format != format) {
-		device.destroyPipeline(m_hudless_pipeline, nullptr);
-		m_hudless_pipeline = nullptr;
-	}
-	if (m_hudless_pipeline == nullptr) {
-		m_hudless_pipeline = CreateFullscreenPipeline(device, m_hudless_layout, GPU_FSR_HUDLESS_SPV, format);
-		m_hudless_format   = format;
-	}
-
-	const auto barrier = [&](vk::Image image, vk::ImageLayout from, vk::ImageLayout to, vk::AccessFlags2 src,
-	                         vk::AccessFlags2 dst) {
-		vk::ImageMemoryBarrier2 b {};
-		b.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
-		b.srcAccessMask       = src;
-		b.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
-		b.dstAccessMask       = dst;
-		b.oldLayout           = from;
-		b.newLayout           = to;
-		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		b.image               = image;
-		b.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-		vk::DependencyInfo dependency {};
-		dependency.imageMemoryBarrierCount = 1;
-		dependency.pImageMemoryBarriers    = &b;
-		command.pipelineBarrier2(dependency);
-	};
-	const auto track = [](VulkanImage& image, vk::ImageLayout layout, vk::AccessFlags2 access) {
-		image.state.layout      = layout;
-		image.state.access_mask = access;
-		image.state.pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
-	};
-	// The finished frame copied out (the swapchain image back in the present layout).
-	const auto backbuffer = m_images[m_image_index];
-	barrier(backbuffer, vk::ImageLayout::ePresentSrcKHR, vk::ImageLayout::eTransferSrcOptimal,
-	        vk::AccessFlagBits2::eMemoryWrite, vk::AccessFlagBits2::eTransferRead);
-	barrier(m_hud_frame.image, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
-	        vk::AccessFlagBits2::eMemoryRead, vk::AccessFlagBits2::eTransferWrite);
-	vk::ImageCopy copy {};
-	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-	copy.extent         = vk::Extent3D {m_extent.width, m_extent.height, 1};
-	command.copyImage(backbuffer, vk::ImageLayout::eTransferSrcOptimal, m_hud_frame.image,
-	                  vk::ImageLayout::eTransferDstOptimal, copy);
-	barrier(backbuffer, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::ePresentSrcKHR,
-	        vk::AccessFlagBits2::eTransferRead, vk::AccessFlagBits2::eMemoryRead);
-	barrier(m_hud_frame.image, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
-	        vk::AccessFlagBits2::eTransferWrite, vk::AccessFlagBits2::eShaderRead);
-	track(m_hud_frame, vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
-	barrier(output.image, vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal,
-	        vk::AccessFlagBits2::eMemoryRead, vk::AccessFlagBits2::eColorAttachmentWrite);
-
-	// The frame with the HUD's pixels changed.
-	const std::array<vk::DescriptorImageInfo, 2> images {
-	    vk::DescriptorImageInfo {m_hudless_sampler, m_hud_frame_view, vk::ImageLayout::eShaderReadOnlyOptimal},
-	    vk::DescriptorImageInfo {m_hudless_sampler, inputs.hud_view, vk::ImageLayout::eShaderReadOnlyOptimal}};
-	std::array<vk::WriteDescriptorSet, 2> writes {};
-	for (uint32_t i = 0; i < writes.size(); ++i) {
-		writes[i].dstBinding      = i;
-		writes[i].descriptorCount = 1;
-		writes[i].descriptorType  = vk::DescriptorType::eCombinedImageSampler;
-		writes[i].pImageInfo      = &images[i];
-	}
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_hudless_layout, 0,
-	                             static_cast<uint32_t>(writes.size()), writes.data());
-	// KYTY_FSR_HUD_THRESHOLD: how far a HUD-layer texel must be from the empty one to be HUD.
-	static const float threshold = [] {
-		const char* value = std::getenv("KYTY_FSR_HUD_THRESHOLD");
-		return value != nullptr && value[0] != '\0' ? static_cast<float>(std::atof(value)) : 0.02f;
-	}();
-	const Constants constants {
-	    {1.0f / static_cast<float>(m_extent.width), 1.0f / static_cast<float>(m_extent.height)},
-	    {1.0f / static_cast<float>(std::max(inputs.hud.extent.width, 1u)),
-	     1.0f / static_cast<float>(std::max(inputs.hud.extent.height, 1u))},
-	    threshold};
-	command.pushConstants(m_hudless_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(constants), &constants);
-	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_hudless_pipeline);
-	vk::RenderingAttachmentInfo attachment {};
-	attachment.imageView   = m_hudless_views[index];
-	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
-	attachment.loadOp      = vk::AttachmentLoadOp::eDontCare;
-	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
-	vk::RenderingInfo rendering {};
-	rendering.renderArea.extent    = m_extent;
-	rendering.layerCount           = 1;
-	rendering.colorAttachmentCount = 1;
-	rendering.pColorAttachments    = &attachment;
-	command.beginRendering(&rendering);
-	const vk::Viewport viewport {0.0f, 0.0f, static_cast<float>(m_extent.width),
-	                             static_cast<float>(m_extent.height), 0.0f, 1.0f};
-	const vk::Rect2D   scissor {{0, 0}, m_extent};
-	command.setViewport(0, 1, &viewport);
-	command.setScissor(0, 1, &scissor);
-	command.draw(3, 1, 0, 0);
-	command.endRendering();
-	// (FSR's "compute read" state.)
-	barrier(output.image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
-	        vk::AccessFlagBits2::eColorAttachmentWrite, vk::AccessFlagBits2::eShaderRead);
-	track(output, vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
-	static bool reported = false;
-	if (!std::exchange(reported, true)) {
-		std::printf("Frame generation: FSR gets a HUD-less image (%ux%u) made from the game's HUD layer\n",
-		            m_extent.width, m_extent.height);
-		std::fflush(stdout);
-	}
-	return &output;
 }
 
 void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer) {
@@ -1707,15 +1460,10 @@ void Presenter::Impl::Present() {
 			// AMD FSR 3.1 frame generation: its settings for this present and its preparation from
 			// the frame's depth, motion and camera (a repeat or a menu has none).
 			if (swapchain.UsesFsrSwapchain()) {
-				auto*       fg_frame = layers[0].frame;
-				const auto* inputs   = fg_frame != nullptr && fg_frame->fg.valid ? &fg_frame->fg : nullptr;
-				// (FSR's HUD-less image, from the game's HUD layer, when the frame has one.)
-				const VulkanImage* hudless =
-				    inputs != nullptr && inputs->has_hud && FrameGen::HudlessWanted()
-				        ? swapchain.RecordHudless(command.Handle(), *inputs, swapchain.Format())
-				        : nullptr;
-				FrameGen::RecordFsrPrepare(window.graphic_ctx, command.Handle(), inputs, swapchain.Extent(),
-				                           hudless);
+				auto* fg_frame = layers[0].frame;
+				FrameGen::RecordFsrPrepare(window.graphic_ctx, command.Handle(),
+				                           fg_frame != nullptr && fg_frame->fg.valid ? &fg_frame->fg : nullptr,
+				                           swapchain.Extent());
 				if (fg_frame != nullptr) fg_frame->fg.valid = false;
 			}
 			// Built-in FSR frame generation (Linux, macOS): a new game frame (one with inputs) puts
@@ -1729,14 +1477,9 @@ void Presenter::Impl::Present() {
 				const bool fresh    = fg_frame != nullptr && fg_frame->fg.valid;
 				// (Only new game frames: a repeat of the last one carries no new inputs.)
 				if (fresh) {
-					// (FSR's HUD-less image, in the format of its copy of the frame.)
-					const VulkanImage* hudless =
-					    fg_frame->fg.has_hud && FrameGen::HudlessWanted()
-					        ? swapchain.RecordHudless(command.Handle(), fg_frame->fg, vk::Format::eR8G8B8A8Unorm)
-					        : nullptr;
 					generated = FrameGen::RecordNativeFrameGen(command.Handle(), &fg_frame->fg,
 					                                           swapchain.CurrentImage(), swapchain.Format(),
-					                                           swapchain.Extent(), !waiting, hudless);
+					                                           swapchain.Extent(), !waiting);
 				}
 				if (fg_frame != nullptr) fg_frame->fg.valid = false;
 			}

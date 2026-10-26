@@ -163,9 +163,6 @@ struct Gathered {
 	ImageId  motion;                         // the TAA pass's motion vectors
 	uint64_t motion_address = 0;
 	bool     gbuffer = false, taa = false;
-	ImageId  hud;                            // the HUD layer the last pass blended (CompositePixelShader)
-	uint64_t hud_address = 0;
-	bool     has_hud     = false;
 };
 std::mutex g_mutex;
 Gathered   g_gathered;
@@ -973,19 +970,6 @@ void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
             std::span<const PreparedBindings* const> vertex, std::span<const RenderColorInfo> colors,
             const RenderDepthInfo& depth) {
 	if (!Gathering()) return;
-	// The last pass: its second image is the HUD layer (1x1 when no HUD is shown).
-	if (pixel_shader == CompositePixelShader) {
-		if (pixel == nullptr || pixel->images.size() < 2) return;
-		const auto& hud    = pixel->images[1];
-		const auto& extent = hud.desc.info.extent;
-		std::lock_guard lock(g_mutex);
-		g_gathered.has_hud = hud.image_id && extent.width > 1 && extent.height > 1;
-		if (g_gathered.has_hud) {
-			g_gathered.hud         = hud.image_id;
-			g_gathered.hud_address = hud.desc.info.data.address;
-		}
-		return;
-	}
 	// The TAA pass: its first image is the motion vectors.
 	if (IsTaaPixelShader(pixel_shader)) {
 		if (pixel == nullptr || pixel->images.empty()) return;
@@ -1034,8 +1018,7 @@ void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
 
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs) {
-	inputs.valid   = false;
-	inputs.has_hud = false;
+	inputs.valid = false;
 	if (!Gathering()) return;
 	g_flips.fetch_add(1, std::memory_order_relaxed);
 	Gathered gathered;
@@ -1073,25 +1056,6 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	inputs.render_extent = {motion.backing.extent.width, motion.backing.extent.height};
 	inputs.camera        = gathered.camera;
 	inputs.valid         = true;
-	inputs.has_hud       = false;
-	// The HUD layer, for FSR's HUD-less image.
-	if (gathered.has_hud && HudlessWanted()) {
-		auto& hud = cache.GetImage(gathered.hud);
-		if (hud.backing.image != nullptr && hud.info.data.address == gathered.hud_address &&
-		    !IsDepthFormat(hud.backing.format) && hud.backing.extent.width > 1 &&
-		    hud.backing.extent.height > 1) {
-			Configure(graphics, inputs.hud, inputs.hud_view, hud.backing);
-			CopyInto(vk_command, hud, inputs.hud);
-			inputs.has_hud = true;
-			static bool reported = false;
-			if (!std::exchange(reported, true)) {
-				std::printf("Frame generation: the game's HUD layer found (%ux%u); FSR keeps the HUD out of "
-				            "its generated frames (KYTY_FSR_HUDLESS=0 off)\n",
-				            hud.backing.extent.width, hud.backing.extent.height);
-				std::fflush(stdout);
-			}
-		}
-	}
 	static bool reported = false;
 	if (!reported) {
 		reported = true;
@@ -1105,19 +1069,18 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 }
 
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
-	for (auto* view: {&inputs.depth_view, &inputs.motion_view, &inputs.hud_view}) {
+	for (auto* view: {&inputs.depth_view, &inputs.motion_view}) {
 		if (*view != nullptr) {
 			graphics.device.destroyImageView(*view, nullptr);
 			*view = nullptr;
 		}
 	}
-	for (auto* image: {&inputs.depth, &inputs.motion, &inputs.hud}) {
+	for (auto* image: {&inputs.depth, &inputs.motion}) {
 		if (image->image != nullptr) {
 			graphics.DeleteImage(*image);
 		}
 	}
-	inputs.valid   = false;
-	inputs.has_hud = false;
+	inputs.valid = false;
 }
 
 #ifdef KYTY_UPSCALER_CODE
@@ -2485,7 +2448,7 @@ bool NativeFrameGenOn() {
 }
 
 bool RecordNativeFrameGen(vk::CommandBuffer command, const FrameInputs* inputs, vk::Image backbuffer,
-                          vk::Format format, vk::Extent2D extent, bool show, const VulkanImage* hudless) {
+                          vk::Format format, vk::Extent2D extent, bool show) {
 #if defined(KYTY_FSR_NATIVE) && !defined(KYTY_FRAMEGEN_STREAMLINE)
 	auto& s = g_fsr_fg_native_state;
 	if (!NativeFrameGenOn() || s.graphics == nullptr) return false;
@@ -2561,11 +2524,6 @@ bool RecordNativeFrameGen(vk::CommandBuffer command, const FrameInputs* inputs, 
 	auto&      b              = s.backend;
 	const auto list           = ffxGetCommandListVK(static_cast<VkCommandBuffer>(command));
 	const auto color          = FsrNativeResource(s.composed, L"KytyFgColor", false);
-	// (With a HUD-less image FSR interpolates that and takes the pixels that differ, the HUD's, from
-	// the frame: Swapchain::RecordHudless, in the composed image's format.)
-	const bool has_hudless = hudless != nullptr && hudless->format == FsrNativeFormat &&
-	                         hudless->extent.width == extent.width && hudless->extent.height == extent.height;
-	const auto hudless_color = has_hudless ? FsrNativeResource(*hudless, L"KytyFgHudless", false) : FfxResource {};
 	const auto target         = FsrNativeResource(s.generated, L"KytyFgOutput", true);
 	const auto flow_vector    = b.fpGetResource(&b, s.flow_vectors);
 	const auto flow_scd       = b.fpGetResource(&b, s.scene_change);
@@ -2613,7 +2571,7 @@ bool RecordNativeFrameGen(vk::CommandBuffer command, const FrameInputs* inputs, 
 	if (ok) {
 		FfxOpticalflowDispatchDescription flow {};
 		flow.commandList                = list;
-		flow.color                      = has_hudless ? hudless_color : color;
+		flow.color                      = color;
 		flow.opticalFlowVector          = flow_vector;
 		flow.opticalFlowSCD             = flow_scd;
 		flow.reset                      = reset;
@@ -2630,7 +2588,6 @@ bool RecordNativeFrameGen(vk::CommandBuffer command, const FrameInputs* inputs, 
 		dispatch.displaySize                     = {extent.width, extent.height};
 		dispatch.renderSize                      = {render.width, render.height};
 		dispatch.currentBackBuffer               = color;
-		dispatch.currentBackBuffer_HUDLess       = hudless_color;
 		dispatch.output                          = target;
 		dispatch.interpolationRect               = {0, 0, static_cast<int32_t>(extent.width),
 		                                            static_cast<int32_t>(extent.height)};
@@ -2680,7 +2637,7 @@ bool RecordNativeFrameGen(vk::CommandBuffer command, const FrameInputs* inputs, 
 	}
 	return generated;
 #else
-	(void)command, (void)inputs, (void)backbuffer, (void)format, (void)extent, (void)show, (void)hudless;
+	(void)command, (void)inputs, (void)backbuffer, (void)format, (void)extent, (void)show;
 	return false;
 #endif
 }
@@ -2941,16 +2898,8 @@ void RecordFsrHudless(GraphicContext& graphics, vk::CommandBuffer command, vk::I
 #endif
 }
 
-bool HudlessWanted() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_FSR_HUDLESS");
-		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
-	return enabled && (OwnsSwapchain() || NativeFrameGenOn());
-}
-
 void RecordFsrPrepare(GraphicContext& graphics, vk::CommandBuffer command, const FrameInputs* inputs,
-                      vk::Extent2D backbuffer, const VulkanImage* hudless) {
+                      vk::Extent2D backbuffer) {
 	(void)graphics;
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	auto& s = g_fsr_fg_state;
@@ -2997,11 +2946,7 @@ void RecordFsrPrepare(GraphicContext& graphics, vk::CommandBuffer command, const
 	                                             static_cast<int32_t>(backbuffer.height)};
 	// (This present's backbuffer before the HUD layer was drawn over it, RecordFsrHudless: FSR takes
 	// the HUD from the frame and keeps it out of the interpolation.)
-	if (hudless != nullptr) {
-		// (Made from the game's HUD layer: Swapchain::RecordHudless.)
-		config.HUDLessColor = FsrResource(*hudless, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-		g_fsr_hudless.ready = false;
-	} else if (std::exchange(g_fsr_hudless.ready, false)) {
+	if (std::exchange(g_fsr_hudless.ready, false)) {
 		config.HUDLessColor =
 		    FsrResource(g_fsr_hudless.images[g_fsr_hudless.index], FFX_API_RESOURCE_STATE_COMPUTE_READ);
 	}
@@ -3057,7 +3002,7 @@ void RecordFsrPrepare(GraphicContext& graphics, vk::CommandBuffer command, const
 		std::fflush(stdout);
 	}
 #else
-	(void)command, (void)inputs, (void)backbuffer, (void)hudless;
+	(void)command, (void)inputs, (void)backbuffer;
 #endif
 }
 

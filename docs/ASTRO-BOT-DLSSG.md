@@ -224,11 +224,8 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 
 ## Known issues
 
-- **FSR frame generation and the HUD (new in this build):** both games draw their HUD into a layer
-  of its own that their last pass blends over the scene. The emulator now takes that layer and gives
-  FSR a HUD-less image, so FSR shows the HUD from the real frame instead of interpolating it (the
-  console says `the game's HUD layer found` and `FSR gets a HUD-less image`). `"KYTY_FSR_HUDLESS":
-  "0",` turns it off; `"KYTY_FSR_HUD_THRESHOLD": "0.02",` sets how faint a HUD pixel still counts.
+- **The HUD can smear a little with FSR frame generation.** The game draws its HUD into the same
+  image as the 3D scene, so FSR generates it along with the scene. With DLSS-G it is steady.
 - **FSR frame generation on Linux and macOS is new and untested**: it needs the Vblank frequency
   at about twice the game's frame rate and a display that refreshes that fast.
 - **Astro's Playroom at double speed:** a Vblank frequency above 60 without the decouple patch.
