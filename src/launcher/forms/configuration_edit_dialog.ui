@@ -348,12 +348,12 @@
               <property name="text"><string>Render resolution:</string></property>
              </widget>
             </item>
-            <item row="14" column="0">
+            <item row="13" column="0">
              <widget class="QLabel" name="label_frame_rate_limit">
               <property name="text"><string>Frame rate limit:</string></property>
              </widget>
             </item>
-            <item row="14" column="1">
+            <item row="13" column="1">
              <widget class="QSpinBox" name="spinBox_frame_rate_limit">
               <property name="toolTip"><string>With frame generation on: NVIDIA Reflex holds the game's rendered frames to at most this rate, so generated frames are evenly spaced (on screen: this times the frame generation factor). Pick a rate your PC holds steadily, e.g. 40 or 60 with a 120 Vblank frequency. Off: no limit.</string></property>
               <property name="specialValueText"><string>Off</string></property>
@@ -369,7 +369,7 @@
               <property name="text"><string>Relaxed shader maths (faster, experimental)</string></property>
              </widget>
             </item>
-            <item row="13" column="1">
+            <item row="14" column="1">
              <widget class="QCheckBox" name="checkBox_smooth_frame_pacing">
               <property name="toolTip"><string>Runs the emulator's virtual vblank on an absolute timeline: after a slow frame, a vblank is skipped instead of the next frames being shown back to back to catch up. Can feel smoother when the frame rate dips (KYTY_PRESENT_ABS_VBLANK). With Present mode Immediate, frames are shown as soon as they are ready, at most one per vblank: the best choice on G-Sync/FreeSync displays. Only the display skips a missed vblank; the game still counts it, so its speed stays right.</string></property>
               <property name="text"><string>Smooth frame pacing (skip missed vblanks)</string></property>
