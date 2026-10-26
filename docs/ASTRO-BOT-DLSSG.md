@@ -79,17 +79,26 @@ In the launcher, a game's **Graphics & display** settings have:
 
 They take precedence over `u59-preset.json`.
 
-### Recommended on a G-Sync / FreeSync display
+### Recommended on a G-Sync / FreeSync display: the smoothest way to play
 
-**Present mode Immediate** with **Smooth frame pacing** ticked: a frame that misses its vblank is
-shown as soon as it is ready instead of a whole vblank later, which the variable refresh then
-displays evenly. In a busy Astro Bot level (Sky Garden) this cut the visible hitches by about 90%
-compared with FIFO.
+With these settings the frame times are **remarkably even**: no judder and no hitching, just a
+steady, fluid picture. In the tester's words, "ultra smooth because of the perfect frame times".
 
-Then pick a **Vblank frequency your PC holds in the busiest levels**: evenly timed frames at a lower
-rate feel smoother than a higher rate that keeps dipping. Astro Bot keeps its normal speed below 60.
-A tester's smooth setup (RTX 5080): **Vblank frequency 40, Frame generation 2x, Frame rate limit
-80**. Without a variable-refresh display keep FIFO. Astro's Playroom: keep 60 (see below).
+1. **Present mode: Immediate**, with **Smooth frame pacing** ticked. A frame that misses its vblank
+   is shown the moment it is ready, instead of a whole vblank later, and the variable refresh shows
+   it evenly. Measured in a busy Astro Bot level (Sky Garden) against FIFO: the visible hitches
+   (doubled 33 ms frames) dropped from **97 a minute to 7**, and the slowest 1% of frames went from
+   **33 ms to 23 ms**.
+2. **Vblank frequency: one your PC holds even in the busiest levels.** A lower rate that never dips
+   feels far smoother than a higher one that keeps missing it: every frame then takes exactly the
+   same time. Astro Bot keeps its normal speed below 60.
+3. **Frame generation on top**, at a matching **Frame rate limit**.
+
+The tester's setup (RTX 5080), smooth all the way through: **Vblank frequency 40, Frame generation
+2x, Frame rate limit 80**, Present mode Immediate, Smooth frame pacing on, G-Sync on.
+
+Without a variable-refresh display keep FIFO. Astro's Playroom: keep the Vblank frequency at 60
+(see below).
 
 This build is made like Jetsku's U59 releases (profile-guided optimisation trained on Astro Bot,
 the emulator's diagnostics compiled out) and ships Jetsku's tuned **`u59-preset.json`** next to
