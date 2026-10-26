@@ -295,6 +295,10 @@ public:
 	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
 	// AMD FSR 3.1 frame generation's swapchain in use (FrameGen::OwnsSwapchain at Create).
 	[[nodiscard]] bool UsesFsrSwapchain() const noexcept { return m_fsr_swapchain && m_handle != nullptr; }
+	// Built-in FSR frame generation (Linux, macOS): the images can be read (transfer source).
+	[[nodiscard]] bool ImagesReadable() const noexcept { return m_images_readable; }
+	// The image acquired last.
+	[[nodiscard]] vk::Image CurrentImage() const { return m_images[m_image_index]; }
 	[[nodiscard]] bool       IsMinimized() const noexcept { return m_minimized; }
 	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
 	bool SetHdr(bool hdr) {
@@ -325,6 +329,7 @@ private:
 	bool                           m_surface_extent_zero = false;
 	bool                           m_suboptimal          = false;
 	bool                           m_fsr_swapchain       = false;
+	bool                           m_images_readable     = false;
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
@@ -350,6 +355,10 @@ struct Presenter::Impl {
 		const uint32_t image_count = swapchain.ImageCount() > 0 ? swapchain.ImageCount() : 3;
 		frames.Initialize(image_count, swapchain.Format());
 	}
+
+	// Built-in FSR frame generation: a generated frame was presented, the game's frame waits for
+	// the next vblank tick (PresentPendingFrame).
+	bool fg_pending = false;
 
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
@@ -513,6 +522,15 @@ void Swapchain::Create() {
 	create_info.imageArrayLayers = 1;
 	create_info.imageUsage =
 	    vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst;
+	// Built-in FSR frame generation copies each frame out of the swapchain image.
+	m_images_readable = FrameGen::NativeFrameGenOn() &&
+	                    static_cast<bool>(surface.capabilities.supportedUsageFlags &
+	                                      vk::ImageUsageFlagBits::eTransferSrc) &&
+	                    static_cast<bool>(graphics.GetFormatProperties(m_format).optimalTilingFeatures &
+	                                      vk::FormatFeatureFlagBits::eBlitSrc);
+	if (m_images_readable) {
+		create_info.imageUsage |= vk::ImageUsageFlagBits::eTransferSrc;
+	}
 	create_info.imageSharingMode = vk::SharingMode::eExclusive;
 	create_info.preTransform     = transform;
 	create_info.compositeAlpha   = composite;
@@ -1416,6 +1434,7 @@ void Presenter::Impl::Present() {
 	if (swapchain.IsMinimized()) {
 		return;
 	}
+	bool generated = false;
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status == Swapchain::Status::Minimized) {
@@ -1445,6 +1464,23 @@ void Presenter::Impl::Present() {
 				FrameGen::RecordFsrPrepare(window.graphic_ctx, command.Handle(),
 				                           fg_frame != nullptr && fg_frame->fg.valid ? &fg_frame->fg : nullptr,
 				                           swapchain.Extent());
+				if (fg_frame != nullptr) fg_frame->fg.valid = false;
+			}
+			// Built-in FSR frame generation (Linux, macOS): a new game frame (one with inputs) puts
+			// the generated frame in this image; the game's frame follows at the next vblank tick
+			// (PresentPendingFrame). One still waiting there means the game outpaces the ticks: that
+			// one is dropped, and this frame is shown as it is.
+			generated = false;
+			if (FrameGen::NativeFrameGenOn() && swapchain.ImagesReadable()) {
+				auto*      fg_frame = layers[0].frame;
+				const bool waiting  = std::exchange(fg_pending, false);
+				const bool fresh    = fg_frame != nullptr && fg_frame->fg.valid;
+				// (Only new game frames: a repeat of the last one carries no new inputs.)
+				if (fresh) {
+					generated = FrameGen::RecordNativeFrameGen(command.Handle(), &fg_frame->fg,
+					                                           swapchain.CurrentImage(), swapchain.Format(),
+					                                           swapchain.Extent(), !waiting);
+				}
 				if (fg_frame != nullptr) fg_frame->fg.valid = false;
 			}
 			const auto tick = swapchain.Submit(present_scheduler);
@@ -1483,10 +1519,34 @@ void Presenter::Impl::Present() {
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		fg_pending = generated;
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DroppedPresents);
+}
+
+bool Presenter::PresentPendingFrame() {
+	Common::LockGuard lock(m_impl->present_mutex);
+	if (!std::exchange(m_impl->fg_pending, false) || m_impl->swapchain.IsMinimized()) {
+		return false;
+	}
+	auto& impl   = *m_impl;
+	auto  status = impl.swapchain.AcquireNextImage(impl.present_scheduler);
+	if (status != Swapchain::Status::Success) {
+		if (status != Swapchain::Status::Minimized) impl.RecoverSwapchain(status);
+		return false;
+	}
+	auto& command = impl.present_scheduler.BeginCommand();
+	FrameGen::RecordNativeRealFrame(command.Handle(), impl.swapchain.CurrentImage(), impl.swapchain.Extent());
+	(void)impl.swapchain.Submit(impl.present_scheduler);
+	status = impl.swapchain.Present();
+	if (status != Swapchain::Status::Success) {
+		if (status != Swapchain::Status::Minimized) impl.RecoverSwapchain(status);
+		return false;
+	}
+	impl.window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+	return true;
 }
 
 void Presenter::Discard(Frame& frame) {

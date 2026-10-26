@@ -370,11 +370,18 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	// (The spin box's minimum, 19, shows "Off".)
 	m_ui->spinBox_frame_rate_limit->setValue(info.frame_rate_limit == 0 ? 19 : info.frame_rate_limit);
 #if !defined(_WIN32)
-	// NVIDIA Streamline (frame generation, DLSS, Reflex) is Windows only.
-	for (QWidget* field: std::initializer_list<QWidget*> {m_ui->comboBox_frame_generation,
-	                                                      m_ui->spinBox_frame_rate_limit}) {
-		m_ui->graphicsLayout->setRowVisible(field, false);
+	// NVIDIA Streamline (DLSS-G, Reflex's frame rate limit) is Windows only; FSR frame generation
+	// is built into the Linux and macOS emulator.
+	if (auto* model = qobject_cast<QStandardItemModel*>(m_ui->comboBox_frame_generation->model());
+	    model != nullptr) {
+		for (int item = 1; item <= 3; ++item) {
+			if (model->item(item) != nullptr) model->item(item)->setEnabled(false);
+		}
 	}
+	if (info.frame_generation >= 1 && info.frame_generation <= 3) {
+		m_ui->comboBox_frame_generation->setCurrentIndex(0);
+	}
+	m_ui->graphicsLayout->setRowVisible(m_ui->spinBox_frame_rate_limit, false);
 #endif
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);

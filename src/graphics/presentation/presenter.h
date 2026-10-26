@@ -31,6 +31,9 @@ public:
 	[[nodiscard]] Frame&         PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
 	                                               CommandBuffer* producer = nullptr);
 	[[nodiscard]] bool           PresentLastFrame();
+	// Built-in FSR frame generation (Linux, macOS): at a vblank tick without a new game frame, the
+	// game frame kept after its generated frame was shown; false when none was waiting.
+	[[nodiscard]] bool           PresentPendingFrame();
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           IsHdrSupported() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;

@@ -63,7 +63,9 @@
 #include "common/threads.h"
 
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
+#include <FidelityFX/host/ffx_frameinterpolation.h>
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
+#include <FidelityFX/host/ffx_opticalflow.h>
 
 #include <cfloat>
 #include <memory>
@@ -611,6 +613,9 @@ bool LoadFsrModule(const char* who);
 // AMD FSR 3.1 frame generation (KYTY_FRAMEGEN_BACKEND=fsr): asked for, and ready (runtime and queues).
 bool              g_fsr_fg = false;
 std::atomic<bool> g_fsr_fg_ready {false};
+// Built in (KYTY_FSR_NATIVE: Linux, macOS): asked for; the presenter shows the generated frames.
+bool g_fsr_fg_native = false;
+std::atomic<bool> g_fsr_fg_native_reset {false}; // the swapchain was made again (SwapchainChanging)
 
 } // namespace
 
@@ -637,8 +642,11 @@ void Initialize() {
 			g_fsr_fg = true;
 			std::printf("Frame generation: AMD FSR 3.1 frame generation asked for (2x)\n");
 		}
+#elif defined(KYTY_FSR_NATIVE)
+		g_fsr_fg_native = true;
+		std::printf("Frame generation: AMD FSR 3.1 frame generation asked for (2x, built in)\n");
 #else
-		std::printf("Frame generation: FSR frame generation is not in this build (Windows only for now)\n");
+		std::printf("Frame generation: FSR frame generation is not in this build\n");
 #endif
 		std::fflush(stdout);
 	}
@@ -1052,7 +1060,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	if (!reported) {
 		reported = true;
 		const auto& p = gathered.camera.projection;
-		std::printf("Frame generation: Astro Bot's inputs found (motion and depth %ux%u, vertical FOV "
+		std::printf("Frame generation: the game's inputs found (motion and depth %ux%u, vertical FOV "
 		            "%.1f degrees)\n",
 		            inputs.render_extent.width, inputs.render_extent.height,
 		            2.0 * std::atan(1.0 / p[5]) * 180.0 / 3.14159265358979);
@@ -2111,6 +2119,7 @@ void SwapchainChanging() {
 	g_options_set    = false;
 	g_previous_valid = false;
 #endif
+	g_fsr_fg_native_reset.store(true, std::memory_order_relaxed);
 }
 
 
@@ -2232,6 +2241,429 @@ ffxReturnCode_t FsrFgGenerate(ffxDispatchDescFrameGeneration* params, void* cont
 } // namespace
 #endif
 
+#if defined(KYTY_FSR_NATIVE) && !defined(KYTY_FRAMEGEN_STREAMLINE)
+namespace {
+
+// FSR 3.1 frame generation built in (Linux, macOS): FidelityFX's optical flow and frame
+// interpolation from the SDK sources, as chenxiao07/KytyPS5's src/local/fsr-native.cpp does for
+// Demon's Souls. AMD's frame generation swapchain is Windows only, so the presenter shows the
+// frames itself: at a new game frame the swapchain image the frame was drawn into gets the frame
+// generated between the last one and it, which is presented; the frame itself (`composed`) is
+// presented at the next vblank tick (Presenter::PresentPendingFrame).
+struct FsrFgNative {
+	GraphicContext*                    graphics = nullptr;
+	VkDeviceContext                    device_context {};
+	void*                              scratch = nullptr;
+	FfxInterface                       backend {};
+	alignas(64) FfxOpticalflowContext        optical_flow {};
+	alignas(64) FfxFrameInterpolationContext interpolation {};
+	uint32_t                           shared_context = 0;
+	FfxResourceInternal                flow_vectors {}, scene_change {}, dilated_depth {}, dilated_motion {},
+	    previous_depth {};
+	bool                               created = false, failed = false;
+	vk::Extent2D                       display {}, max_render {};
+	VulkanImage                        composed, generated; // R8G8B8A8 at the display size
+	uint64_t                           frame_id = 0;
+	bool                               mode_on = false, reset = true, format_reported = false;
+	uint32_t                           run_with = 0, run_without = 0;
+	std::chrono::steady_clock::time_point last {};
+	Mat4                               previous_view_proj;
+	bool                               previous_valid = false;
+};
+FsrFgNative g_fsr_fg_native_state;
+constexpr uint32_t FsrNativeTurnOnAfter = 10, FsrNativeTurnOffAfter = 30;
+constexpr vk::Format FsrNativeFormat = vk::Format::eR8G8B8A8Unorm;
+
+void FsrFgNativeWaitIdle() {
+	auto& s = g_fsr_fg_native_state;
+	if (s.graphics == nullptr) return;
+	Common::LockGuard lock(s.graphics->queue_mutex);
+	(void)s.graphics->queue.waitIdle();
+}
+
+void FsrFgNativeDestroyContext() {
+	auto& s = g_fsr_fg_native_state;
+	if (!s.created) return;
+	FsrFgNativeWaitIdle();
+	auto& b = s.backend;
+	for (auto* resource: {&s.flow_vectors, &s.scene_change, &s.dilated_depth, &s.dilated_motion, &s.previous_depth}) {
+		b.fpDestroyResource(&b, *resource, s.shared_context);
+	}
+	b.fpDestroyBackendContext(&b, s.shared_context);
+	ffxFrameInterpolationContextDestroy(&s.interpolation);
+	ffxOpticalflowContextDestroy(&s.optical_flow);
+	std::free(s.scratch);
+	s.scratch = nullptr;
+	s.created = false;
+}
+
+bool FsrFgNativeFail(const char* what, FfxErrorCode code) {
+	g_fsr_fg_native_state.failed = true;
+	std::printf("Frame generation: FSR %s failed (error 0x%x); frame generation off\n", what,
+	            static_cast<unsigned>(code));
+	std::fflush(stdout);
+	return false;
+}
+
+// The contexts for the display size and render sizes up to `render` (made again for others).
+bool FsrFgNativeEnsureContext(vk::Extent2D display, vk::Extent2D render) {
+	auto& s = g_fsr_fg_native_state;
+	if (s.failed) return false;
+	if (s.created && s.display == display && render.width <= s.max_render.width &&
+	    render.height <= s.max_render.height) {
+		return true;
+	}
+	FsrFgNativeDestroyContext();
+	g_fsr_instance                    = static_cast<VkInstance>(s.graphics->instance);
+	s.device_context.vkDevice         = static_cast<VkDevice>(s.graphics->device);
+	s.device_context.vkPhysicalDevice = static_cast<VkPhysicalDevice>(s.graphics->physical_device);
+	s.device_context.vkDeviceProcAddr = FsrGetDeviceProcAddr;
+	// (Optical flow, frame interpolation and their shared resources. The SDK keeps structures with
+	// SIMD members in its scratch memory: more than its declared alignment.)
+	const size_t size = (ffxGetScratchMemorySizeVK(s.device_context.vkPhysicalDevice, 3) + 63) & ~size_t {63};
+	if (posix_memalign(&s.scratch, 64, size) != 0 || s.scratch == nullptr) {
+		s.scratch = nullptr;
+		return FsrFgNativeFail("scratch memory", FFX_ERROR_OUT_OF_MEMORY);
+	}
+	std::memset(s.scratch, 0, size);
+	if (const auto code = ffxGetInterfaceVK(&s.backend, ffxGetDeviceVK(&s.device_context), s.scratch, size, 3);
+	    code != FFX_OK) {
+		return FsrFgNativeFail("ffxGetInterfaceVK", code);
+	}
+	auto& b = s.backend;
+	FfxOpticalflowContextDescription flow {};
+	flow.backendInterface = b;
+	flow.resolution       = {display.width, display.height};
+	if (const auto code = ffxOpticalflowContextCreate(&s.optical_flow, &flow); code != FFX_OK) {
+		return FsrFgNativeFail("optical flow context", code);
+	}
+	s.max_render = {std::max(render.width, display.width), std::max(render.height, display.height)};
+	FfxFrameInterpolationContextDescription description {};
+	// Astro Bot's depth is OpenGL-style (not reversed, a finite far plane); vectors at render size.
+	description.flags            = std::getenv("KYTY_FRAMEGEN_DEBUG") != nullptr ? FFX_FRAMEINTERPOLATION_ENABLE_DEBUG_CHECKING : 0u;
+	description.maxRenderSize    = {s.max_render.width, s.max_render.height};
+	description.displaySize      = {display.width, display.height};
+	description.backBufferFormat = ffxGetSurfaceFormatVK(static_cast<VkFormat>(FsrNativeFormat));
+	description.previousInterpolationSourceFormat = description.backBufferFormat;
+	description.backendInterface                  = b;
+	if (const auto code = ffxFrameInterpolationContextCreate(&s.interpolation, &description); code != FFX_OK) {
+		ffxOpticalflowContextDestroy(&s.optical_flow);
+		return FsrFgNativeFail("frame interpolation context", code);
+	}
+	FfxErrorCode code = b.fpCreateBackendContext(&b, FFX_EFFECT_SHAREDRESOURCES, nullptr, &s.shared_context);
+	FfxOpticalflowSharedResourceDescriptions flow_resources {};
+	FfxFrameInterpolationSharedResourceDescriptions resources {};
+	if (code == FFX_OK) code = ffxOpticalflowGetSharedResourceDescriptions(&s.optical_flow, &flow_resources);
+	if (code == FFX_OK) code = b.fpCreateResource(&b, &flow_resources.opticalFlowVector, s.shared_context, &s.flow_vectors);
+	if (code == FFX_OK) code = b.fpCreateResource(&b, &flow_resources.opticalFlowSCD, s.shared_context, &s.scene_change);
+	if (code == FFX_OK) code = ffxFrameInterpolationGetSharedResourceDescriptions(&s.interpolation, &resources);
+	if (code == FFX_OK) code = b.fpCreateResource(&b, &resources.dilatedDepth, s.shared_context, &s.dilated_depth);
+	if (code == FFX_OK) code = b.fpCreateResource(&b, &resources.dilatedMotionVectors, s.shared_context, &s.dilated_motion);
+	if (code == FFX_OK) {
+		code = b.fpCreateResource(&b, &resources.reconstructedPrevNearestDepth, s.shared_context, &s.previous_depth);
+	}
+	if (code != FFX_OK) {
+		ffxFrameInterpolationContextDestroy(&s.interpolation);
+		ffxOpticalflowContextDestroy(&s.optical_flow);
+		return FsrFgNativeFail("shared resources", code);
+	}
+	s.created = true;
+	s.display = display;
+	s.reset   = true;
+	std::printf("Frame generation: FSR 3.1 ready (%ux%u, render up to %ux%u, built in)\n", display.width,
+	            display.height, s.max_render.width, s.max_render.height);
+	std::fflush(stdout);
+	return true;
+}
+
+// `image` at the display size (made again for another), `usage` its usage.
+bool FsrFgNativeImage(VulkanImage& image, vk::Extent2D extent, vk::ImageUsageFlags usage) {
+	auto& graphics = *g_fsr_fg_native_state.graphics;
+	if (image.image != nullptr && image.extent.width == extent.width && image.extent.height == extent.height) {
+		return true;
+	}
+	if (image.image != nullptr) {
+		FsrFgNativeWaitIdle();
+		graphics.DeleteImage(image);
+	}
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = FsrNativeFormat;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = usage;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, image)) {
+		return false;
+	}
+	image.state.layout      = vk::ImageLayout::eUndefined;
+	image.state.access_mask = {};
+	image.state.pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
+	return true;
+}
+
+// A swapchain image's layout change (its contents kept unless from undefined).
+void SwapchainBarrier(vk::CommandBuffer command, vk::Image image, vk::ImageLayout from, vk::ImageLayout to,
+                      vk::AccessFlags2 access) {
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask       = access;
+	barrier.oldLayout           = from;
+	barrier.newLayout           = to;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = image;
+	barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+}
+
+void Blit(vk::CommandBuffer command, vk::Image source, vk::Image target, vk::Extent2D extent) {
+	vk::ImageBlit region {};
+	region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1};
+	region.dstOffsets[1]  = region.srcOffsets[1];
+	command.blitImage(source, vk::ImageLayout::eTransferSrcOptimal, target, vk::ImageLayout::eTransferDstOptimal, 1,
+	                  &region, vk::Filter::eNearest);
+}
+
+} // namespace
+#endif
+
+bool NativeFrameGenOn() {
+#if defined(KYTY_FSR_NATIVE) && !defined(KYTY_FRAMEGEN_STREAMLINE)
+	return g_fsr_fg_native && g_fsr_fg_ready.load(std::memory_order_relaxed) && !g_fsr_fg_native_state.failed;
+#else
+	return false;
+#endif
+}
+
+bool RecordNativeFrameGen(vk::CommandBuffer command, const FrameInputs* inputs, vk::Image backbuffer,
+                          vk::Format format, vk::Extent2D extent, bool show) {
+#if defined(KYTY_FSR_NATIVE) && !defined(KYTY_FRAMEGEN_STREAMLINE)
+	auto& s = g_fsr_fg_native_state;
+	if (!NativeFrameGenOn() || s.graphics == nullptr) return false;
+	if (g_fsr_fg_native_reset.exchange(false, std::memory_order_relaxed)) s.reset = true;
+	const bool usable = inputs != nullptr && inputs->valid && inputs->camera.valid;
+	s.run_with        = usable ? s.run_with + 1 : 0;
+	s.run_without     = usable ? 0 : s.run_without + 1;
+	const bool mode_on = s.mode_on ? s.run_without < FsrNativeTurnOffAfter : s.run_with >= FsrNativeTurnOnAfter;
+	if (mode_on != s.mode_on) {
+		std::printf("Frame generation: FSR %s\n", mode_on ? "on" : "off (no inputs)");
+		std::fflush(stdout);
+		s.mode_on        = mode_on;
+		s.reset          = true;
+		s.previous_valid = false;
+	}
+	if (!mode_on || !usable) {
+		s.reset = true;
+		return false;
+	}
+	// (The generated frame is made in 8-bit RGBA: an SDR swapchain's. HDR output is not interpolated.)
+	if (format != vk::Format::eB8G8R8A8Unorm && format != vk::Format::eR8G8B8A8Unorm) {
+		if (!std::exchange(s.format_reported, true)) {
+			std::printf("Frame generation: FSR (built in) needs SDR output (swapchain format %s); not generating\n",
+			            vk::to_string(format).c_str());
+			std::fflush(stdout);
+		}
+		return false;
+	}
+	const auto render = inputs->render_extent;
+	if (!FsrFgNativeEnsureContext(extent, render)) return false;
+	using Usage = vk::ImageUsageFlagBits;
+	if (!FsrFgNativeImage(s.composed, extent, Usage::eTransferDst | Usage::eTransferSrc | Usage::eSampled) ||
+	    !FsrFgNativeImage(s.generated, extent, Usage::eStorage | Usage::eTransferSrc | Usage::eSampled)) {
+		std::printf("Frame generation: no memory for FSR's %ux%u frames; frame generation off\n", extent.width,
+		            extent.height);
+		std::fflush(stdout);
+		s.failed = true;
+		return false;
+	}
+
+	// The camera as DLSS-G gets it (Streamline's conventions are FSR's).
+	sl::Constants constants {};
+	DefaultConstants(constants);
+	if (!CameraConstants(inputs->camera, render, s.previous_view_proj, s.previous_valid, constants)) s.reset = true;
+	const auto  now   = std::chrono::steady_clock::now();
+	const float delta = s.last.time_since_epoch().count() == 0
+	                        ? 16.7f
+	                        : std::clamp(std::chrono::duration<float, std::milli>(now - s.last).count(), 1.0f, 200.0f);
+	s.last = now;
+	if (delta >= 200.0f) s.reset = true; // (a gap: a menu, a load, a pause)
+	static const uint32_t debug_flags = [] {
+		const char* value = std::getenv("KYTY_FRAMEGEN_DEBUG");
+		const int   level = value != nullptr ? std::atoi(value) : 0;
+		return level >= 2   ? uint32_t(FFX_FRAMEINTERPOLATION_DISPATCH_DRAW_DEBUG_VIEW)
+		       : level == 1 ? uint32_t(FFX_FRAMEINTERPOLATION_DISPATCH_DRAW_DEBUG_TEAR_LINES |
+		                               FFX_FRAMEINTERPOLATION_DISPATCH_DRAW_DEBUG_RESET_INDICATORS)
+		                    : 0u;
+	}();
+
+	// This frame (with its overlays) copied out of the swapchain image: FSR's input, and the frame
+	// presented after the generated one.
+	SwapchainBarrier(command, backbuffer, vk::ImageLayout::ePresentSrcKHR, vk::ImageLayout::eTransferSrcOptimal,
+	                 vk::AccessFlagBits2::eTransferRead);
+	Transition(command, s.composed, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	Blit(command, backbuffer, s.composed.image, extent);
+	Transition(command, s.composed, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eAllCommands);
+	Transition(command, s.generated, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+	           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+	           vk::PipelineStageFlagBits2::eAllCommands);
+
+	auto&      b              = s.backend;
+	const auto list           = ffxGetCommandListVK(static_cast<VkCommandBuffer>(command));
+	const auto color          = FsrNativeResource(s.composed, L"KytyFgColor", false);
+	const auto target         = FsrNativeResource(s.generated, L"KytyFgOutput", true);
+	const auto flow_vector    = b.fpGetResource(&b, s.flow_vectors);
+	const auto flow_scd       = b.fpGetResource(&b, s.scene_change);
+	const auto depth_dilated  = b.fpGetResource(&b, s.dilated_depth);
+	const auto motion_dilated = b.fpGetResource(&b, s.dilated_motion);
+	const auto depth_previous = b.fpGetResource(&b, s.previous_depth);
+	const uint64_t id         = ++s.frame_id;
+	const bool     reset      = std::exchange(s.reset, false);
+
+	FfxFrameInterpolationPrepareDescription prepare {};
+	prepare.flags                   = debug_flags;
+	prepare.commandList             = list;
+	prepare.renderSize              = {render.width, render.height};
+	prepare.jitterOffset            = {constants.jitterOffset.x, constants.jitterOffset.y};
+	prepare.motionVectorScale       = {MotionVectorSign() * static_cast<float>(render.width),
+	                                   MotionVectorSign() * static_cast<float>(render.height)};
+	prepare.frameTimeDelta          = delta;
+	prepare.cameraNear              = constants.cameraNear;
+	prepare.cameraFar               = constants.cameraFar;
+	prepare.viewSpaceToMetersFactor = 1.0f;
+	prepare.cameraFovAngleVertical  = constants.cameraFOV;
+	prepare.depth                   = FsrNativeResource(inputs->depth, L"KytyFgDepth", false);
+	prepare.motionVectors           = FsrNativeResource(inputs->motion, L"KytyFgMotion", false);
+	prepare.frameID                 = id;
+	prepare.dilatedDepth            = depth_dilated;
+	prepare.dilatedMotionVectors    = motion_dilated;
+	prepare.reconstructedPrevDepth  = depth_previous;
+	prepare.cameraPosition[0] = constants.cameraPos.x;
+	prepare.cameraPosition[1] = constants.cameraPos.y;
+	prepare.cameraPosition[2] = constants.cameraPos.z;
+	prepare.cameraUp[0]       = constants.cameraUp.x;
+	prepare.cameraUp[1]       = constants.cameraUp.y;
+	prepare.cameraUp[2]       = constants.cameraUp.z;
+	prepare.cameraRight[0]    = constants.cameraRight.x;
+	prepare.cameraRight[1]    = constants.cameraRight.y;
+	prepare.cameraRight[2]    = constants.cameraRight.z;
+	prepare.cameraForward[0]  = constants.cameraFwd.x;
+	prepare.cameraForward[1]  = constants.cameraFwd.y;
+	prepare.cameraForward[2]  = constants.cameraFwd.z;
+	bool ok = true;
+	if (const auto code = ffxFrameInterpolationPrepare(&s.interpolation, &prepare); code != FFX_OK) {
+		ok = FsrFgNativeFail("prepare", code);
+	}
+
+	if (ok) {
+		FfxOpticalflowDispatchDescription flow {};
+		flow.commandList                = list;
+		flow.color                      = color;
+		flow.opticalFlowVector          = flow_vector;
+		flow.opticalFlowSCD             = flow_scd;
+		flow.reset                      = reset;
+		flow.backbufferTransferFunction = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+		flow.minMaxLuminance            = {0.0f, 1.0f};
+		if (const auto code = ffxOpticalflowContextDispatch(&s.optical_flow, &flow); code != FFX_OK) {
+			ok = FsrFgNativeFail("optical flow", code);
+		}
+	}
+	if (ok) {
+		FfxFrameInterpolationDispatchDescription dispatch {};
+		dispatch.flags                           = debug_flags;
+		dispatch.commandList                     = list;
+		dispatch.displaySize                     = {extent.width, extent.height};
+		dispatch.renderSize                      = {render.width, render.height};
+		dispatch.currentBackBuffer               = color;
+		dispatch.output                          = target;
+		dispatch.interpolationRect               = {0, 0, static_cast<int32_t>(extent.width),
+		                                            static_cast<int32_t>(extent.height)};
+		dispatch.opticalFlowVector               = flow_vector;
+		dispatch.opticalFlowSceneChangeDetection = flow_scd;
+		dispatch.opticalFlowBufferSize           = {flow_vector.description.width, flow_vector.description.height};
+		dispatch.opticalFlowScale = {1.0f / static_cast<float>(extent.width), 1.0f / static_cast<float>(extent.height)};
+		dispatch.opticalFlowBlockSize       = 8;
+		dispatch.cameraNear                 = constants.cameraNear;
+		dispatch.cameraFar                  = constants.cameraFar;
+		dispatch.cameraFovAngleVertical     = constants.cameraFOV;
+		dispatch.viewSpaceToMetersFactor    = 1.0f;
+		dispatch.frameTimeDelta             = delta;
+		dispatch.reset                      = reset;
+		dispatch.backBufferTransferFunction = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+		dispatch.minMaxLuminance[0]         = 0.0f;
+		dispatch.minMaxLuminance[1]         = 1.0f;
+		dispatch.frameID                    = id;
+		dispatch.dilatedDepth               = depth_dilated;
+		dispatch.dilatedMotionVectors       = motion_dilated;
+		dispatch.reconstructedPrevDepth     = depth_previous;
+		if (const auto code = ffxFrameInterpolationDispatch(&s.interpolation, &dispatch); code != FFX_OK) {
+			ok = FsrFgNativeFail("frame interpolation", code);
+		}
+	}
+	// (The first frame after a reset has no frame before it: shown as it is.)
+	const bool generated = ok && !reset && show;
+	if (generated) {
+		Transition(command, s.generated, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+		           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+		SwapchainBarrier(command, backbuffer, vk::ImageLayout::eTransferSrcOptimal,
+		                 vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
+		Blit(command, s.generated.image, backbuffer, extent);
+		SwapchainBarrier(command, backbuffer, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::ePresentSrcKHR,
+		                 vk::AccessFlagBits2::eMemoryRead);
+		static bool reported = false;
+		if (!std::exchange(reported, true)) {
+			std::printf("Frame generation: FSR 2x on (render %ux%u, display %ux%u, jitter %.3f, %.3f px; built in, "
+			            "shown at the vblank ticks)\n",
+			            render.width, render.height, extent.width, extent.height, constants.jitterOffset.x,
+			            constants.jitterOffset.y);
+			std::fflush(stdout);
+		}
+	} else {
+		SwapchainBarrier(command, backbuffer, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::ePresentSrcKHR,
+		                 vk::AccessFlagBits2::eMemoryRead);
+	}
+	return generated;
+#else
+	(void)command, (void)inputs, (void)backbuffer, (void)format, (void)extent, (void)show;
+	return false;
+#endif
+}
+
+void RecordNativeRealFrame(vk::CommandBuffer command, vk::Image backbuffer, vk::Extent2D extent) {
+#if defined(KYTY_FSR_NATIVE) && !defined(KYTY_FRAMEGEN_STREAMLINE)
+	auto& s = g_fsr_fg_native_state;
+	SwapchainBarrier(command, backbuffer, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
+	                 vk::AccessFlagBits2::eTransferWrite);
+	if (s.composed.image != nullptr && s.composed.extent.width == extent.width &&
+	    s.composed.extent.height == extent.height) {
+		Transition(command, s.composed, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferSrcOptimal,
+		           vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
+		Blit(command, s.composed.image, backbuffer, extent);
+	} else {
+		const vk::ClearColorValue black {};
+		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(backbuffer, vk::ImageLayout::eTransferDstOptimal, &black, 1, &range);
+	}
+	SwapchainBarrier(command, backbuffer, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::ePresentSrcKHR,
+	                 vk::AccessFlagBits2::eMemoryRead);
+#else
+	(void)command, (void)backbuffer, (void)extent;
+#endif
+}
+
 bool FsrFrameGenRequested() {
 	return g_fsr_fg;
 }
@@ -2246,13 +2678,21 @@ void OnFsrQueues(GraphicContext& graphics) {
 	}
 	g_fsr_fg_state.graphics = &graphics;
 	g_fsr_fg_ready.store(true, std::memory_order_relaxed);
+#elif defined(KYTY_FSR_NATIVE)
+	if (!g_fsr_fg_native) return;
+	g_fsr_fg_native_state.graphics = &graphics;
+	g_fsr_fg_ready.store(true, std::memory_order_relaxed);
 #else
 	(void)graphics;
 #endif
 }
 
 bool OwnsSwapchain() {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
 	return g_fsr_fg_ready.load(std::memory_order_relaxed);
+#else
+	return false; // (built in: the emulator's own swapchain, the presenter shows the frames)
+#endif
 }
 
 vk::Result CreateSwapchain(GraphicContext& graphics, const vk::SwapchainCreateInfoKHR& info, bool hdr,

@@ -7,7 +7,7 @@ that adds frame generation and modern upscaling to **ASTRO BOT (PPSA21564)** and
 | | What it does | GPU | Platforms |
 |---|---|---|---|
 | **NVIDIA DLSS frame generation (DLSS-G)** | 2x, 3x, 4x generated frames, with Reflex | RTX 40 / 50 (3x/4x: RTX 50) | Windows |
-| **AMD FSR 3.1 frame generation** | 2x generated frames | any GPU (AMD, Intel, RTX 20/30, ...) | Windows |
+| **AMD FSR 3.1 frame generation** | 2x generated frames | any GPU (AMD, Intel, RTX 20/30, ...) | Windows, Linux, macOS |
 | **NVIDIA DLSS upscaling (super resolution)** | replaces the game's TAA | any RTX | Windows |
 | **AMD FSR 3.1 upscaling** | replaces the game's TAA | any Vulkan GPU | Windows, Linux, macOS |
 | **Built-in render resolution** | 1080p / 1368p / 1872p / 2160p, no patch file needed | any | all |
@@ -28,7 +28,7 @@ between the emulator and the driver, so if another game misbehaves with this bui
   included, see below).
 - **FSR upscaling and FSR frame generation:** any GPU. Nothing to download: AMD's
   `amd_fidelityfx_vk.dll` (FidelityFX SDK v1.1.4, MIT licence) is included next to the emulator.
-- **Linux / macOS:** see below (FSR upscaling and render resolution only).
+- **Linux / macOS:** see below (FSR upscaling, FSR frame generation and the render resolution).
 
 ## Setup
 
@@ -109,7 +109,7 @@ Frame generation: Streamline loaded from ...\streamline (1 generated frame(s) pe
 Frame generation: Streamline offers DLSS-G with this GPU, driver and Windows
 Frame generation: Vulkan is loaded from sl.interposer.dll (Streamline's interposer, as needed)
 Frame generation: DLSS-G ready (1 generated frame(s) per frame); it turns on in the game's 3D view
-Frame generation: Astro Bot's inputs found (motion and depth 3840x2160, ...)
+Frame generation: the game's inputs found (motion and depth 3840x2160, ...)
 Frame generation: DLSS-G on
 ```
 
@@ -117,7 +117,7 @@ Use the **NVIDIA overlay** (Alt+R) to see the frame rate on screen: it counts th
 frames. The emulator's own counter shows the game's real frame rate, which frame generation does
 not change.
 
-## AMD FSR 3.1 frame generation (experimental, Windows)
+## AMD FSR 3.1 frame generation (experimental)
 
 **Frame generation: 2x (AMD FSR 3.1, any GPU)** generates frames with AMD's FSR 3.1 instead of
 DLSS-G, on **any GPU**, from the same depth, motion vectors and camera. No Streamline files are
@@ -125,7 +125,19 @@ needed. Use it with **FSR upscaling or the game's own TAA** (not with DLSS upsca
 shows `Frame generation: FSR swapchain ...`, `FSR 3.1 ready ...`, then `FSR on` and
 `FSR 2x on (render ..., display ...)` in the 3D view; it switches off during videos and menus and
 back on in the 3D view. `"KYTY_FRAMEGEN_DEBUG": "1",` draws FSR's tear and reset lines, `"2"` its
-debug view. Tested working in both Astro Bot and Playroom.
+debug view. Tested working on Windows in both Astro Bot and Playroom.
+
+**On Linux and macOS** (new in this build, untested by us) FSR frame generation is built into the
+emulator from AMD's FidelityFX SDK 1.1.4 sources, so the same launcher choice (or
+`"KYTY_FRAMEGEN": "1",` with `"KYTY_FRAMEGEN_BACKEND": "fsr",` in `u59-preset.json`) works on any
+Vulkan GPU, no extra file needed. AMD's frame generation swapchain is Windows only, so there the
+emulator shows the frames itself, on its vblank ticks: the generated frame at the tick a new game
+frame arrives, the game's frame at the next tick. So set **Vblank frequency to twice the game's
+frame rate** (e.g. 120 for 60 fps, with a display that shows 120 Hz); if the game reaches the
+vblank rate itself, no frame is generated. The console shows `Frame generation: AMD FSR 3.1 frame
+generation asked for (2x, built in)`, `FSR 3.1 ready (..., built in)`, `FSR on` and
+`FSR 2x on (...; built in, shown at the vblank ticks)`. It needs SDR output (not HDR). Please report
+whether it works, with those lines.
 
 ## DLSS and FSR upscaling (experimental)
 
@@ -164,8 +176,7 @@ Playroom uses the same kind of TAA pass as Astro Bot, so everything above works 
 **FSR frame generation**, **DLSS and FSR upscaling** and the **render resolution** (tested on
 version 01.905). One difference: Playroom's TAA runs at the render resolution and a later pass of
 its own does the upscale, so DLSS and FSR work there as **anti-aliasing at the render resolution
-(DLAA / native AA)**, not as the upscaler. The console's lines are the same as for Astro Bot
-(including the wording "Astro Bot's inputs found").
+(DLAA / native AA)**, not as the upscaler. The console's lines are the same as for Astro Bot.
 
 ## Shader maths profile (experimental)
 
@@ -181,12 +192,13 @@ game's shaders again.
 
 The release also has a **Linux build** (`...-Linux-x86_64.tar.gz`) and a **macOS build**
 (`...-macOS-x86_64.zip`, Intel Macs; Apple Silicon through Rosetta, with MoltenVK). DLSS, frame
-generation (DLSS-G and FSR) and Reflex are Windows only and not in them. **FSR upscaling is**:
-there it is built into the emulator from AMD's FidelityFX SDK 1.1.4 sources (no extra file), so
-**Upscaling: AMD FSR** in the launcher, or `"KYTY_FSR": "1",` in `u59-preset.json`, works on any
-Vulkan GPU. The built-in **render resolution**, the **shader maths profile** and everything else
+generation (DLSS-G) and Reflex are Windows only and not in them. **FSR upscaling and FSR frame
+generation are**: there they are built into the emulator from AMD's FidelityFX SDK 1.1.4 sources
+(no extra file), so **Upscaling: AMD FSR** and **Frame generation: 2x (AMD FSR 3.1)** in the
+launcher, or `"KYTY_FSR": "1",` and `"KYTY_FRAMEGEN_BACKEND": "fsr",` in `u59-preset.json`, work on
+any Vulkan GPU (frame generation: see above, Vblank frequency at twice the game's frame rate). The built-in **render resolution**, the **shader maths profile** and everything else
 from Jetsku's int21 are in them too. The macOS build is new and untested by us: please report
-whether it works (and the console's `FSR upscaling:` lines if it does not).
+whether it works (and the console's `FSR upscaling:` and `Frame generation:` lines if it does not).
 
 Started without the launcher (as frontends do), the emulator applies `u59-preset.json` from its
 folder itself, so add settings there, e.g. `"KYTY_ASTRO_RENDER_RES": "1080",` and
@@ -207,6 +219,8 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 - **The HUD can wobble or smear with FSR frame generation.** The game draws its HUD into the same
   image as the 3D scene, so FSR generates it along with the scene. With DLSS-G it is steady. A fix
   is being worked on.
+- **FSR frame generation on Linux and macOS is new and untested**: it needs the Vblank frequency
+  at about twice the game's frame rate and a display that refreshes that fast.
 - **FSR frame generation does not work together with DLSS upscaling.** Use FSR upscaling or the
   game's TAA with it.
 - **Game patches are separate and up to you.** Frame generation and upscaling do not depend on

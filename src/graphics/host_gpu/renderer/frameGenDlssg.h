@@ -22,7 +22,8 @@
 // KYTY_DLSS_JITTER=projection takes the jitter from the camera's projection instead of the TAA's
 // constants; KYTY_DLSS_JITTER_X=-1 / KYTY_DLSS_JITTER_Y=-1 flip it; KYTY_DLSS_MV_JITTERED=1 tells
 // DLSS the motion vectors include the jitter.
-// Windows only, and only in builds with Streamline's headers (KYTY_FRAMEGEN_STREAMLINE).
+// DLSS: Windows only, and only in builds with Streamline's headers (KYTY_FRAMEGEN_STREAMLINE).
+// FSR: Windows through AMD's runtime; Linux and macOS built in (KYTY_FSR_NATIVE).
 
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -152,6 +153,23 @@ void RecordFsrPrepare(GraphicContext& graphics, vk::CommandBuffer command, const
 // (left in it), copied as FSR's HUD-less image, so FSR keeps the HUD out of its interpolation.
 void RecordFsrHudless(GraphicContext& graphics, vk::CommandBuffer command, vk::Image backbuffer,
                       vk::ImageLayout layout, vk::Format format, vk::Extent2D extent);
+
+// AMD FSR 3.1 frame generation built in (KYTY_FRAMEGEN_BACKEND=fsr on Linux and macOS, from the
+// FidelityFX SDK sources): AMD's frame generation swapchain is Windows only, so the presenter
+// shows the generated frames itself.
+// On (asked for, the device ready, not failed): the swapchain's images can then be read
+// (transfer source) and the presenter calls the two below.
+[[nodiscard]] bool NativeFrameGenOn();
+// Present thread, after RecordPresentCommands (`backbuffer` the swapchain image, in the present
+// layout): copies the frame out and, with inputs, generates the frame between the last one and it
+// into `backbuffer` (left in the present layout). True: `backbuffer` now holds the generated frame,
+// and RecordNativeRealFrame shows the game's frame at the next present. `show` false: FSR's
+// history only (the generated frame is not put in `backbuffer`).
+[[nodiscard]] bool RecordNativeFrameGen(vk::CommandBuffer command, const FrameInputs* inputs,
+                                        vk::Image backbuffer, vk::Format format, vk::Extent2D extent,
+                                        bool show);
+// Into a newly acquired swapchain image: the game's frame RecordNativeFrameGen kept.
+void RecordNativeRealFrame(vk::CommandBuffer command, vk::Image backbuffer, vk::Extent2D extent);
 
 } // namespace FrameGen
 } // namespace Libs::Graphics
