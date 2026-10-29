@@ -274,9 +274,17 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   timing" mod switches Decouple off when a rescue starts and only back on when it ends; some levels
   start one without ending it. The emulator now applies that fix itself, automatically (no button
   combination), in place of the mod (it is skipped, enabled or not), with a safety net: if Decouple
-  stays off for 15 s, it is switched back on (the console then shows `Game patch: bot rescue fix:
-  Decouple was off ...`). Settings: `"KYTY_ASTRO_RESCUE_TIMEOUT_S": "15",`, and
-  `"KYTY_ASTRO_RESCUE_FIX": "0",` to use the patch file's mod as before.
+  stays off for 6 s (15 s before build 22), it is switched back on (the console then shows `Game
+  patch: bot rescue fix: Decouple was off ...`). Settings: `"KYTY_ASTRO_RESCUE_TIMEOUT_S": "6",`
+  (2 to 600), and `"KYTY_ASTRO_RESCUE_FIX": "0",` to use the patch file's mod as before.
+- **Build 22 (test): shorter slow-down at a level's start, and two logs.** The rescue fix's hook
+  also fires at the start of some levels, not only for rescues, so those levels began with up to
+  15 s of slow motion; the safety net now steps in after 6 s. To find a proper fix, the console
+  shows a `Game patch: bot rescue log:` line for each rescue start and end, with the calling code
+  and the time (`"KYTY_ASTRO_RESCUE_LOG": "0",` hides them). For a built-in Decouple that works in
+  every version of the game without a patch file, the console also shows `Decouple probe:` lines at
+  start-up, saying where it finds the game's timing code (`"KYTY_DECOUPLE_PROBE": "0",` hides
+  them). Neither log changes the game.
 - **Fixed in build 18: slow motion with frame generation and Smooth frame pacing.** When a
   frame took longer to present than one vblank (DLSS-G pacing its generated frames, more often at
   3x than 2x), the skipped vblank was also lost to the game, which then ran slower, in Astro Bot

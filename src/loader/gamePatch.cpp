@@ -59,7 +59,7 @@ std::vector<uint64_t> g_applied_cave_pages;
 // that fix itself in place of the mod (the mod is skipped, enabled or not), finds Decouple's
 // on/off byte in the applied Decouple mod (its variants place it differently), and adds a
 // watchdog: if Decouple stays off for this fix longer than KYTY_ASTRO_RESCUE_TIMEOUT_S seconds
-// (default 15; a real rescue is a few seconds), it is switched back on as the rescue end does.
+// (default 6; a real rescue is a few seconds), it is switched back on as the rescue end does.
 constexpr const char* kRescueModName = "Bot rescue plays with the game's own 60 fps timing";
 constexpr uint64_t    kRescueStart   = 0x5074e20;
 constexpr uint64_t    kRescueEnd     = 0x5077e60;
@@ -71,16 +71,19 @@ struct RescueFix {
 	uint64_t gate    = 0; // source addresses until applied, then target addresses
 	uint64_t state   = 0;
 	uint64_t marker  = 0;
+	uint64_t log     = 0; // the rescue log's count; its entries follow it
 };
 RescueFix g_rescue_plan;
 // Armed after the writes (target addresses); read by the flip watchdog.
 std::atomic<uint64_t> g_rescue_gate {0};
 std::atomic<uint64_t> g_rescue_state {0};
 std::atomic<uint64_t> g_rescue_marker {0};
+std::atomic<uint64_t> g_rescue_log {0};
+std::atomic<uint64_t> g_rescue_base {0}; // the main program's base: log addresses as offsets
 
 uint32_t RescueTimeoutSeconds() {
 	const auto* value = std::getenv("KYTY_ASTRO_RESCUE_TIMEOUT_S");
-	const int   s     = value != nullptr ? std::atoi(value) : 15;
+	const int   s     = value != nullptr ? std::atoi(value) : 6;
 	return static_cast<uint32_t>(std::clamp(s, 2, 600));
 }
 
@@ -151,7 +154,11 @@ void PlanRescueFix(Plan* plan) {
 			}
 		}
 	}
-	const uint64_t marker = cave + 0x80;
+	// Data after the code: the marker byte, then the rescue log (a count and 16 entries, each the
+	// caller's return address, bit 62 = Decouple was on, bit 63 = an end call; KYTY_ASTRO_RESCUE_LOG).
+	const uint64_t marker  = cave + 0x100;
+	const uint64_t count   = cave + 0x108;
+	const uint64_t entries = cave + 0x110;
 	for (const uint64_t target: {gate, state, marker, kRescueStart + 6, kRescueEnd + 6}) {
 		if (!FitsRel32(cave, target)) {
 			Log::WriteToConsoleAndLog("Game patch: built-in bot rescue fix not applied (addresses out "
@@ -160,47 +167,76 @@ void PlanRescueFix(Plan* plan) {
 		}
 	}
 	std::vector<uint8_t> code;
-	const auto at = [&](uint64_t offset) { return cave + offset; };
+	// rel32 to target, for an instruction that has `tail` more bytes after it
+	const auto emit_rel = [&](uint64_t target, uint64_t tail) {
+		AppendRel32(&code, cave + code.size() + 4 + tail, target);
+	};
+	const auto log_call = [&](bool end) {
+		code.insert(code.end(), {0x50, 0x51, 0x52, 0x56});       // push rax, rcx, rdx, rsi
+		code.insert(code.end(), {0x48, 0x8b, 0x05});             // mov rax, [count]
+		emit_rel(count, 0);
+		code.insert(code.end(), {0x89, 0xc1, 0x83, 0xe1, 0x0f}); // mov ecx, eax; and ecx, 15
+		code.insert(code.end(), {0x48, 0x8b, 0x54, 0x24, 0x20}); // mov rdx, [rsp+0x20] (return address)
+		code.insert(code.end(), {0x80, 0x3d});                   // cmp byte [gate], 0
+		emit_rel(gate, 1);
+		code.push_back(0x00);
+		code.insert(code.end(), {0x75, 0x05});                   // jne +5
+		code.insert(code.end(), {0x48, 0x0f, 0xba, 0xea, 0x3e}); // bts rdx, 62
+		if (end) {
+			code.insert(code.end(), {0x48, 0x0f, 0xba, 0xea, 0x3f}); // bts rdx, 63
+		}
+		code.insert(code.end(), {0x48, 0x8d, 0x35});             // lea rsi, [entries]
+		emit_rel(entries, 0);
+		code.insert(code.end(), {0x48, 0x89, 0x14, 0xce});       // mov [rsi+rcx*8], rdx
+		code.insert(code.end(), {0x48, 0xff, 0xc0});             // inc rax
+		code.insert(code.end(), {0x48, 0x89, 0x05});             // mov [count], rax (after the entry)
+		emit_rel(count, 0);
+		code.insert(code.end(), {0x5e, 0x5a, 0x59, 0x58});       // pop rsi, rdx, rcx, rax
+	};
 	// start: if Decouple is on, switch it off and remember doing so
+	const uint64_t start_entry = cave + code.size();
+	log_call(false);
 	code.insert(code.end(), {0x80, 0x3d});
-	AppendRel32(&code, at(7), gate);
+	emit_rel(gate, 1);
 	code.push_back(0x00);
 	code.insert(code.end(), {0x75, 0x0e});
 	code.insert(code.end(), {0xc6, 0x05});
-	AppendRel32(&code, at(0x10), gate);
+	emit_rel(gate, 1);
 	code.push_back(0x01);
 	code.insert(code.end(), {0xc6, 0x05});
-	AppendRel32(&code, at(0x17), marker);
+	emit_rel(marker, 1);
 	code.push_back(0x01);
 	code.insert(code.end(), std::begin(kPrologue), std::end(kPrologue));
 	code.push_back(0xe9);
-	AppendRel32(&code, at(0x22), kRescueStart + 6);
+	emit_rel(kRescueStart + 6, 0);
 	// end: if this fix switched it off, switch it back on and reset Decouple's timestamp
+	const uint64_t end_entry = cave + code.size();
+	log_call(true);
 	code.insert(code.end(), {0x80, 0x3d});
-	AppendRel32(&code, at(0x29), marker);
+	emit_rel(marker, 1);
 	code.push_back(0x00);
 	code.insert(code.end(), {0x74, 0x19});
 	code.insert(code.end(), {0xc6, 0x05});
-	AppendRel32(&code, at(0x32), marker);
+	emit_rel(marker, 1);
 	code.push_back(0x00);
 	code.insert(code.end(), {0xc6, 0x05});
-	AppendRel32(&code, at(0x39), gate);
+	emit_rel(gate, 1);
 	code.push_back(0x00);
 	code.insert(code.end(), {0x48, 0xc7, 0x05});
-	AppendRel32(&code, at(0x44), state);
+	emit_rel(state, 4);
 	code.insert(code.end(), {0x00, 0x00, 0x00, 0x00});
 	code.insert(code.end(), std::begin(kPrologue), std::end(kPrologue));
 	code.push_back(0xe9);
-	AppendRel32(&code, at(0x4f), kRescueEnd + 6);
-	EXIT_IF(code.size() != 0x4f);
-	code.resize(0x88, 0x00); // the marker byte at +0x80
+	emit_rel(kRescueEnd + 6, 0);
+	EXIT_IF(code.size() > 0x100);
+	code.resize(0x190, 0x00); // marker, count and log entries
 
 	Write cave_write;
 	cave_write.source_address = cave;
 	cave_write.on             = code;
 	cave_write.off.assign(code.size(), 0);
 	plan->writes.push_back(std::move(cave_write));
-	for (const auto& [hook, entry]: {std::pair {kRescueStart, cave}, std::pair {kRescueEnd, cave + 0x22}}) {
+	for (const auto& [hook, entry]: {std::pair {kRescueStart, start_entry}, std::pair {kRescueEnd, end_entry}}) {
 		Write write;
 		write.source_address = hook;
 		write.off.assign(std::begin(kPrologue), std::end(kPrologue));
@@ -209,7 +245,7 @@ void PlanRescueFix(Plan* plan) {
 		write.on.push_back(0x90);
 		plan->writes.push_back(std::move(write));
 	}
-	g_rescue_plan = {true, gate, state, marker};
+	g_rescue_plan = {true, gate, state, marker, count};
 	plan->mod_names.emplace_back("[Built-in] Bot rescue fix with safety timeout (KYTY_ASTRO_RESCUE_FIX)");
 }
 
@@ -492,10 +528,13 @@ bool ApplyPending(Program* program) {
 		::printf("Successfully applied cheat: %s\n", name.c_str());
 	}
 	if (g_rescue_plan.planned) {
-		uint64_t gate = 0, state = 0, marker = 0;
+		uint64_t gate = 0, state = 0, marker = 0, log = 0;
 		Translate(*program, source_base, g_rescue_plan.gate, &gate);
 		Translate(*program, source_base, g_rescue_plan.state, &state);
 		Translate(*program, source_base, g_rescue_plan.marker, &marker);
+		Translate(*program, source_base, g_rescue_plan.log, &log);
+		g_rescue_base.store(program->base_vaddr);
+		g_rescue_log.store(log);
 		g_rescue_state.store(state);
 		g_rescue_marker.store(marker);
 		g_rescue_gate.store(gate);
@@ -791,6 +830,122 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 	         version.c_str());
 }
 
+// KYTY_DECOUPLE_PROBE (default 1; 0 = off): Astro Bot (PPSA21564 / PPSA21567), any version, before
+// any patch is applied. Looks for the game's three fixed-step getters that the community "Decouple
+// gameplay timers from render FPS" mod hooks (01.018.000: 0x3520, 0x3530, 0x3550): dt as a double
+// "vmovsd xmm0, [rip+A]; vdivsd xmm0, [rip+B]; ret" (1.0 / target fps), with "mov rax, [rip+B+0x10];
+// ret" (dt in microseconds) and "vmovss xmm0, [rip+B+8]; ret" (dt as a float) within 0x40 bytes.
+// Logs each such cluster, then every direct call of the double getter with the next calls after
+// it (01.018: the frame update's call at 0x2a4a2b, then the frame-limiter sleep at 0x2a4aa8 ->
+// 0x1370). Changes nothing; for a built-in Decouple that finds its hooks in any version.
+void ProbeDecouple(Program* main_program) {
+	if (main_program == nullptr || main_program->elf == nullptr || main_program->elf->IsShared()) {
+		return;
+	}
+	if (const char* value = std::getenv("KYTY_DECOUPLE_PROBE"); value != nullptr && value[0] == '0') {
+		return;
+	}
+	std::string title_id;
+	std::string version;
+	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
+	    !SystemContentParamSfoGetString("APP_VER", &version) ||
+	    (title_id != "PPSA21564" && title_id != "PPSA21567")) {
+		return;
+	}
+	const auto  base = main_program->base_vaddr;
+	const auto* ehdr = main_program->elf->GetEhdr();
+	const auto* phdr = main_program->elf->GetPhdr();
+	struct Range {
+		const uint8_t* begin;
+		const uint8_t* end;
+	};
+	std::vector<Range> code;
+	for (Elf64_Half index = 0; index < ehdr->e_phnum; index++) {
+		const auto& segment = phdr[index];
+		if (segment.p_type == PT_LOAD && (segment.p_flags & PF_X) != 0 && segment.p_filesz >= 32) {
+			const auto* begin = reinterpret_cast<const uint8_t*>(base + segment.p_vaddr);
+			code.push_back({begin, begin + segment.p_filesz});
+		}
+	}
+	const auto rel_target = [](const uint8_t* rel_at, size_t tail) {
+		int32_t rel = 0;
+		std::memcpy(&rel, rel_at, sizeof(rel));
+		return reinterpret_cast<uint64_t>(rel_at) + 4 + tail + static_cast<int64_t>(rel);
+	};
+	const auto off = [&](uint64_t address) { return static_cast<unsigned long long>(address - base); };
+	static constexpr uint8_t kDouble[] = {0xc5, 0xfb, 0x10, 0x05};
+	static constexpr uint8_t kDivide[] = {0xc5, 0xfb, 0x5e, 0x05};
+	uint32_t                 doubles   = 0;
+	std::vector<uint64_t>    getters;
+	for (const auto& range: code) {
+		for (const auto* at = range.begin; at + 17 <= range.end; ++at) {
+			if (std::memcmp(at, kDouble, 4) != 0 || std::memcmp(at + 8, kDivide, 4) != 0 || at[16] != 0xc3) {
+				continue;
+			}
+			doubles++;
+			const uint64_t global = rel_target(at + 12, 0);
+			bool           ticks  = false;
+			bool           single = false;
+			const auto*    from   = std::max(range.begin, at - 0x40);
+			const auto*    to     = std::min(range.end - 9, at + 0x40);
+			for (const auto* near = from; near <= to; ++near) {
+				if (near[0] == 0x48 && near[1] == 0x8b && near[2] == 0x05 && near[7] == 0xc3 &&
+				    rel_target(near + 3, 0) == global + 0x10) {
+					ticks = true;
+				}
+				if (near[0] == 0xc5 && near[1] == 0xfa && near[2] == 0x10 && near[3] == 0x05 &&
+				    near[8] == 0xc3 && rel_target(near + 4, 0) == global + 8) {
+					single = true;
+				}
+			}
+			if (ticks && single) {
+				getters.push_back(reinterpret_cast<uint64_t>(at));
+				const double fps = IsInsideProgram(*main_program, global, 8)
+				                       ? *reinterpret_cast<const double*>(global)
+				                       : 0.0;
+				::printf("Decouple probe: Astro Bot %s %s: getters at game+0x%llx, step global "
+				         "game+0x%llx (now %g) (KYTY_DECOUPLE_PROBE)\n",
+				         title_id.c_str(), version.c_str(), off(reinterpret_cast<uint64_t>(at)), off(global), fps);
+			}
+		}
+	}
+	::printf("Decouple probe: %u double getter(s), %zu with both siblings (want 1) (KYTY_DECOUPLE_PROBE)\n",
+	         doubles, getters.size());
+	for (const uint64_t getter: getters) {
+		uint32_t callers = 0;
+		for (const auto& range: code) {
+			for (const auto* at = range.begin; at + 5 <= range.end; ++at) {
+				if (at[0] != 0xe8 || rel_target(at + 1, 0) != getter) {
+					continue;
+				}
+				if (++callers > 24) {
+					continue;
+				}
+				std::string next;
+				int         found = 0;
+				for (const auto* after = at + 5; after + 5 <= range.end && after < at + 0x100 && found < 3; ++after) {
+					if (*after == 0xe8) {
+						const uint64_t target = rel_target(after + 1, 0);
+						if (IsInsideProgram(*main_program, target, 1)) {
+							char text[48];
+							std::snprintf(text, sizeof(text), " +0x%llx->0x%llx",
+							              static_cast<unsigned long long>(after - at),
+							              static_cast<unsigned long long>(target - base));
+							next += text;
+							found++;
+							after += 4;
+						}
+					}
+				}
+				::printf("Decouple probe: call of game+0x%llx at game+0x%llx, next calls:%s (KYTY_DECOUPLE_PROBE)\n",
+				         off(getter), off(reinterpret_cast<uint64_t>(at)), next.c_str());
+			}
+		}
+		::printf("Decouple probe: %u direct call(s) of game+0x%llx (KYTY_DECOUPLE_PROBE)\n", callers, off(getter));
+	}
+	std::fflush(stdout);
+}
+
 void ApplyBuiltin(Program* main_program) {
 	if (main_program == nullptr || main_program->elf == nullptr || main_program->elf->IsShared()) {
 		return;
@@ -843,7 +998,46 @@ void ApplyBuiltin(Program* main_program) {
 	         scale, scaled[0], scaled[1], scaled[2], scaled[3], scaled[4]);
 }
 
+// KYTY_ASTRO_RESCUE_LOG (default 1; 0 = off): one console line per call of the rescue-start and
+// rescue-end functions the built-in rescue fix hooks, with the caller (an offset in the game) and the
+// time, to tell real rescues from the calls at a level's start (test build 22).
+void PrintRescueLog() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASTRO_RESCUE_LOG");
+		return value == nullptr || value[0] != '0';
+	}();
+	const auto log = g_rescue_log.load(std::memory_order_relaxed);
+	if (!enabled || log == 0) {
+		return;
+	}
+	using Clock = std::chrono::steady_clock;
+	static const auto started = Clock::now();
+	static uint64_t   printed = 0;
+	const uint64_t    count   = *reinterpret_cast<volatile uint64_t*>(log);
+	if (count == printed) {
+		return;
+	}
+	if (count - printed > 16) {
+		::printf("Game patch: bot rescue log: %llu call(s) not shown (KYTY_ASTRO_RESCUE_LOG)\n",
+		         static_cast<unsigned long long>(count - printed - 16));
+		printed = count - 16;
+	}
+	const auto seconds = std::chrono::duration<double>(Clock::now() - started).count();
+	const auto base    = g_rescue_base.load(std::memory_order_relaxed);
+	const auto* entries = reinterpret_cast<volatile uint64_t*>(log + 8);
+	for (; printed < count; printed++) {
+		const uint64_t entry  = entries[printed & 15];
+		const uint64_t caller = entry & ((uint64_t {1} << 62) - 1);
+		::printf("Game patch: bot rescue log: %s called from game+0x%llx, Decouple was %s, %.1f s "
+		         "(KYTY_ASTRO_RESCUE_LOG)\n",
+		         (entry >> 63) != 0 ? "end  " : "start", static_cast<unsigned long long>(caller - base),
+		         ((entry >> 62) & 1) != 0 ? "on " : "off", seconds);
+	}
+	std::fflush(stdout);
+}
+
 void OnGuestFlip() {
+	PrintRescueLog();
 	const auto gate = g_rescue_gate.load(std::memory_order_relaxed);
 	if (gate == 0) {
 		return;
