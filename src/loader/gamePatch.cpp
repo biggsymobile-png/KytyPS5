@@ -1175,6 +1175,38 @@ void SetUpDecouple(Program* main_program) {
 	} else if (candidates.size() == 1) {
 		call = candidates[0];
 	}
+	// Test build 23b: the code around the frame update's call (from 0x60 before it to 0x90 after,
+	// which covers the frame limiter's call at +0x7d) and the start of the functions it calls next,
+	// for a search by shape in other versions. Instruction bytes only, as a patch file holds.
+	if (call != 0 && version == "01.018.000") {
+		const auto dump = [&](const char* what, uint64_t from, size_t size) {
+			if (!IsInsideProgram(*main_program, from, size)) return;
+			const auto* b = reinterpret_cast<const uint8_t*>(from);
+			for (size_t row = 0; row < size; row += 32) {
+				std::string hex;
+				for (size_t i = row; i < size && i < row + 32; i++) {
+					char text[4];
+					std::snprintf(text, sizeof(text), "%02x", b[i]);
+					hex += text;
+				}
+				::printf("Decouple bytes: %s game+0x%llx: %s (KYTY_DECOUPLE_PROBE)\n", what, off(from + row), hex.c_str());
+			}
+		};
+		dump("call", call - 0x60, 0xf0);
+		const auto* at = reinterpret_cast<const uint8_t*>(call);
+		int shown = 0;
+		for (const auto* after = at + 5; after < at + 0x100 && shown < 3; ++after) {
+			if (*after != 0xe8) continue;
+			const uint64_t target = rel_target(after + 1, 0);
+			if (target == getter || !IsInsideProgram(*main_program, target, 0x80)) continue;
+			char what[32];
+			std::snprintf(what, sizeof(what), "next+0x%llx", static_cast<unsigned long long>(after - at));
+			dump(what, target, 0x80);
+			shown++;
+			after += 4;
+		}
+		std::fflush(stdout);
+	}
 	if (call == 0) {
 		give_up(candidates.empty() ? "the frame update's call was not found"
 		                           : "several calls could be the frame update's");

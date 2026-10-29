@@ -278,6 +278,9 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   stays off for 6 s (15 s before build 22), it is switched back on (the console then shows `Game
   patch: bot rescue fix: Decouple was off ...`). Settings: `"KYTY_ASTRO_RESCUE_TIMEOUT_S": "6",`
   (2 to 600), and `"KYTY_ASTRO_RESCUE_FIX": "0",` to use the patch file's mod as before.
+- **Build 23b (test):** as build 23, plus a few `Decouple bytes:` lines at Astro Bot's start-up
+  (01.018.000 only): the instructions around the game's frame update, for a built-in Decouple that
+  finds them in every version. They change nothing.
 - **New in build 23: Decouple built in, the rescue mod's slow motion gone, gyro re-centre key.**
   - **Decouple built in.** The emulator now finds Astro Bot's timing code itself, in any version
     and region, and lets game time follow the real frame time, with the community v3 mod's
