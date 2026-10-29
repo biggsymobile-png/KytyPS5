@@ -190,7 +190,7 @@ public:
 	int                    vblank_frequency            = 60;
 	// NVIDIA DLSS (Streamline; Astro Bot): frames generated per rendered frame (0 off, 1 = 2x,
 	// 2 = 3x, 3 = 4x; KYTY_FRAMEGEN) and the upscaler in place of the game's TAA (0 the game's,
-	// 1 DLSS, KYTY_DLSS; 2 AMD FSR 3.1, KYTY_FSR). Set in the emulator's environment, over the
+	// 1 DLSS, KYTY_DLSS; 2 AMD FSR 3.1, KYTY_FSR; 3 DLSS 5, KYTY_DLSS+KYTY_DLSS5). Set in the emulator's environment, over the
 	// bundled preset.
 	int                    frame_generation            = 1;
 	int                    upscaler                    = 0;

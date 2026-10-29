@@ -544,7 +544,9 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		                   QString::number(info.frame_generation == 4 ? 1 : info.frame_generation));
 		environment.insert(QStringLiteral("KYTY_FRAMEGEN_BACKEND"),
 		                   info.frame_generation == 4 ? QStringLiteral("fsr") : QStringLiteral("dlss"));
-		environment.insert(QStringLiteral("KYTY_DLSS"), QString::number(info.upscaler == 1 ? 1 : 0));
+		environment.insert(QStringLiteral("KYTY_DLSS"),
+		                   QString::number((info.upscaler == 1 || info.upscaler == 3) ? 1 : 0));
+		environment.insert(QStringLiteral("KYTY_DLSS5"), QString::number(info.upscaler == 3 ? 1 : 0));
 		environment.insert(QStringLiteral("KYTY_FSR"), QString::number(info.upscaler == 2 ? 1 : 0));
 		environment.insert(QStringLiteral("KYTY_FRAMEGEN_FPS_CAP"), QString::number(info.frame_rate_limit));
 		environment.insert(QStringLiteral("KYTY_PRESENT_ABS_VBLANK"),

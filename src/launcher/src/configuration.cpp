@@ -180,8 +180,8 @@ bool Configuration::SetGameSettings(const QJsonObject& imported_settings, QStrin
 	if (frame_generation < 0 || frame_generation > 4) {
 		return fail(tr("Frame generation must be between 0 (off) and 4 (FSR 2x)."));
 	}
-	if (upscaler < 0 || upscaler > 2) {
-		return fail(tr("Upscaler must be 0 (the game's), 1 (DLSS) or 2 (FSR)."));
+	if (upscaler < 0 || upscaler > 3) {
+		return fail(tr("Upscaler must be 0 (the game's), 1 (DLSS), 2 (FSR) or 3 (DLSS 5)."));
 	}
 	if (frame_rate_limit != 0 && (frame_rate_limit < 20 || frame_rate_limit > 240)) {
 		return fail(tr("Frame rate limit must be 0 (off) or between 20 and 240."));

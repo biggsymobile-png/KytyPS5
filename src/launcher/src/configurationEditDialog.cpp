@@ -348,16 +348,18 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->comboBox_frame_generation->addItem(tr("2x (AMD FSR 3.1, any GPU, experimental)"));
 	m_ui->comboBox_frame_generation->setCurrentIndex(std::clamp(info.frame_generation, 0, 4));
 	m_ui->comboBox_upscaler->clear();
-	m_ui->comboBox_upscaler->addItems(
-	    {tr("Game's own (TAA)"), tr("NVIDIA DLSS (RTX)"), tr("AMD FSR 3.1 (any GPU)")});
-	m_ui->comboBox_upscaler->setCurrentIndex(std::clamp(info.upscaler, 0, 2));
+	m_ui->comboBox_upscaler->addItems({tr("Game's own (TAA)"), tr("NVIDIA DLSS (RTX)"),
+	                                   tr("AMD FSR 3.1 (any GPU)"),
+	                                   tr("NVIDIA DLSS 5 (RTX 40 / 50)")});
+	m_ui->comboBox_upscaler->setCurrentIndex(std::clamp(info.upscaler, 0, 3));
 #if !defined(_WIN32)
 	// DLSS needs NVIDIA Streamline (Windows); FSR is built into the Linux and macOS emulator.
 	if (auto* model = qobject_cast<QStandardItemModel*>(m_ui->comboBox_upscaler->model());
-	    model != nullptr && model->item(1) != nullptr) {
-		model->item(1)->setEnabled(false);
+	    model != nullptr) {
+		if (model->item(1) != nullptr) model->item(1)->setEnabled(false);
+		if (model->item(3) != nullptr) model->item(3)->setEnabled(false);
 	}
-	if (info.upscaler == 1) {
+	if (info.upscaler == 1 || info.upscaler == 3) {
 		m_ui->comboBox_upscaler->setCurrentIndex(0);
 	}
 #endif

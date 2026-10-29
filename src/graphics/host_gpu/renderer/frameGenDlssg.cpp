@@ -146,6 +146,7 @@ constexpr uint32_t ViewConstantsBytes = 576; // docs/RE-ASTRO-BOT-FG.md
 
 int  g_generate = 0;     // frames to generate per rendered frame (0 = off)
 bool g_upscale  = false; // KYTY_DLSS: DLSS super resolution in place of the game's TAA
+bool g_dlss5    = false; // KYTY_DLSS5: DLSS 5 Neural Rendering (NGX Feature 18 via dlss5-bridge)
 bool g_fsr      = false; // KYTY_FSR: AMD FSR 3.1 in place of the game's TAA (no Streamline needed)
 std::atomic<bool> g_sr_ready {false}; // DLSS-SR available on the device (OnDevice)
 std::atomic<uint64_t> g_flips {0};    // guest flips seen (PrepareInputs)
@@ -624,11 +625,66 @@ void Initialize() {
 	g_generate        = value != nullptr && value[0] != '\0' ? std::clamp(std::atoi(value), 0, 3) : 1;
 	const char* dlss  = std::getenv("KYTY_DLSS");
 	g_upscale         = dlss != nullptr && dlss[0] != '\0' && dlss[0] != '0';
+	const char* dlss5 = std::getenv("KYTY_DLSS5");
+	g_dlss5           = dlss5 != nullptr && dlss5[0] != '\0' && dlss5[0] != '0';
+	if (g_dlss5) {
+		g_upscale = true; // (DLSS 5 Neural Rendering hooks DLSS-SR's NGX evaluation)
+	}
 	const char* fsr   = std::getenv("KYTY_FSR");
 	g_fsr             = fsr != nullptr && fsr[0] != '\0' && fsr[0] != '0';
 	if (g_fsr) {
 		g_upscale = false; // (one upscaler: FSR, which needs no Streamline)
+		g_dlss5   = false;
 	}
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	{
+		wchar_t exe_buf[MAX_PATH] {};
+		GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+		const auto exe_folder = std::filesystem::path(exe_buf).parent_path();
+		std::error_code ec;
+		if (!g_fsr && (dlss5 == nullptr || dlss5[0] == '\0') &&
+		    std::filesystem::exists(exe_folder / "dlss5-bridge.addon64", ec) &&
+		    std::filesystem::exists(exe_folder / "nvngx_dlssnr.dll", ec)) {
+			g_dlss5   = true;
+			g_upscale = true;
+		}
+		if (g_dlss5) {
+			if (std::filesystem::exists(exe_folder / "ReShade64.json", ec)) {
+				SetEnvironmentVariableW(L"DISABLE_VK_LAYER_reshade_1", L"1");
+				_putenv_s("DISABLE_VK_LAYER_reshade_1", "1");
+			}
+			const auto cfg_path = exe_folder / "dlss5-bridge.cfg";
+			if (!std::filesystem::exists(cfg_path, ec)) {
+				if (FILE* f = _wfopen(cfg_path.c_str(), L"wb"); f != nullptr) {
+					static constexpr char kDefaultCfg[] =
+					    "# dlss5-bridge keep\n"
+					    "vk_mirror=1\n"
+					    "synth=0\n"
+					    "synth_after=0\n"
+					    "ngx_loader=0\n"
+					    "unwrap=0\n";
+					std::fwrite(kDefaultCfg, 1, sizeof(kDefaultCfg) - 1, f);
+					std::fclose(f);
+				}
+			}
+			const auto ini_path = exe_folder / "ReShade.ini";
+			if (!std::filesystem::exists(ini_path, ec)) {
+				if (FILE* f = _wfopen(ini_path.c_str(), L"wb"); f != nullptr) {
+					static constexpr char kDefaultIni[] =
+					    "[ADDON]\n"
+					    "AddonPath=.\\\n\n"
+					    "[RenoDX.DLSS5]\n"
+					    "NeuralUplift=1\n";
+					std::fwrite(kDefaultIni, 1, sizeof(kDefaultIni) - 1, f);
+					std::fclose(f);
+				}
+			}
+			std::printf("DLSS 5 Neural Rendering: enabled (vk_mirror=1; nvngx_dlssnr.dll %s)\n",
+			            std::filesystem::exists(exe_folder / "nvngx_dlssnr.dll", ec) ? "found" : "missing");
+			std::fflush(stdout);
+		}
+	}
+#endif
 	// KYTY_FRAMEGEN_BACKEND=fsr: AMD FSR 3.1 frame generation (2x) in place of DLSS-G.
 	if (const char* backend = std::getenv("KYTY_FRAMEGEN_BACKEND");
 	    backend != nullptr && std::strcmp(backend, "fsr") == 0 && g_generate > 0) {
@@ -679,6 +735,21 @@ void Initialize() {
 		            "SDK's bin\\x64 files in a \"streamline\" folder next to kyty_emulator.exe)\n");
 		std::fflush(stdout);
 		return;
+	}
+	// Disable unused DLSS Ray Reconstruction plugins if copied from the full Streamline SDK bin\x64:
+	// sl.interposer.dll scans all sl.*.dll plugins in pathsToPlugins during slInit, and loading
+	// sl.dlss_d.dll without a ray-reconstruction pipeline can cause VK_ERROR_DEVICE_LOST on present.
+	for (const char* unused_dll: {"sl.dlss_d.dll", "nvngx_dlssd.dll"}) {
+		std::error_code ec;
+		const auto      src = dir / unused_dll;
+		if (std::filesystem::exists(src, ec)) {
+			const auto dst = dir / (std::string(unused_dll) + ".disabled");
+			std::filesystem::rename(src, dst, ec);
+			if (!ec) {
+				std::printf("Frame generation: disabled unused %s in %s\n", unused_dll,
+				            dir.string().c_str());
+			}
+		}
 	}
 	const auto interposer = dir / "sl.interposer.dll";
 	if (!IsNvidiaSigned(interposer.wstring())) {
