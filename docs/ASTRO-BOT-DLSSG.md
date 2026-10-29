@@ -284,9 +284,12 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   made Playroom less smooth than Astro Bot at the same settings; the built-in one smooths it the
   same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
   console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
-  is skipped (its physics and ultrawide mods still apply). Also a few `Decouple bytes:` lines at
-  start-up (01.018.000 and 01.905.000): the instructions around the frame update, for a built-in
-  Decouple that finds them in every version. They change nothing.
+  is skipped (its physics and ultrawide mods still apply).
+- **Build 23c (test): the built-in Decouple finds the game's frame update by its shape**, so it
+  should work in other versions of both games too (the console says `agrees with the known one`
+  on 01.018.000 and 01.905.000; on another version, `built-in one on` or, if it is not sure,
+  `not applied` and the patch file's Decouple as before). Please report your game version and
+  that line.
 - **New in build 23: Decouple built in, the rescue mod's slow motion gone, gyro re-centre key.**
   - **Decouple built in.** The emulator now finds Astro Bot's timing code itself, in any version
     and region, and lets game time follow the real frame time, with the community v3 mod's

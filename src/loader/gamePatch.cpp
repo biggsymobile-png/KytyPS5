@@ -929,8 +929,8 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 // and caps it (KYTY_ASTRO_DECOUPLE_DT_CAP: 20 = 1/20 s, the default; 30 = 1/30 s; 0 = 1/10 s), and
 // the three getters return that. The code is found by its shape, not its address: the getters by
 // their instructions and shared global, the frame update's call among the double getter's callers
-// (01.018: pinned to 0x2a4a2b; other versions: the one caller whose next calls read the same
-// global, the frame limiter). When either is not found exactly once nothing is changed and the
+// by the instructions that use its result (exactly one; 01.018 / 01.905: pinned to the known call,
+// and the log says whether the search agrees). When either is not found exactly once nothing is changed and the
 // patch file's Decouple mod applies as before. When it is applied, the patch file's Decouple mod
 // and the mods that need it are skipped (the console says which). KYTY_DECOUPLE_PROBE=1 also
 // logs every caller.
@@ -1114,23 +1114,16 @@ void SetUpDecouple(Program* main_program) {
 		give_up("the timing values are outside the game");
 		return;
 	}
-	// The double getter's callers; the frame update's is the one whose next calls (within 0x100
-	// bytes) reach a function that reads the step global within its first 0x400 bytes.
-	const auto reads_step = [&](uint64_t function) {
-		if (!IsInsideProgram(*main_program, function, 0x400)) {
-			return false;
-		}
-		const auto* f = reinterpret_cast<const uint8_t*>(function);
-		for (size_t k = 0; k + 4 <= 0x400; k++) {
-			for (size_t tail = 0; tail <= 4; tail++) {
-				const uint64_t target = rel_target(f + k, tail);
-				if (target == denom || target == denom + 8 || target == denom + 0x10) {
-					return true;
-				}
-			}
-		}
-		return false;
-	};
+	// The double getter's callers; the frame update's is the one followed by the game's own use of
+	// the step (01.018 / 01.905 bytes, displacements as wildcards): Astro Bot scales it and folds
+	// it into a running value (vmulsd xmm0, [rip+d]; vmovss xmm1, [rbp+d]; vcvtss2sd xmm1, xmm1),
+	// Playroom passes it to its main update (mov rax, [rbx]; vcvtsd2ss xmm0, xmm0; mov rdi, rbx;
+	// call [rax+0x10]).
+	static const std::vector<int> kAstroAfter = {0xc5, 0xfb, 0x59, 0x05, -1,   -1,   -1,   -1,   0xc5, 0xfa,
+	                                             0x10, 0x8d, -1,   -1,   -1,   -1,   0xc5, 0xf2, 0x5a, 0xc9};
+	static const std::vector<int> kPlayroomAfter = {0x48, 0x8b, 0x03, 0xc5, 0xfb, 0x5a, 0xc0,
+	                                                0x48, 0x89, 0xdf, 0xff, 0x50, 0x10};
+	const auto& after_pattern = playroom ? kPlayroomAfter : kAstroAfter;
 	std::vector<uint64_t> callers;
 	std::vector<uint64_t> candidates;
 	for (const auto& range: code) {
@@ -1139,28 +1132,16 @@ void SetUpDecouple(Program* main_program) {
 				continue;
 			}
 			callers.push_back(reinterpret_cast<uint64_t>(at));
-			bool        limiter = false;
-			std::string next;
-			for (const auto* after = at + 5; after + 5 <= range.end && after < at + 0x100; ++after) {
-				if (*after != 0xe8) continue;
-				const uint64_t target = rel_target(after + 1, 0);
-				if (target == getter || !IsInsideProgram(*main_program, target, 1)) continue;
-				if (reads_step(target)) {
-					limiter = true;
-					char text[48];
-					std::snprintf(text, sizeof(text), " +0x%llx->0x%llx",
-					              static_cast<unsigned long long>(after - at), off(target));
-					next += text;
-				}
-				after += 4;
+			bool matches = at + 5 + after_pattern.size() <= range.end;
+			for (size_t k = 0; matches && k < after_pattern.size(); k++) {
+				matches = after_pattern[k] < 0 || at[5 + k] == after_pattern[k];
 			}
-			if (limiter) {
+			if (matches) {
 				candidates.push_back(reinterpret_cast<uint64_t>(at));
 			}
 			if (verbose) {
-				::printf("Decouple probe: call of game+0x%llx at game+0x%llx%s%s (KYTY_DECOUPLE_PROBE)\n",
-				         off(getter), off(reinterpret_cast<uint64_t>(at)), limiter ? ", then reads the step:" : "",
-				         next.c_str());
+				::printf("Decouple probe: call of game+0x%llx at game+0x%llx%s (KYTY_DECOUPLE_PROBE)\n",
+				         off(getter), off(reinterpret_cast<uint64_t>(at)), matches ? ", the frame update's shape" : "");
 			}
 		}
 	}
@@ -1182,38 +1163,6 @@ void SetUpDecouple(Program* main_program) {
 		         candidates.size());
 	} else if (candidates.size() == 1) {
 		call = candidates[0];
-	}
-	// Test build 23b: the code around the frame update's call (from 0x60 before it to 0x90 after,
-	// which covers the frame limiter's call at +0x7d) and the start of the functions it calls next,
-	// for a search by shape in other versions. Instruction bytes only, as a patch file holds.
-	if (call != 0 && pin != 0) {
-		const auto dump = [&](const char* what, uint64_t from, size_t size) {
-			if (!IsInsideProgram(*main_program, from, size)) return;
-			const auto* b = reinterpret_cast<const uint8_t*>(from);
-			for (size_t row = 0; row < size; row += 32) {
-				std::string hex;
-				for (size_t i = row; i < size && i < row + 32; i++) {
-					char text[4];
-					std::snprintf(text, sizeof(text), "%02x", b[i]);
-					hex += text;
-				}
-				::printf("Decouple bytes: %s game+0x%llx: %s (KYTY_DECOUPLE_PROBE)\n", what, off(from + row), hex.c_str());
-			}
-		};
-		dump("call", call - 0x60, 0xf0);
-		const auto* at = reinterpret_cast<const uint8_t*>(call);
-		int shown = 0;
-		for (const auto* after = at + 5; after < at + 0x100 && shown < 3; ++after) {
-			if (*after != 0xe8) continue;
-			const uint64_t target = rel_target(after + 1, 0);
-			if (target == getter || !IsInsideProgram(*main_program, target, 0x80)) continue;
-			char what[32];
-			std::snprintf(what, sizeof(what), "next+0x%llx", static_cast<unsigned long long>(after - at));
-			dump(what, target, 0x80);
-			shown++;
-			after += 4;
-		}
-		std::fflush(stdout);
 	}
 	if (call == 0) {
 		give_up(candidates.empty() ? "the frame update's call was not found"
