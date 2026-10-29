@@ -80,6 +80,8 @@ std::atomic<uint64_t> g_rescue_state {0};
 std::atomic<uint64_t> g_rescue_marker {0};
 std::atomic<uint64_t> g_rescue_log {0};
 std::atomic<uint64_t> g_rescue_base {0}; // the main program's base: log addresses as offsets
+// The main program's executable segments (host addresses), for the rescue log's call chains.
+std::vector<std::pair<uint64_t, uint64_t>> g_rescue_code;
 
 uint32_t RescueTimeoutSeconds() {
 	const auto* value = std::getenv("KYTY_ASTRO_RESCUE_TIMEOUT_S");
@@ -155,10 +157,12 @@ void PlanRescueFix(Plan* plan) {
 		}
 	}
 	// Data after the code: the marker byte, then the rescue log (a count and 16 entries, each the
-	// caller's return address, bit 62 = Decouple was on, bit 63 = an end call; KYTY_ASTRO_RESCUE_LOG).
-	const uint64_t marker  = cave + 0x100;
-	const uint64_t count   = cave + 0x108;
-	const uint64_t entries = cave + 0x110;
+	// caller's return address, bit 62 = Decouple was on, bit 63 = an end call; KYTY_ASTRO_RESCUE_LOG)
+	// and per entry a snapshot of the 64 stack qwords above that return address (its call chain).
+	const uint64_t marker    = cave + 0x200;
+	const uint64_t count     = cave + 0x208;
+	const uint64_t entries   = cave + 0x210;
+	const uint64_t snapshots = cave + 0x400;
 	for (const uint64_t target: {gate, state, marker, kRescueStart + 6, kRescueEnd + 6}) {
 		if (!FitsRel32(cave, target)) {
 			Log::WriteToConsoleAndLog("Game patch: built-in bot rescue fix not applied (addresses out "
@@ -172,11 +176,22 @@ void PlanRescueFix(Plan* plan) {
 		AppendRel32(&code, cave + code.size() + 4 + tail, target);
 	};
 	const auto log_call = [&](bool end) {
-		code.insert(code.end(), {0x50, 0x51, 0x52, 0x56});       // push rax, rcx, rdx, rsi
+		code.insert(code.end(), {0x50, 0x51, 0x52, 0x56, 0x57}); // push rax, rcx, rdx, rsi, rdi
 		code.insert(code.end(), {0x48, 0x8b, 0x05});             // mov rax, [count]
 		emit_rel(count, 0);
 		code.insert(code.end(), {0x89, 0xc1, 0x83, 0xe1, 0x0f}); // mov ecx, eax; and ecx, 15
-		code.insert(code.end(), {0x48, 0x8b, 0x54, 0x24, 0x20}); // mov rdx, [rsp+0x20] (return address)
+		// the stack above the return address into this entry's snapshot
+		code.insert(code.end(), {0x48, 0x89, 0xcf});             // mov rdi, rcx
+		code.insert(code.end(), {0x48, 0xc1, 0xe7, 0x09});       // shl rdi, 9 (0x200 bytes each)
+		code.insert(code.end(), {0x48, 0x8d, 0x35});             // lea rsi, [snapshots]
+		emit_rel(snapshots, 0);
+		code.insert(code.end(), {0x48, 0x01, 0xf7});             // add rdi, rsi
+		code.insert(code.end(), {0x48, 0x8d, 0x74, 0x24, 0x30}); // lea rsi, [rsp+0x30]
+		code.insert(code.end(), {0x51});                         // push rcx
+		code.insert(code.end(), {0xb9, 0x40, 0x00, 0x00, 0x00}); // mov ecx, 64
+		code.insert(code.end(), {0xfc, 0xf3, 0x48, 0xa5});       // cld; rep movsq
+		code.insert(code.end(), {0x59});                         // pop rcx
+		code.insert(code.end(), {0x48, 0x8b, 0x54, 0x24, 0x28}); // mov rdx, [rsp+0x28] (return address)
 		code.insert(code.end(), {0x80, 0x3d});                   // cmp byte [gate], 0
 		emit_rel(gate, 1);
 		code.push_back(0x00);
@@ -191,7 +206,7 @@ void PlanRescueFix(Plan* plan) {
 		code.insert(code.end(), {0x48, 0xff, 0xc0});             // inc rax
 		code.insert(code.end(), {0x48, 0x89, 0x05});             // mov [count], rax (after the entry)
 		emit_rel(count, 0);
-		code.insert(code.end(), {0x5e, 0x5a, 0x59, 0x58});       // pop rsi, rdx, rcx, rax
+		code.insert(code.end(), {0x5f, 0x5e, 0x5a, 0x59, 0x58}); // pop rdi, rsi, rdx, rcx, rax
 	};
 	// start: if Decouple is on, switch it off and remember doing so
 	const uint64_t start_entry = cave + code.size();
@@ -228,8 +243,8 @@ void PlanRescueFix(Plan* plan) {
 	code.insert(code.end(), std::begin(kPrologue), std::end(kPrologue));
 	code.push_back(0xe9);
 	emit_rel(kRescueEnd + 6, 0);
-	EXIT_IF(code.size() > 0x100);
-	code.resize(0x190, 0x00); // marker, count and log entries
+	EXIT_IF(code.size() > 0x200);
+	code.resize(0x2400, 0x00); // marker, count, log entries and their stack snapshots
 
 	Write cave_write;
 	cave_write.source_address = cave;
@@ -533,6 +548,17 @@ bool ApplyPending(Program* program) {
 		Translate(*program, source_base, g_rescue_plan.state, &state);
 		Translate(*program, source_base, g_rescue_plan.marker, &marker);
 		Translate(*program, source_base, g_rescue_plan.log, &log);
+		g_rescue_code.clear();
+		if (const auto* elf = program->elf.get(); elf != nullptr) {
+			const auto* ehdr = elf->GetEhdr();
+			const auto* phdr = elf->GetPhdr();
+			for (Elf64_Half index = 0; index < ehdr->e_phnum; index++) {
+				if (phdr[index].p_type == PT_LOAD && (phdr[index].p_flags & PF_X) != 0) {
+					const uint64_t begin = program->base_vaddr + phdr[index].p_vaddr;
+					g_rescue_code.emplace_back(begin, begin + phdr[index].p_filesz);
+				}
+			}
+		}
 		g_rescue_base.store(program->base_vaddr);
 		g_rescue_log.store(log);
 		g_rescue_state.store(state);
@@ -1001,6 +1027,22 @@ void ApplyBuiltin(Program* main_program) {
 // KYTY_ASTRO_RESCUE_LOG (default 1; 0 = off): one console line per call of the rescue-start and
 // rescue-end functions the built-in rescue fix hooks, with the caller (an offset in the game) and the
 // time, to tell real rescues from the calls at a level's start (test build 22).
+// A value that points just after a call instruction in the game's code (call rel32, call [rip+d],
+// call reg, call [reg+d8/d32]).
+bool IsGameReturnAddress(uint64_t value) {
+	for (const auto& [begin, end]: g_rescue_code) {
+		if (value < begin + 6 || value >= end) {
+			continue;
+		}
+		const auto* b = reinterpret_cast<const uint8_t*>(value);
+		return b[-5] == 0xe8 || (b[-6] == 0xff && (b[-5] == 0x15 || (b[-5] & 0xf8) == 0x90)) ||
+		       (b[-2] == 0xff && (b[-1] & 0xf8) == 0xd0) ||
+		       (b[-3] == 0x41 && b[-2] == 0xff && (b[-1] & 0xf8) == 0xd0) ||
+		       (b[-3] == 0xff && (b[-2] & 0xf8) == 0x50);
+	}
+	return false;
+}
+
 void PrintRescueLog() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_ASTRO_RESCUE_LOG");
@@ -1032,6 +1074,21 @@ void PrintRescueLog() {
 		         "(KYTY_ASTRO_RESCUE_LOG)\n",
 		         (entry >> 63) != 0 ? "end  " : "start", static_cast<unsigned long long>(caller - base),
 		         ((entry >> 62) & 1) != 0 ? "on " : "off", seconds);
+		// its call chain: the game return addresses in the stack above the caller's
+		const auto* stack = reinterpret_cast<volatile uint64_t*>(log + (0x400 - 0x208) + (printed & 15) * 0x200);
+		std::string chain;
+		int         found = 0;
+		for (int i = 0; i < 64 && found < 10; i++) {
+			const uint64_t value = stack[i];
+			if (IsGameReturnAddress(value)) {
+				char text[32];
+				std::snprintf(text, sizeof(text), " <- 0x%llx", static_cast<unsigned long long>(value - base));
+				chain += text;
+				found++;
+			}
+		}
+		::printf("Game patch: bot rescue log:   chain 0x%llx%s (KYTY_ASTRO_RESCUE_LOG)\n",
+		         static_cast<unsigned long long>(caller - base), chain.c_str());
 	}
 	std::fflush(stdout);
 }

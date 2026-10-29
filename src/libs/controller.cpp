@@ -23,7 +23,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace Libs::Controller {
@@ -180,6 +183,7 @@ private:
 	std::array<float, 3> m_prev_accel {};
 	std::array<float, 3> m_bias_logged {};
 	uint64_t             m_bias_log_us      = 0;
+	std::string          m_bias_key; // the pad's identity in gyro-calibration.txt (empty: not saved)
 	ControllerState  m_state;
 	ControllerState  m_states[STATES_MAX];
 	bool             m_obtained[STATES_MAX] {};
@@ -525,6 +529,69 @@ static bool HostInputOnly() {
 	return enabled;
 }
 
+// KYTY_GYRO_CALIBRATION: learned offsets are kept per pad in gyro-calibration.txt (next to the
+// emulator, the working directory; one line per pad: identity, then x y z in rad/s), so the next
+// session corrects from its first reading instead of only after the pad has rested for a moment.
+// The identity is the pad's serial number, else its vendor and product IDs.
+static std::string GyroPadKey(SDL_JoystickID id) {
+	if (auto* pad = SDL_GetGamepadFromID(id); pad != nullptr) {
+		if (const char* serial = SDL_GetGamepadSerial(pad); serial != nullptr && serial[0] != '\0') {
+			std::string key = serial;
+			for (char& c: key) {
+				if (c == ' ' || c == '\t') c = '_';
+			}
+			return key;
+		}
+		char text[32];
+		std::snprintf(text, sizeof(text), "%04x:%04x", SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad));
+		return text;
+	}
+	return {};
+}
+
+static bool GyroOffsetSaved() { // KYTY_GYRO_CALIBRATION=0 also turns the saved offsets off
+	const char* value = std::getenv("KYTY_GYRO_CALIBRATION");
+	return value == nullptr || value[0] != '0';
+}
+
+static constexpr const char* kGyroCalibrationFile = "gyro-calibration.txt";
+
+static bool LoadGyroOffset(const std::string& key, std::array<float, 3>* bias) {
+	std::ifstream in(kGyroCalibrationFile);
+	std::string   line;
+	while (std::getline(in, line)) {
+		std::istringstream fields(line);
+		std::string        name;
+		std::array<float, 3> value {};
+		if ((fields >> name >> value[0] >> value[1] >> value[2]) && name == key) {
+			for (float v: value) {
+				if (!std::isfinite(v) || std::fabs(v) > 0.2f) return false; // over ~11 degrees/s: not an offset
+			}
+			*bias = value;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void SaveGyroOffset(const std::string& key, const std::array<float, 3>& bias) {
+	std::vector<std::string> lines;
+	{
+		std::ifstream in(kGyroCalibrationFile);
+		std::string   line;
+		while (std::getline(in, line)) {
+			std::istringstream fields(line);
+			std::string        name;
+			if ((fields >> name) && name != key) lines.push_back(line);
+		}
+	}
+	char text[160];
+	std::snprintf(text, sizeof(text), "%s %.7g %.7g %.7g", key.c_str(), bias[0], bias[1], bias[2]);
+	lines.emplace_back(text);
+	std::ofstream out(kGyroCalibrationFile, std::ios::trunc);
+	for (const auto& line: lines) out << line << '\n';
+}
+
 void GameController::SetDevices(int active_id) {
 	Common::LockGuard lock(m_mutex);
 	if (m_active_id == active_id) {
@@ -557,8 +624,24 @@ void GameController::SetDevices(int active_id) {
 	m_emulated_time  = 0;
 	m_emulated_stick = {128, 128};
 	m_up_reference_valid = false;
-	m_gyro_bias          = {}; // another controller: learn its own offset
+	m_gyro_bias          = {}; // another controller: learn its own offset (or load its saved one)
 	m_gyro_bias_valid    = false;
+	m_bias_logged        = {};
+	m_bias_log_us        = 0;
+	m_bias_key.clear();
+	if (active_id != HOST_INPUT_CONTROLLER_ID && active_id != -1 && GyroOffsetSaved()) {
+		m_bias_key = GyroPadKey(static_cast<SDL_JoystickID>(active_id));
+		if (!m_bias_key.empty() && LoadGyroOffset(m_bias_key, &m_gyro_bias)) {
+			constexpr float deg = 57.29578f;
+			m_gyro_bias_valid = true;
+			m_bias_logged     = m_gyro_bias;
+			m_bias_log_us     = 1;
+			::printf("Gyro calibration: saved resting offset %.2f, %.2f, %.2f degrees/s loaded for this "
+			         "controller; still refined during play (KYTY_GYRO_CALIBRATION)\n",
+			         m_gyro_bias[0] * deg, m_gyro_bias[1] * deg, m_gyro_bias[2] * deg);
+			fflush(stdout);
+		}
+	}
 	m_still_since_us     = 0;
 	m_still_for_us       = 0;
 	m_accel_jitter       = 1.0f;
@@ -816,6 +899,9 @@ void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t t
 					fflush(stdout);
 					m_bias_logged = m_gyro_bias;
 					m_bias_log_us = time_us != 0 ? time_us : 1;
+					if (!m_bias_key.empty()) {
+						SaveGyroOffset(m_bias_key, m_gyro_bias);
+					}
 				}
 				for (int i = 0; i < 3; i++) {
 					m_state.gyro[i] = raw[i] - m_gyro_bias[i];

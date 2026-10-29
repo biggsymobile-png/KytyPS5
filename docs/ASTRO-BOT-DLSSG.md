@@ -277,6 +277,14 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   stays off for 6 s (15 s before build 22), it is switched back on (the console then shows `Game
   patch: bot rescue fix: Decouple was off ...`). Settings: `"KYTY_ASTRO_RESCUE_TIMEOUT_S": "6",`
   (2 to 600), and `"KYTY_ASTRO_RESCUE_FIX": "0",` to use the patch file's mod as before.
+- **Build 22b (test): the gyro is centred from the start, and a deeper rescue log.** The gyro
+  calibration only corrected once the pad had rested for a moment, so in the first minutes of a
+  session the view could creep off centre and stay there. The learned offset is now saved per
+  controller in `gyro-calibration.txt` next to the emulator and loaded at the next start (the
+  console shows `Gyro calibration: saved resting offset ... loaded`), and still refined during
+  play. The first session still needs the pad to rest once: put it down for 3 seconds at start-up.
+  The rescue log now also prints each call's chain (`bot rescue log:   chain ...`), to tell a real
+  rescue apart from the level launches and the gameplay moments that use the same hook.
 - **Build 22 (test): shorter slow-down at a level's start, and two logs.** The rescue fix's hook
   also fires at the start of some levels, not only for rescues, so those levels began with up to
   15 s of slow motion; the safety net now steps in after 6 s. To find a proper fix, the console
