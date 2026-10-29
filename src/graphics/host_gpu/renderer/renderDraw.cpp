@@ -4337,6 +4337,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	// Astro's Playroom upscale: its last pass reads the upscaled TAA output (its descriptors written).
+	bool composite_redirected = false;
+	if (FrameGen::UpscaleEnabled() && state.ps_active && bindings.pixel &&
+	    state.ps_input_info.stage.program != nullptr &&
+	    state.ps_input_info.stage.program->shader_hash == FrameGen::CompositePixelShader) {
+		composite_redirected = FrameGen::RedirectComposite(
+		    *bindings.pixel, std::span {state.color_info, state.color_count});
+	}
+
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory. Until BeginRendering() only state commands are recorded through vk_buffer; image
@@ -4379,7 +4388,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("Draw::CommitBindings");
 		const CommitStats::SubScope push_scope(CommitStats::Sub::Push);
-		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages, m_run_active);
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages,
+		               m_run_active && !composite_redirected);
 	}
 	if (run_verify_push) {
 		OwnedCounters::Add(DrawRun::GetTotals().partial_pushes, 1);

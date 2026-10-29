@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/fgDiscovery.h"
+#include "graphics/host_gpu/renderer/frameGenDlssg.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
@@ -116,6 +117,17 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 // whose buffer writes recorded a metadata clear (UpdateComputeMetaClears) still runs, so its guest
 // writes to the metadata memory are kept for readers that reuse it as an ordinary buffer. Off, the
 // recorded clear consumes the dispatch, as before.
+// The chain probe's compute side (FrameGen::ProbeDispatch): the images the dispatch writes.
+static void ProbeChainDispatch(const ShaderStageRuntime& stage, const PreparedBindings& bindings) {
+	if (!stage || stage.program == nullptr) return;
+	const auto& images = stage.program->info.images;
+	uint32_t    written = 0;
+	for (size_t i = 0; i < images.size() && i < 32; i++) {
+		if (images[i].written) written |= 1u << i;
+	}
+	FrameGen::ProbeDispatch(stage.program->shader_hash, bindings, written);
+}
+
 static bool ComputeMetaClearDispatchEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_COMPUTE_META_CLEAR_DISPATCH");
@@ -549,6 +561,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	FgDiscovery::OnDispatch(input_info.stage, bindings, thread_group_x, thread_group_y, thread_group_z, false);
+	ProbeChainDispatch(input_info.stage, bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 
 	PreparedBindings* descriptor_stage = &bindings;
@@ -839,6 +852,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	FgDiscovery::OnDispatch(input_info.stage, bindings, 0, 0, 0, true);
+	ProbeChainDispatch(input_info.stage, bindings);
 	CpGaps::Phase(CpGaps::Cat::DispatchEmit);
 	PreparedBindings* descriptor_stage = &bindings;
 	// Emission safe point (see DispatchDirect).

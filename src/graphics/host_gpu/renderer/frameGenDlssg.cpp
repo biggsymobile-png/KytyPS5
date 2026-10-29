@@ -155,6 +155,99 @@ std::atomic<bool> g_ready {false}; // ... and DLSS-G's functions found (OnDevice
 bool g_device_ok = false;           // DLSS-G supported and loaded on the device (OnDevice)
 std::string g_loader_path;          // Streamline's interposer, UTF-8 (VulkanLoaderPath)
 
+// Astro's Playroom upscale (its TAA output is the render size; KYTY_PLAYROOM_UPSCALE, default on):
+// the last pass's target size (GPU thread, RedirectComposite), and the frame's upscaled TAA output
+// that the last pass reads in place of the game's (UpscaleTaa).
+std::atomic<uint64_t> g_composite_extent {0}; // width << 32 | height
+struct Redirect {
+	uint64_t      address = 0; // the game's TAA output
+	vk::Extent2D  small {};    // its size
+	vk::Extent2D  big {};      // the upscaled image's
+	vk::ImageView view = nullptr;
+	uint64_t      flip = 0;
+};
+Redirect          g_redirect;               // GPU thread
+std::atomic<bool> g_redirect_used {false};  // the last pass read it once (turns the chain probe on)
+
+bool PlayroomUpscaleAllowed() {
+	static const bool allowed = [] {
+		const char* value = std::getenv("KYTY_PLAYROOM_UPSCALE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return allowed;
+}
+
+// Chain probe (test build): from each TAA pass, the passes that read its output, or what those
+// wrote, logged once per new combination ("Chain probe: ..."), up to the last pass. On with
+// KYTY_COMPOSITE_PROBE=1, or once the Playroom upscale is in use. GPU thread.
+std::array<std::atomic<uint64_t>, 16> g_chain {};
+std::atomic<uint32_t>                 g_chain_count {0};
+
+bool ChainProbeOn() {
+	static const bool forced = [] {
+		const char* value = std::getenv("KYTY_COMPOSITE_PROBE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return forced || g_redirect_used.load(std::memory_order_relaxed);
+}
+
+void ChainStep(uint64_t hash, bool compute, const PreparedBindings* bindings,
+               std::span<const RenderColorInfo> colors, uint32_t written_mask, bool taa) {
+	if (taa) {
+		const uint64_t address = colors.empty() ? 0 : colors[0].desc.info.data.address;
+		g_chain_count.store(0, std::memory_order_relaxed);
+		if (address != 0) {
+			g_chain[0].store(address, std::memory_order_relaxed);
+			g_chain_count.store(1, std::memory_order_relaxed);
+		}
+		return;
+	}
+	const uint32_t count = g_chain_count.load(std::memory_order_relaxed);
+	if (count == 0 || bindings == nullptr) return;
+	const auto tracked = [&](uint64_t address) {
+		if (address == 0) return false;
+		for (uint32_t i = 0; i < count; i++) {
+			if (g_chain[i].load(std::memory_order_relaxed) == address) return true;
+		}
+		return false;
+	};
+	bool reads = false;
+	for (size_t i = 0; i < bindings->images.size() && !reads; i++) {
+		if (i < 32 && (written_mask & (1u << i)) != 0) continue;
+		reads = tracked(bindings->images[i].desc.info.data.address);
+	}
+	if (!reads) return;
+	std::string line = fmt::format("Chain probe: {} {:016x}", compute ? "dispatch CS" : "draw PS", hash);
+	std::vector<uint64_t> outputs;
+	for (size_t i = 0; i < bindings->images.size() && i < 8; i++) {
+		const auto& info    = bindings->images[i].desc.info;
+		const bool  written = i < 32 && (written_mask & (1u << i)) != 0;
+		line += fmt::format("; {} {} {}x{} {} at 0x{:x}{}", written ? "writes image" : "image", i,
+		                    info.extent.width, info.extent.height, vk::to_string(info.pixel_format),
+		                    info.data.address, tracked(info.data.address) ? " (chain)" : "");
+		if (written) outputs.push_back(info.data.address);
+	}
+	for (size_t i = 0; i < colors.size() && i < 4; i++) {
+		const auto& info = colors[i].desc.info;
+		line += fmt::format("; target {} {}x{} {} at 0x{:x}", i, info.extent.width, info.extent.height,
+		                    vk::to_string(info.pixel_format), info.data.address);
+		outputs.push_back(info.data.address);
+	}
+	uint32_t n = count;
+	for (const auto address: outputs) {
+		if (n >= g_chain.size() || address == 0 || tracked(address)) continue;
+		g_chain[n++].store(address, std::memory_order_relaxed);
+	}
+	g_chain_count.store(n, std::memory_order_relaxed);
+	static std::mutex               mutex;
+	static std::vector<std::string> seen;
+	std::lock_guard lock(mutex);
+	if (seen.size() >= 32 || std::find(seen.begin(), seen.end(), line) != seen.end()) return;
+	seen.push_back(line);
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
+}
+
 // GPU thread: what the current guest frame has drawn so far.
 struct Gathered {
 	Camera   camera;                         // from a G-buffer draw's per-view constants
@@ -970,6 +1063,7 @@ void OnDevice(vk::PhysicalDevice physical_device) {
 void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
                std::span<const RenderColorInfo> colors) {
 	const bool composite = pixel_shader == CompositePixelShader;
+	if (ChainProbeOn()) ChainStep(pixel_shader, false, pixel, colors, 0, IsTaaPixelShader(pixel_shader));
 	if (!composite && !IsTaaPixelShader(pixel_shader)) return;
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_COMPOSITE_PROBE");
@@ -998,6 +1092,11 @@ void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
 	seen.push_back(line);
 	std::printf("%s (KYTY_COMPOSITE_PROBE)\n", line.c_str());
 	std::fflush(stdout);
+}
+
+void ProbeDispatch(uint64_t compute_shader, const PreparedBindings& bindings, uint32_t written_mask) {
+	if (!ChainProbeOn()) return;
+	ChainStep(compute_shader, true, &bindings, {}, written_mask, false);
 }
 
 void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
@@ -1749,12 +1848,24 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		return a.backing.extent.width == b.backing.extent.width &&
 		       a.backing.extent.height == b.backing.extent.height;
 	};
+	// Astro's Playroom: its TAA output is the render size and its last pass draws at the output
+	// size (noted at last frame's last pass): the upscaler writes an image of that size, which the
+	// last pass reads in place of the TAA output (RedirectComposite); the game's two TAA outputs
+	// get scaled copies.
+	const uint64_t composite_packed = g_composite_extent.load(std::memory_order_relaxed);
+	const vk::Extent2D composite {static_cast<uint32_t>(composite_packed >> 32),
+	                              static_cast<uint32_t>(composite_packed & 0xffffffffu)};
+	const bool redirect = PlayroomUpscaleAllowed() && out0.backing.image != nullptr &&
+	                      color.backing.image != nullptr && same_extent(color, out0) &&
+	                      composite.width > out0.backing.extent.width &&
+	                      composite.height > out0.backing.extent.height;
 	if (color.backing.image == nullptr || motion.backing.image == nullptr ||
 	    depth.backing.image == nullptr || out0.backing.image == nullptr ||
 	    out1.backing.image == nullptr || color.info.data.address != color_address ||
 	    motion.info.data.address != motion_address ||
 	    depth.info.data.address != gathered.depth_address || !IsDepthFormat(depth.backing.format) ||
-	    !same_extent(color, motion) || !same_extent(color, depth) || !same_extent(out0, out1) ||
+	    !same_extent(color, motion) || !same_extent(color, depth) ||
+	    (!redirect && !same_extent(out0, out1)) ||
 	    out0.backing.format != out1.backing.format || &out0 == &out1 ||
 	    color.backing.extent.width > out0.backing.extent.width ||
 	    color.backing.extent.height > out0.backing.extent.height) {
@@ -1771,7 +1882,8 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		return false;
 	}
 	const vk::Extent2D in {color.backing.extent.width, color.backing.extent.height};
-	const vk::Extent2D out {out0.backing.extent.width, out0.backing.extent.height};
+	const vk::Extent2D out = redirect ? composite
+	                                  : vk::Extent2D {out0.backing.extent.width, out0.backing.extent.height};
 	if (!ConfigureOutput(graphics, out, out0.backing.format)) {
 		g_sr.disabled = true;
 		return false;
@@ -1947,13 +2059,39 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	for (auto* target: {&out0, &out1}) {
 		target->Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
 		                vk_command);
-		vk::ImageCopy copy {};
-		copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-		copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-		copy.extent         = vk::Extent3D {out.width, out.height, 1};
-		vk_command.copyImage(g_sr.output.image, vk::ImageLayout::eTransferSrcOptimal,
-		                     target->backing.image, vk::ImageLayout::eTransferDstOptimal, copy);
+		const auto& size = target->backing.extent;
+		if (size.width == out.width && size.height == out.height) {
+			vk::ImageCopy copy {};
+			copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			copy.extent         = vk::Extent3D {out.width, out.height, 1};
+			vk_command.copyImage(g_sr.output.image, vk::ImageLayout::eTransferSrcOptimal,
+			                     target->backing.image, vk::ImageLayout::eTransferDstOptimal, copy);
+		} else {
+			// (Playroom: the game's render-size TAA output, and its history at either size.)
+			vk::ImageBlit blit {};
+			blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(out.width), static_cast<int32_t>(out.height), 1};
+			blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(size.width), static_cast<int32_t>(size.height), 1};
+			vk_command.blitImage(g_sr.output.image, vk::ImageLayout::eTransferSrcOptimal,
+			                     target->backing.image, vk::ImageLayout::eTransferDstOptimal, blit,
+			                     vk::Filter::eLinear);
+		}
 		target->NoteContentWrite();
+	}
+	if (redirect) {
+		// Sampled by the last pass (RedirectComposite) until the next frame's upscale.
+		Transition(vk_command, g_sr.output, vk::ImageAspectFlagBits::eColor,
+		           vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead,
+		           vk::PipelineStageFlagBits2::eAllCommands);
+		g_redirect.address = out0.info.data.address;
+		g_redirect.small   = vk::Extent2D {out0.backing.extent.width, out0.backing.extent.height};
+		g_redirect.big     = out;
+		g_redirect.view    = g_sr.output_view;
+		g_redirect.flip    = flip;
+	} else {
+		g_redirect.address = 0;
 	}
 	// The jitter's spread over the last status interval: a still camera jitter (0) means the
 	// upscaler has no sub-pixel samples to accumulate.
@@ -1983,6 +2121,48 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	(void)command;
 	(void)pixel;
 	(void)user_data;
+	(void)colors;
+	return false;
+#endif
+}
+
+bool RedirectComposite(PreparedBindings& pixel, std::span<const RenderColorInfo> colors) {
+#ifdef KYTY_UPSCALER_CODE
+	if (!g_sr_ready.load(std::memory_order_relaxed) || g_sr.disabled || !PlayroomUpscaleAllowed()) {
+		return false;
+	}
+	if (!colors.empty() && colors[0].image_id) {
+		const auto& extent = colors[0].desc.info.extent;
+		g_composite_extent.store((static_cast<uint64_t>(extent.width) << 32) | extent.height,
+		                         std::memory_order_relaxed);
+	}
+	const auto& r    = g_redirect;
+	const uint64_t flip = g_flips.load(std::memory_order_relaxed);
+	if (r.address == 0 || r.view == nullptr || r.view != g_sr.output_view || flip > r.flip + 1) {
+		return false;
+	}
+	bool changed = false;
+	for (auto& image: pixel.images) {
+		const auto& info = image.desc.info;
+		if (info.data.address != r.address || info.extent.width != r.small.width ||
+		    info.extent.height != r.small.height || !image.mip_views.empty() ||
+		    image.desc.type == TextureCache::BindingType::Storage) {
+			continue;
+		}
+		image.image_view      = r.view;
+		image.external_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+		changed               = true;
+	}
+	if (changed && !g_redirect_used.exchange(true, std::memory_order_relaxed)) {
+		std::printf("%s: the last pass reads the %ux%u upscaled image in place of the game's %ux%u "
+		            "TAA output (KYTY_PLAYROOM_UPSCALE)\n",
+		            g_fsr ? "FSR upscaling" : "DLSS upscaling", r.big.width, r.big.height,
+		            r.small.width, r.small.height);
+		std::fflush(stdout);
+	}
+	return changed;
+#else
+	(void)pixel;
 	(void)colors;
 	return false;
 #endif

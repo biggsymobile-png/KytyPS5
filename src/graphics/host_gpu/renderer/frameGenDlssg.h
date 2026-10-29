@@ -107,6 +107,16 @@ void OnDevice(vk::PhysicalDevice physical_device);
 constexpr uint64_t CompositePixelShader = 0x67008a703cf06422ull;
 void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
                std::span<const RenderColorInfo> colors);
+// The chain probe's compute side (test build): a dispatch's images, bit i of `written_mask` set
+// for an image it writes. GPU thread, every dispatch after its images are rebound.
+void ProbeDispatch(uint64_t compute_shader, const PreparedBindings& bindings, uint32_t written_mask);
+
+// Astro's Playroom upscale (its TAA output is the render size; KYTY_PLAYROOM_UPSCALE=0: off): at
+// the last pass's draw (CompositePixelShader), after its bindings are prepared. Notes the last
+// pass's target size (UpscaleTaa upscales to it from the next frame on), and points the binding
+// of the game's TAA output at this frame's upscaled image. True: a binding was changed (its image
+// descriptors must be written, not kept from an earlier draw).
+[[nodiscard]] bool RedirectComposite(PreparedBindings& pixel, std::span<const RenderColorInfo> colors);
 
 // GPU thread, every draw after its bindings are prepared (while Enabled()).
 void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,

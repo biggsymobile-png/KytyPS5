@@ -2221,6 +2221,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto acquire_view = [&](uint32_t i) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
+		binding.external_layout = vk::ImageLayout::eUndefined;
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			EXIT_IF(resource.mip_count == 0u ||
@@ -2768,6 +2769,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer, true);
 			}
 			binding.layout = image.backing.state.layout;
+			if (binding.external_layout != vk::ImageLayout::eUndefined) {
+				binding.layout = binding.external_layout; // (FrameGen::RedirectComposite)
+			}
 		}
 
 		transitions_scope.Stop();

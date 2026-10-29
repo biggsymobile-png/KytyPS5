@@ -32,6 +32,10 @@ struct TextureBinding {
 	// TextureBindingMemo entry (slot, unique tag) whose description `desc` equals; tag 0: none.
 	uint64_t                   memo_tag  = 0;
 	uint32_t                   memo_slot = 0;
+	// Astro's Playroom upscale (FrameGen::RedirectComposite): image_view is the upscaler's own
+	// image, in this layout, in place of image_id's (eUndefined: none). Reset when the view is
+	// acquired again.
+	vk::ImageLayout            external_layout = vk::ImageLayout::eUndefined;
 };
 
 struct PreparedBindings {

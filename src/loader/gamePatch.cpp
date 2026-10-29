@@ -736,11 +736,23 @@ void ApplyPlayroomRenderResolution(Program* main_program, const std::string& ver
 		for (const char* p = list; *p != '\0'; ++p) {
 			if (*p >= '1' && *p <= '5') keep[*p - '1'] = true;
 		}
+	} else {
+		// DLSS or FSR upscaling on (KYTY_PLAYROOM_UPSCALE not 0): group 2 keeps the output size, for
+		// the HUD layer (and the TAA history, which the upscaler replaces); the upscaler writes the
+		// output-size image the last pass reads (FrameGen::RedirectComposite).
+		const auto on = [](const char* name) {
+			const char* value = std::getenv(name);
+			return value != nullptr && value[0] == '1';
+		};
+		const char* upscale = std::getenv("KYTY_PLAYROOM_UPSCALE");
+		if ((on("KYTY_DLSS") || on("KYTY_FSR")) && (upscale == nullptr || upscale[0] != '0')) {
+			keep[1] = true;
+		}
 	}
 	for (size_t g = 0; g < found.size(); ++g) {
 		if (g < 5 && keep[g]) {
 			::printf("Game patch: Astro's Playroom render resolution: group %zu kept at the game's own sizes "
-			         "(KYTY_PLAYROOM_RES_KEEP)\n",
+			         "(KYTY_PLAYROOM_RES_KEEP, or DLSS/FSR upscaling)\n",
 			         g + 1);
 			continue;
 		}

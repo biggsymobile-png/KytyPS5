@@ -285,6 +285,15 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
   console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
   is skipped (its physics and ultrawide mods still apply).
+- **Build 23e (test): real DLSS/FSR upscaling in Astro's Playroom, first step.** With DLSS or FSR
+  upscaling on and a lower render resolution, Playroom renders the 3D scene at that resolution,
+  and DLSS/FSR now upscales it to the full output size, as in Astro Bot (before, DLSS only cleaned
+  up the low-resolution image and the game stretched it). The HUD stays at full size, so it is
+  sharp. In this build that works on the title screen and menus; in gameplay the game runs one
+  more effect pass after its TAA, which the console logs as `Chain probe:` lines so the next build
+  can carry the upscaled image through it. The console shows `the last pass reads the ...
+  upscaled image`. `"KYTY_PLAYROOM_UPSCALE": "0",` turns it off. Remove any
+  `KYTY_PLAYROOM_RES_KEEP` line from `u59-preset.json` for this build.
 - **Build 23d (test): finding Playroom's render size groups, for real upscaling.** The render
   resolution changes five groups of sizes in Playroom; some size the 3D scene, others probably its
   TAA outputs and HUD, which should keep their full size so that DLSS/FSR upscales for real and the
