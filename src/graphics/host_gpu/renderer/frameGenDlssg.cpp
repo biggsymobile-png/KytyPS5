@@ -628,7 +628,8 @@ void Initialize() {
 	const char* dlss5 = std::getenv("KYTY_DLSS5");
 	g_dlss5           = dlss5 != nullptr && dlss5[0] != '\0' && dlss5[0] != '0';
 	if (g_dlss5) {
-		g_upscale = true; // (DLSS 5 Neural Rendering hooks DLSS-SR's NGX evaluation)
+		g_upscale  = true; // (DLSS 5 Neural Rendering hooks DLSS-SR's NGX evaluation)
+		g_generate = 0;    // (ReShade VK_LAYER_reshad6 swapchain interposer conflicts with sl.dlss_g.dll)
 	}
 	const char* fsr   = std::getenv("KYTY_FSR");
 	g_fsr             = fsr != nullptr && fsr[0] != '\0' && fsr[0] != '0';
@@ -642,12 +643,6 @@ void Initialize() {
 		GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
 		const auto exe_folder = std::filesystem::path(exe_buf).parent_path();
 		std::error_code ec;
-		if (!g_fsr && (dlss5 == nullptr || dlss5[0] == '\0') &&
-		    std::filesystem::exists(exe_folder / "dlss5-bridge.addon64", ec) &&
-		    std::filesystem::exists(exe_folder / "nvngx_dlssnr.dll", ec)) {
-			g_dlss5   = true;
-			g_upscale = true;
-		}
 		if (g_dlss5) {
 			if (std::filesystem::exists(exe_folder / "ReShade64.json", ec)) {
 				SetEnvironmentVariableW(L"DISABLE_VK_LAYER_reshade_1", L"1");

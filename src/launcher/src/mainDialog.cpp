@@ -539,9 +539,11 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		// DLSS frame generation and upscaling (Graphics settings), over the bundled preset's
 		// values, which the launcher put in its own environment at start.
 		auto environment = QProcessEnvironment::systemEnvironment();
-		// (4: AMD FSR 3.1 2x, KYTY_FRAMEGEN_BACKEND=fsr.)
+		// (4: AMD FSR 3.1 2x, KYTY_FRAMEGEN_BACKEND=fsr; 3 in upscaler: DLSS 5 disables FG interposer)
 		environment.insert(QStringLiteral("KYTY_FRAMEGEN"),
-		                   QString::number(info.frame_generation == 4 ? 1 : info.frame_generation));
+		                   QString::number(info.upscaler == 3
+		                                       ? 0
+		                                       : (info.frame_generation == 4 ? 1 : info.frame_generation)));
 		environment.insert(QStringLiteral("KYTY_FRAMEGEN_BACKEND"),
 		                   info.frame_generation == 4 ? QStringLiteral("fsr") : QStringLiteral("dlss"));
 		environment.insert(QStringLiteral("KYTY_DLSS"),
