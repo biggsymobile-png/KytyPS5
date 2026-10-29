@@ -161,7 +161,7 @@ std::string g_loader_path;          // Streamline's interposer, UTF-8 (VulkanLoa
 std::atomic<uint64_t> g_composite_extent {0}; // width << 32 | height
 struct Redirect {
 	uint64_t      address = 0; // the game's TAA output
-	vk::Extent2D  small {};    // its size
+	vk::Extent2D  small_extent {};    // its size
 	vk::Extent2D  big {};      // the upscaled image's
 	vk::ImageView view = nullptr;
 	uint64_t      flip = 0;
@@ -2086,7 +2086,7 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		           vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead,
 		           vk::PipelineStageFlagBits2::eAllCommands);
 		g_redirect.address = out0.info.data.address;
-		g_redirect.small   = vk::Extent2D {out0.backing.extent.width, out0.backing.extent.height};
+		g_redirect.small_extent   = vk::Extent2D {out0.backing.extent.width, out0.backing.extent.height};
 		g_redirect.big     = out;
 		g_redirect.view    = g_sr.output_view;
 		g_redirect.flip    = flip;
@@ -2144,8 +2144,8 @@ bool RedirectComposite(PreparedBindings& pixel, std::span<const RenderColorInfo>
 	bool changed = false;
 	for (auto& image: pixel.images) {
 		const auto& info = image.desc.info;
-		if (info.data.address != r.address || info.extent.width != r.small.width ||
-		    info.extent.height != r.small.height || !image.mip_views.empty() ||
+		if (info.data.address != r.address || info.extent.width != r.small_extent.width ||
+		    info.extent.height != r.small_extent.height || !image.mip_views.empty() ||
 		    image.desc.type == TextureCache::BindingType::Storage) {
 			continue;
 		}
@@ -2157,7 +2157,7 @@ bool RedirectComposite(PreparedBindings& pixel, std::span<const RenderColorInfo>
 		std::printf("%s: the last pass reads the %ux%u upscaled image in place of the game's %ux%u "
 		            "TAA output (KYTY_PLAYROOM_UPSCALE)\n",
 		            g_fsr ? "FSR upscaling" : "DLSS upscaling", r.big.width, r.big.height,
-		            r.small.width, r.small.height);
+		            r.small_extent.width, r.small_extent.height);
 		std::fflush(stdout);
 	}
 	return changed;
