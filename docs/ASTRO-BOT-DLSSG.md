@@ -204,6 +204,13 @@ version 01.905). One difference: Playroom's TAA runs at the render resolution an
 its own does the upscale, so DLSS and FSR work there as **anti-aliasing at the render resolution
 (DLAA / native AA)**, not as the upscaler. The console's lines are the same as for Astro Bot.
 
+**Work in progress: real upscaling in Playroom.** The plan is to upscale Playroom's scene just before
+its last pass, so that the game's own HUD is drawn sharp over it. The idea of a late upscale in
+Playroom comes from [iska0702/DLSSKytyPS5](https://github.com/iska0702/DLSSKytyPS5). This build only
+adds a probe that changes nothing on screen. In Playroom it prints up to 24 console lines starting
+`Composite probe:`, listing the image and target sizes and formats of the TAA pass and of the last
+pass. `KYTY_COMPOSITE_PROBE=0` turns it off.
+
 **Playroom runs at double speed with a Vblank frequency above 60** unless a "Decouple gameplay
 timers from render FPS" patch is applied (its game logic steps once per frame). Keep Playroom's
 **Vblank frequency at 60** (launcher: the game's settings, Graphics & display; frontends:
