@@ -285,6 +285,11 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
   console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
   is skipped (its physics and ultrawide mods still apply).
+- **Build 23d (test): finding Playroom's render size groups, for real upscaling.** The render
+  resolution changes five groups of sizes in Playroom; some size the 3D scene, others probably its
+  TAA outputs and HUD, which should keep their full size so that DLSS/FSR upscales for real and the
+  HUD stays sharp. `"KYTY_PLAYROOM_RES_KEEP": "3",` (in `u59-preset.json`) keeps group 3 at the
+  game's own sizes, and so on for 1 to 5, and logs `Composite probe:` lines. Testers only.
 - **Build 23c (test): the built-in Decouple finds the game's frame update by its shape**, so it
   should work in other versions of both games too (the console says `agrees with the known one`
   on 01.018.000 and 01.905.000; on another version, `built-in one on` or, if it is not sure,

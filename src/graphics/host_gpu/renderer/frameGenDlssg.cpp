@@ -973,7 +973,8 @@ void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
 	if (!composite && !IsTaaPixelShader(pixel_shader)) return;
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_COMPOSITE_PROBE");
-		return value != nullptr && value[0] == '1';
+		// (also on for the Playroom render resolution test, KYTY_PLAYROOM_RES_KEEP)
+		return (value != nullptr && value[0] == '1') || std::getenv("KYTY_PLAYROOM_RES_KEEP") != nullptr;
 	}();
 	if (!enabled) return;
 	static std::mutex                mutex;

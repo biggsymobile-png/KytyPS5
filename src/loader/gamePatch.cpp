@@ -728,7 +728,22 @@ void ApplyPlayroomRenderResolution(Program* main_program, const std::string& ver
 		}
 		found.push_back(hit);
 	}
+	// KYTY_PLAYROOM_RES_KEEP=<groups, e.g. "3" or "3,4"> (test build 23d): those groups (1-5, in
+	// kGroups' order) keep the game's own sizes, to find which ones size the scene and which its
+	// TAA outputs and HUD layer (the composite probe logs them; KYTY_COMPOSITE_PROBE turns on too).
+	bool keep[5] = {};
+	if (const char* list = std::getenv("KYTY_PLAYROOM_RES_KEEP"); list != nullptr) {
+		for (const char* p = list; *p != '\0'; ++p) {
+			if (*p >= '1' && *p <= '5') keep[*p - '1'] = true;
+		}
+	}
 	for (size_t g = 0; g < found.size(); ++g) {
+		if (g < 5 && keep[g]) {
+			::printf("Game patch: Astro's Playroom render resolution: group %zu kept at the game's own sizes "
+			         "(KYTY_PLAYROOM_RES_KEEP)\n",
+			         g + 1);
+			continue;
+		}
 		for (const auto& immediate: kGroups[g].immediates) {
 			uint8_t* const at    = found[g] + immediate.offset;
 			const uint32_t value = immediate.dim == Dim::Width ? width : static_cast<uint32_t>(height);
