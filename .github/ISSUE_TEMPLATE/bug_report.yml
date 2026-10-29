@@ -1,0 +1,73 @@
+name: Bug report
+description: Something wrong in Astro Bot or Astro's Playroom with this build (crash, slow motion, graphics, controller, ...)
+title: "[Build NN] short description"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! One problem per report, please. The console log is the most useful part: it is the text window that opens with the emulator.
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      description: The release you are using.
+      placeholder: astrobot-dlss-int21-23
+    validations:
+      required: true
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game
+      options:
+        - ASTRO BOT (PPSA21564, US)
+        - ASTRO BOT (PPSA21567, EU)
+        - Astro's Playroom (PPSA01325)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: game_version
+    attributes:
+      label: Game version
+      description: Shown in the launcher's game list or at the top of the console log (APP_VER).
+      placeholder: "01.018.000"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: GPU, driver and operating system
+      placeholder: RTX 5080, NVIDIA 617.42, Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings
+      description: The launcher's Graphics & display settings, and which mods are ticked in your patch file (if you use one).
+      placeholder: |
+        Vblank 40, DLSS-G 2x, DLSS upscaling, render resolution 1368p, frame rate limit 80,
+        Present mode Immediate, Smooth frame pacing on
+        Patch file mods: ...
+    validations:
+      required: true
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: What you saw, what you expected, and where in the game (level, moment).
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      description: If you know. "Happens every time I ..." helps a lot.
+  - type: textarea
+    id: log
+    attributes:
+      label: Console log
+      description: Attach the whole log as a .txt file (drag it into this box), or paste the lines from around the problem. For a crash, the last lines matter most.
+    validations:
+      required: true
