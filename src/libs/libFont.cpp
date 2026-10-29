@@ -799,9 +799,9 @@ struct CjkFallbackFace {
 // Resolved once, on the first glyph that needs it. The font file is memory-mapped rather than
 // read, so that first lookup on a guest thread does not stall on a ~20 MB file read; only the
 // pages stb_truetype touches are faulted in.
-static const CjkFallbackFace& cjk_fallback_face() {
-	static const CjkFallbackFace face = [] {
-		CjkFallbackFace result;
+static const std::vector<CjkFallbackFace>& cjk_fallback_faces() {
+	static const std::vector<CjkFallbackFace> faces = [] {
+		std::vector<CjkFallbackFace> result;
 		for (const auto& path: Common::FindCjkFontFiles()) {
 			const auto data = Common::MapFileReadOnly(path);
 			if (data.empty()) {
@@ -809,21 +809,22 @@ static const CjkFallbackFace& cjk_fallback_face() {
 			}
 			// A rejected file stays mapped (address space only, nothing is read); this happens at
 			// most once per candidate for the whole process.
-			if (!init_stb_info(&result.info, data.data(), static_cast<uint32_t>(data.size()))) {
+			CjkFallbackFace face;
+			if (!init_stb_info(&face.info, data.data(), static_cast<uint32_t>(data.size()))) {
 				continue;
 			}
-			result.data = data;
-			result.ok   = true;
+			face.data = data;
+			face.ok   = true;
 			LOGF("[Font] CJK fallback font: %s\n", path.string().c_str());
-			break;
+			result.push_back(face);
 		}
-		if (!result.ok) {
+		if (result.empty()) {
 			LOGF("[Font] no CJK fallback font found, CJK text will render as '?' "
 			     "(set KYTY_CJK_FONT to a .ttf/.ttc/.otf file)\n");
 		}
 		return result;
 	}();
-	return face;
+	return faces;
 }
 
 static void init_font_face(FontState* font) {
@@ -844,8 +845,8 @@ static void init_font_face(FontState* font) {
 		return;
 	}
 
-	if (const auto& cjk = cjk_fallback_face(); cjk.ok) {
-		(void)init_stb_font(font, cjk.data.data(), static_cast<uint32_t>(cjk.data.size()));
+	if (const auto& cjk = cjk_fallback_faces(); !cjk.empty()) {
+		(void)init_stb_font(font, cjk.front().data.data(), static_cast<uint32_t>(cjk.front().data.size()));
 	}
 }
 
@@ -884,9 +885,10 @@ static StbGlyphFace resolve_stb_glyph(FontState* font, uint32_t code) {
 	}
 
 	if (code <= 0x10ffffu && code >= 0x80u) {
-		if (const auto& cjk = cjk_fallback_face();
-		    cjk.ok && stbtt_FindGlyphIndex(&cjk.info, static_cast<int>(code)) != 0) {
-			return {&cjk.info, code, stbtt_ScaleForPixelHeight(&cjk.info, pixel_height)};
+		for (const auto& cjk: cjk_fallback_faces()) {
+			if (cjk.ok && stbtt_FindGlyphIndex(&cjk.info, static_cast<int>(code)) != 0) {
+				return {&cjk.info, code, stbtt_ScaleForPixelHeight(&cjk.info, pixel_height)};
+			}
 		}
 	}
 

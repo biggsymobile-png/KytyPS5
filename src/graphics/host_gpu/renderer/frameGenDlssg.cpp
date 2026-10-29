@@ -853,7 +853,7 @@ std::string RefusedDeviceAdvice() {
 
 void AddDeviceExtensions(const std::vector<vk::ExtensionProperties>& available,
                          std::vector<const char*>&                   extensions) {
-	if (g_fsr) {
+	if (g_fsr || g_fsr_fg) {
 		// FSR's runtime looks these up under their extension names (vkGetBufferMemoryRequirements2KHR)
 		// when the GPU offers dedicated allocations, and calls them unchecked: the extensions,
 		// promoted to Vulkan 1.1, are enabled so the names exist on the device.
