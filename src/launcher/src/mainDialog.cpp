@@ -559,6 +559,8 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		} else {
 			environment.remove(QStringLiteral("KYTY_ASTRO_RENDER_RES"));
 		}
+		environment.insert(QStringLiteral("KYTY_GYRO_RECENTER_KEY"),
+		                   QString::fromLatin1(Configuration::GyroRecenterKeyName(info.gyro_recenter_key)));
 		process->setProcessEnvironment(environment);
 	}
 #if defined(_WIN32)

@@ -1356,6 +1356,17 @@ void CycleKeyboardPlayer() {
 	}
 }
 
+void RecenterGyro() {
+	for (const auto& player: g_players) {
+		if (player != nullptr) {
+			player->ResetOrientation();
+		}
+	}
+	::printf("Gyro: re-centred; how the controller is held now is its neutral position "
+	         "(KYTY_GYRO_RECENTER_KEY)\n");
+	fflush(stdout);
+}
+
 void SetButton(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {

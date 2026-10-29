@@ -508,11 +508,33 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 	}
 }
 
+// KYTY_GYRO_RECENTER_KEY=<key name> (the launcher's "Gyro re-centre key"; default F9; "off" or
+// empty: none): re-centres the controllers' orientation (Controller::RecenterGyro).
+static SDL_Keycode GyroRecenterKey() {
+	static const SDL_Keycode key = [] {
+		const char* value = std::getenv("KYTY_GYRO_RECENTER_KEY");
+		if (value == nullptr) {
+			return SDLK_F9;
+		}
+		if (value[0] == '\0' || std::strcmp(value, "off") == 0 || std::strcmp(value, "0") == 0) {
+			return SDLK_UNKNOWN;
+		}
+		return SDL_GetKeyFromName(value);
+	}();
+	return key;
+}
+
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
 	if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) {
 		const bool pressed = event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0;
+		if (const auto recenter = GyroRecenterKey(); recenter != SDLK_UNKNOWN && event->key.key == recenter) {
+			if (pressed) {
+				Controller::RecenterGyro();
+			}
+			return;
+		}
 		switch (event->key.key) {
 			case SDLK_F7:
 				if (pressed) {

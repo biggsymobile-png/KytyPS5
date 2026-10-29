@@ -973,7 +973,7 @@ void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
 	if (!composite && !IsTaaPixelShader(pixel_shader)) return;
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_COMPOSITE_PROBE");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	if (!enabled) return;
 	static std::mutex                mutex;

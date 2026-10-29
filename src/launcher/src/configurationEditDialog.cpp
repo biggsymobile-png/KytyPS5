@@ -361,6 +361,13 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 		m_ui->comboBox_upscaler->setCurrentIndex(0);
 	}
 #endif
+	m_ui->comboBox_gyro_recenter_key->clear();
+	for (int index = 0; index < 8; index++) {
+		m_ui->comboBox_gyro_recenter_key->addItem(
+		    index == 0 ? tr("Off") : QString::fromLatin1(Configuration::GyroRecenterKeyName(index)), index);
+	}
+	m_ui->comboBox_gyro_recenter_key->setCurrentIndex(std::max(
+	    m_ui->comboBox_gyro_recenter_key->findData(std::clamp(info.gyro_recenter_key, 0, 7)), 0));
 	m_ui->comboBox_render_resolution->clear();
 	// Shown smallest to largest; each item carries the saved value (render_resolution), whose
 	// numbering stays as it was (5 = 720p and 6 = 540p were added later), so saved choices keep.
@@ -598,6 +605,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.frame_generation          = std::max(ui.comboBox_frame_generation->currentIndex(), 0);
 	info.upscaler                  = std::max(ui.comboBox_upscaler->currentIndex(), 0);
 	info.render_resolution         = std::clamp(ui.comboBox_render_resolution->currentData().toInt(), 0, 6);
+	info.gyro_recenter_key         = std::clamp(ui.comboBox_gyro_recenter_key->currentData().toInt(), 0, 7);
 	info.smooth_frame_pacing       = ui.checkBox_smooth_frame_pacing->isChecked();
 	info.relaxed_shader_maths      = ui.checkBox_relaxed_shader_maths->isChecked();
 	info.frame_rate_limit =

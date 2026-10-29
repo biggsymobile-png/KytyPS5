@@ -1,5 +1,6 @@
 #include "loader/gamePatch.h"
 
+#include "common/abi.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -50,7 +51,7 @@ using Json = nlohmann::json;
 std::unique_ptr<Plan> g_pending_plan;
 std::vector<uint64_t> g_applied_cave_pages;
 
-// KYTY_ASTRO_RESCUE_FIX (default 1; 0 = off): Astro Bot 01.018.000 with a "Decouple gameplay timers
+// KYTY_ASTRO_RESCUE_FIX (default 0 since build 23, see LoadPlan; 1 = on): Astro Bot 01.018.000 with a "Decouple gameplay timers
 // from render FPS" patch. The community "[Fix] Bot rescue plays with the game's own 60 fps timing"
 // mod switches Decouple off when the game calls the rescue-start function (0x5074e20) and back on
 // only in the rescue-end function (0x5077e60). Some levels (Pumpkin Peril) call the start without
@@ -74,6 +75,25 @@ struct RescueFix {
 	uint64_t log     = 0; // the rescue log's count; its entries follow it
 };
 RescueFix g_rescue_plan;
+
+// The built-in Decouple (SetUpDecouple), when on.
+struct DecoupleState {
+	bool     active  = false;
+	uint64_t base    = 0;
+	uint64_t gate    = 0; // target addresses (guest)
+	uint64_t last_us = 0;
+	uint64_t dt      = 0;
+	uint64_t numer   = 0; // the game's own step: [numer] / [denom]
+	uint64_t denom   = 0;
+	uint64_t getter  = 0; // the getters and the frame update's call, for skipping conflicting mods
+	uint64_t ticks   = 0;
+	uint64_t single  = 0;
+	uint64_t call    = 0;
+	double   prev_raw = 0.0;
+	int64_t  counter  = 0;
+	double   cap      = 1.0 / 20.0;
+};
+DecoupleState g_decouple;
 // Armed after the writes (target addresses); read by the flip watchdog.
 std::atomic<uint64_t> g_rescue_gate {0};
 std::atomic<uint64_t> g_rescue_state {0};
@@ -89,9 +109,9 @@ uint32_t RescueTimeoutSeconds() {
 	return static_cast<uint32_t>(std::clamp(s, 2, 600));
 }
 
-bool RescueFixEnabled() {
+bool RescueFixEnabled() { // (default off since build 23)
 	const auto* value = std::getenv("KYTY_ASTRO_RESCUE_FIX");
-	return value == nullptr || value[0] != '0';
+	return value != nullptr && value[0] == '1';
 }
 
 void AppendRel32(std::vector<uint8_t>* code, uint64_t next_ip, uint64_t target) {
@@ -136,13 +156,21 @@ void PlanRescueFix(Plan* plan) {
 			getter = &write;
 		}
 	}
-	if (getter == nullptr) {
-		return; // no Decouple mod applied: nothing to switch, no fix needed
+	uint64_t gate  = 0;
+	uint64_t state = 0;
+	if (g_decouple.active) {
+		// the built-in Decouple's on/off byte and last frame time (source addresses: base 0)
+		gate  = g_decouple.gate - g_decouple.base;
+		state = g_decouple.last_us - g_decouple.base;
+	} else {
+		if (getter == nullptr) {
+			return; // no Decouple mod applied: nothing to switch, no fix needed
+		}
+		int32_t rel = 0;
+		std::memcpy(&rel, &getter->on[2], sizeof(rel));
+		gate  = kDecoupleGetter + 7 + static_cast<int64_t>(rel);
+		state = gate - 0x68; // Decouple's last frame timestamp (both known variants)
 	}
-	int32_t rel = 0;
-	std::memcpy(&rel, &getter->on[2], sizeof(rel));
-	const uint64_t gate  = kDecoupleGetter + 7 + static_cast<int64_t>(rel);
-	const uint64_t state = gate - 0x68; // Decouple's last frame timestamp (both known variants)
 	// A code-cave page no other write uses.
 	uint64_t cave = 0x12008000;
 	for (bool clash = true; clash;) {
@@ -312,17 +340,51 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 		}
 	}
 
+	const bool astro          = plan->title_id == "PPSA21564" || plan->title_id == "PPSA21567";
 	const bool rescue_builtin = plan->title_id == "PPSA21564" && plan->version == "01.018.000" &&
 	                            RescueFixEnabled();
+	// With the built-in Decouple on (SetUpDecouple): a mod that writes to the code it changed
+	// (the getters, the frame update's call) or that names Decouple, or needs it, is skipped.
+	const auto touches_decouple = [&](const Json& mod) {
+		if (!g_decouple.active || !mod.contains("memory")) return false;
+		const uint64_t base = g_decouple.base;
+		for (const auto& entry: mod["memory"]) {
+			if (!entry.contains("offset") || !entry["offset"].is_string()) continue;
+			const uint64_t at = base + std::stoull(entry["offset"].get<std::string>(), nullptr, 16);
+			for (const uint64_t hook: {g_decouple.getter, g_decouple.ticks, g_decouple.single, g_decouple.call}) {
+				if (at + 0x20 > hook && at < hook + 0x20) return true;
+			}
+		}
+		return false;
+	};
 	size_t mod_index = 0;
 	for (const auto& mod: root["mods"]) {
 		const auto decision = selection.decisions[mod_index++];
-		if (rescue_builtin && mod.contains("name") && mod["name"].is_string() &&
-		    mod["name"].get<std::string>().find(kRescueModName) != std::string::npos) {
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Game patch: mod {} (bot rescue fix) superseded by the built-in one, with a {} s "
-			    "safety timeout (KYTY_ASTRO_RESCUE_FIX)\n",
-			    mod_index, RescueTimeoutSeconds()));
+		const std::string mod_name = mod.contains("name") && mod["name"].is_string() ? mod["name"].get<std::string>() : "";
+		if (astro && mod_name.find(kRescueModName) != std::string::npos) {
+			if (rescue_builtin) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Game patch: mod {} (bot rescue fix) superseded by the built-in one, with a {} s "
+				    "safety timeout (KYTY_ASTRO_RESCUE_FIX=1)\n",
+				    mod_index, RescueTimeoutSeconds()));
+			} else {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Game patch: mod {} (bot rescue fix) skipped: its hooks mark entering and leaving a "
+				    "level, not rescues, and slowed the game down; KYTY_ASTRO_RESCUE_FIX=1 uses the "
+				    "built-in one instead\n",
+				    mod_index));
+			}
+			continue;
+		}
+		if (astro && g_decouple.active &&
+		    (mod_name.find("Decouple gameplay timers") != std::string::npos ||
+		     mod_name.find("needs Decouple") != std::string::npos || touches_decouple(mod))) {
+			if (decision == ModDecision::Apply) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Game patch: mod {} \"{}\" skipped: the built-in Decouple replaces it "
+				    "(KYTY_ASTRO_DECOUPLE)\n",
+				    mod_index, mod_name));
+			}
 			continue;
 		}
 		if (decision != ModDecision::Apply) {
@@ -856,19 +918,112 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 	         version.c_str());
 }
 
-// KYTY_DECOUPLE_PROBE (default 1; 0 = off): Astro Bot (PPSA21564 / PPSA21567), any version, before
-// any patch is applied. Looks for the game's three fixed-step getters that the community "Decouple
-// gameplay timers from render FPS" mod hooks (01.018.000: 0x3520, 0x3530, 0x3550): dt as a double
-// "vmovsd xmm0, [rip+A]; vdivsd xmm0, [rip+B]; ret" (1.0 / target fps), with "mov rax, [rip+B+0x10];
-// ret" (dt in microseconds) and "vmovss xmm0, [rip+B+8]; ret" (dt as a float) within 0x40 bytes.
-// Logs each such cluster, then every direct call of the double getter with the next calls after
-// it (01.018: the frame update's call at 0x2a4a2b, then the frame-limiter sleep at 0x2a4aa8 ->
-// 0x1370). Changes nothing; for a built-in Decouple that finds its hooks in any version.
-void ProbeDecouple(Program* main_program) {
-	if (main_program == nullptr || main_program->elf == nullptr || main_program->elf->IsShared()) {
-		return;
+// The built-in Decouple (KYTY_ASTRO_DECOUPLE, default 1; 0 = the patch file's mod as before):
+// Astro Bot (PPSA21564 / PPSA21567), any version. The game advances by a fixed 1/60 s per frame
+// (three small getters return it as a double, a float and microseconds: 1.0 / target fps, at
+// 0x3530, 0x3550 and 0x3520 in 01.018.000), so below 60 fps it runs slow. As the community
+// "Decouple gameplay timers from render FPS" mod (v3) does, the frame update's call of the double
+// getter (01.018: 0x2a4a2b) then measures the real frame time, smooths it (v3's rules: follows a
+// lasting change after two frames, else eases 10% per frame, steps at most 1.5x the current one)
+// and caps it (KYTY_ASTRO_DECOUPLE_DT_CAP: 20 = 1/20 s, the default; 30 = 1/30 s; 0 = 1/10 s), and
+// the three getters return that. The code is found by its shape, not its address: the getters by
+// their instructions and shared global, the frame update's call among the double getter's callers
+// (01.018: pinned to 0x2a4a2b; other versions: the one caller whose next calls read the same
+// global, the frame limiter). When either is not found exactly once nothing is changed and the
+// patch file's Decouple mod applies as before. When it is applied, the patch file's Decouple mod
+// and the mods that need it are skipped (the console says which). KYTY_DECOUPLE_PROBE=1 also
+// logs every caller.
+namespace {
+
+
+constexpr uint8_t kDecoupleSave[] = {
+	    0x9c, 0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x48, 0x81,
+	    0xec, 0xe8, 0x01, 0x00, 0x00, 0xc5, 0xfe, 0x7f, 0x0c, 0x24, 0xc5, 0xfe, 0x7f, 0x54, 0x24, 0x20,
+	    0xc5, 0xfe, 0x7f, 0x5c, 0x24, 0x40, 0xc5, 0xfe, 0x7f, 0x64, 0x24, 0x60, 0xc5, 0xfe, 0x7f, 0xac,
+	    0x24, 0x80, 0x00, 0x00, 0x00, 0xc5, 0xfe, 0x7f, 0xb4, 0x24, 0xa0, 0x00, 0x00, 0x00, 0xc5, 0xfe,
+	    0x7f, 0xbc, 0x24, 0xc0, 0x00, 0x00, 0x00, 0xc5, 0x7e, 0x7f, 0x84, 0x24, 0xe0, 0x00, 0x00, 0x00,
+	    0xc5, 0x7e, 0x7f, 0x8c, 0x24, 0x00, 0x01, 0x00, 0x00, 0xc5, 0x7e, 0x7f, 0x94, 0x24, 0x20, 0x01,
+	    0x00, 0x00, 0xc5, 0x7e, 0x7f, 0x9c, 0x24, 0x40, 0x01, 0x00, 0x00, 0xc5, 0x7e, 0x7f, 0xa4, 0x24,
+	    0x60, 0x01, 0x00, 0x00, 0xc5, 0x7e, 0x7f, 0xac, 0x24, 0x80, 0x01, 0x00, 0x00, 0xc5, 0x7e, 0x7f,
+	    0xb4, 0x24, 0xa0, 0x01, 0x00, 0x00, 0xc5, 0x7e, 0x7f, 0xbc, 0x24, 0xc0, 0x01, 0x00, 0x00,
+};
+constexpr uint8_t kDecoupleRestore[] = { // (ends with popfq; ret)
+	    0xc5, 0xfe, 0x6f, 0x0c, 0x24, 0xc5, 0xfe, 0x6f, 0x54, 0x24, 0x20, 0xc5, 0xfe, 0x6f, 0x5c, 0x24,
+	    0x40, 0xc5, 0xfe, 0x6f, 0x64, 0x24, 0x60, 0xc5, 0xfe, 0x6f, 0xac, 0x24, 0x80, 0x00, 0x00, 0x00,
+	    0xc5, 0xfe, 0x6f, 0xb4, 0x24, 0xa0, 0x00, 0x00, 0x00, 0xc5, 0xfe, 0x6f, 0xbc, 0x24, 0xc0, 0x00,
+	    0x00, 0x00, 0xc5, 0x7e, 0x6f, 0x84, 0x24, 0xe0, 0x00, 0x00, 0x00, 0xc5, 0x7e, 0x6f, 0x8c, 0x24,
+	    0x00, 0x01, 0x00, 0x00, 0xc5, 0x7e, 0x6f, 0x94, 0x24, 0x20, 0x01, 0x00, 0x00, 0xc5, 0x7e, 0x6f,
+	    0x9c, 0x24, 0x40, 0x01, 0x00, 0x00, 0xc5, 0x7e, 0x6f, 0xa4, 0x24, 0x60, 0x01, 0x00, 0x00, 0xc5,
+	    0x7e, 0x6f, 0xac, 0x24, 0x80, 0x01, 0x00, 0x00, 0xc5, 0x7e, 0x6f, 0xb4, 0x24, 0xa0, 0x01, 0x00,
+	    0x00, 0xc5, 0x7e, 0x6f, 0xbc, 0x24, 0xc0, 0x01, 0x00, 0x00, 0x48, 0x81, 0xc4, 0xe8, 0x01, 0x00,
+	    0x00, 0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58, 0x9d, 0xc3,
+};
+
+uint64_t DecoupleNowUs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count()) +
+	       1;
+}
+
+// Called by the game's frame update (through the cave's stub) in place of its fixed-step getter.
+KYTY_SYSV_ABI double DecoupleUpdate() {
+	auto&      d     = g_decouple;
+	auto*      gate  = reinterpret_cast<volatile uint8_t*>(d.gate);
+	auto*      last  = reinterpret_cast<volatile uint64_t*>(d.last_us);
+	auto*      dt_d  = reinterpret_cast<volatile double*>(d.dt);
+	auto*      dt_f  = reinterpret_cast<volatile float*>(d.dt + 8);
+	auto*      dt_us = reinterpret_cast<volatile int64_t*>(d.dt + 16);
+	if (*gate != 0) { // switched off (KYTY_ASTRO_RESCUE_FIX): the game's own step
+		*last = 0;
+		return *reinterpret_cast<const double*>(d.numer) / *reinterpret_cast<const double*>(d.denom);
 	}
-	if (const char* value = std::getenv("KYTY_DECOUPLE_PROBE"); value != nullptr && value[0] == '0') {
+	const uint64_t now  = DecoupleNowUs();
+	const uint64_t then = *last;
+	*last               = now;
+	double         dt   = *dt_d;
+	if (then != 0 && now > then) {
+		const double raw  = static_cast<double>(now - then) * 0.000001;
+		const double prev = d.prev_raw;
+		d.prev_raw        = raw;
+		bool         jump = false;
+		if (raw > dt * 1.25) {
+			d.counter = d.counter > 0 ? d.counter + 1 : 1;
+			if (d.counter >= 2) {
+				dt   = std::min(raw, prev);
+				jump = true;
+			}
+		} else if (raw < dt * 0.8) {
+			d.counter = d.counter < 0 ? d.counter - 1 : -1;
+			if (d.counter <= -2) {
+				dt   = std::max(raw, prev);
+				jump = true;
+			}
+		} else {
+			d.counter = 0;
+		}
+		if (jump) {
+			dt        = std::min(std::max(dt, 0.0001), 0.1);
+			d.counter = 0;
+		} else {
+			const double step = std::max(std::min(raw, dt * 1.5), 0.0001);
+			dt += (step - dt) * 0.1;
+		}
+	} else {
+		d.counter = 0;
+	}
+	dt     = std::min(dt, d.cap);
+	*dt_d  = dt;
+	*dt_f  = static_cast<float>(dt);
+	*dt_us = static_cast<int64_t>(dt * 1000000.0 + 0.5);
+	return dt;
+}
+
+} // namespace
+
+void SetUpDecouple(Program* main_program) {
+	g_decouple = {};
+	if (main_program == nullptr || main_program->elf == nullptr || main_program->elf->IsShared()) {
 		return;
 	}
 	std::string title_id;
@@ -878,18 +1033,27 @@ void ProbeDecouple(Program* main_program) {
 	    (title_id != "PPSA21564" && title_id != "PPSA21567")) {
 		return;
 	}
+	if (const char* value = std::getenv("KYTY_ASTRO_DECOUPLE"); value != nullptr && value[0] == '0') {
+		::printf("Decouple: built-in one off; the patch file's Decouple mod applies if enabled "
+		         "(KYTY_ASTRO_DECOUPLE)\n");
+		return;
+	}
+	const bool verbose = [] {
+		const char* value = std::getenv("KYTY_DECOUPLE_PROBE");
+		return value != nullptr && value[0] == '1';
+	}();
 	const auto  base = main_program->base_vaddr;
 	const auto* ehdr = main_program->elf->GetEhdr();
 	const auto* phdr = main_program->elf->GetPhdr();
 	struct Range {
-		const uint8_t* begin;
-		const uint8_t* end;
+		uint8_t* begin;
+		uint8_t* end;
 	};
 	std::vector<Range> code;
 	for (Elf64_Half index = 0; index < ehdr->e_phnum; index++) {
 		const auto& segment = phdr[index];
 		if (segment.p_type == PT_LOAD && (segment.p_flags & PF_X) != 0 && segment.p_filesz >= 32) {
-			const auto* begin = reinterpret_cast<const uint8_t*>(base + segment.p_vaddr);
+			auto* begin = reinterpret_cast<uint8_t*>(base + segment.p_vaddr);
 			code.push_back({begin, begin + segment.p_filesz});
 		}
 	}
@@ -899,76 +1063,250 @@ void ProbeDecouple(Program* main_program) {
 		return reinterpret_cast<uint64_t>(rel_at) + 4 + tail + static_cast<int64_t>(rel);
 	};
 	const auto off = [&](uint64_t address) { return static_cast<unsigned long long>(address - base); };
+	const auto give_up = [&](const char* why) {
+		::printf("Decouple: built-in one not applied (%s, Astro Bot %s %s); the patch file's Decouple "
+		         "mod applies if enabled (KYTY_ASTRO_DECOUPLE)\n",
+		         why, title_id.c_str(), version.c_str());
+	};
+	// The getters: "vmovsd xmm0, [A]; vdivsd xmm0, [B]; ret" with "mov rax, [B+0x10]; ret" and
+	// "vmovss xmm0, [B+8]; ret" within 0x40 bytes.
 	static constexpr uint8_t kDouble[] = {0xc5, 0xfb, 0x10, 0x05};
 	static constexpr uint8_t kDivide[] = {0xc5, 0xfb, 0x5e, 0x05};
-	uint32_t                 doubles   = 0;
-	std::vector<uint64_t>    getters;
+	uint32_t found = 0;
+	uint64_t getter = 0, ticks = 0, single = 0, numer = 0, denom = 0;
 	for (const auto& range: code) {
 		for (const auto* at = range.begin; at + 17 <= range.end; ++at) {
 			if (std::memcmp(at, kDouble, 4) != 0 || std::memcmp(at + 8, kDivide, 4) != 0 || at[16] != 0xc3) {
 				continue;
 			}
-			doubles++;
 			const uint64_t global = rel_target(at + 12, 0);
-			bool           ticks  = false;
-			bool           single = false;
-			const auto*    from   = std::max(range.begin, at - 0x40);
-			const auto*    to     = std::min(range.end - 9, at + 0x40);
+			uint64_t       t = 0, f = 0;
+			const auto*    from = std::max<const uint8_t*>(range.begin, at - 0x40);
+			const auto*    to   = std::min<const uint8_t*>(range.end - 9, at + 0x40);
 			for (const auto* near = from; near <= to; ++near) {
 				if (near[0] == 0x48 && near[1] == 0x8b && near[2] == 0x05 && near[7] == 0xc3 &&
 				    rel_target(near + 3, 0) == global + 0x10) {
-					ticks = true;
+					t = reinterpret_cast<uint64_t>(near);
 				}
 				if (near[0] == 0xc5 && near[1] == 0xfa && near[2] == 0x10 && near[3] == 0x05 &&
 				    near[8] == 0xc3 && rel_target(near + 4, 0) == global + 8) {
-					single = true;
+					f = reinterpret_cast<uint64_t>(near);
 				}
 			}
-			if (ticks && single) {
-				getters.push_back(reinterpret_cast<uint64_t>(at));
-				const double fps = IsInsideProgram(*main_program, global, 8)
-				                       ? *reinterpret_cast<const double*>(global)
-				                       : 0.0;
-				::printf("Decouple probe: Astro Bot %s %s: getters at game+0x%llx, step global "
-				         "game+0x%llx (now %g) (KYTY_DECOUPLE_PROBE)\n",
-				         title_id.c_str(), version.c_str(), off(reinterpret_cast<uint64_t>(at)), off(global), fps);
+			if (t != 0 && f != 0) {
+				found++;
+				getter = reinterpret_cast<uint64_t>(at);
+				ticks  = t;
+				single = f;
+				numer  = rel_target(at + 4, 0);
+				denom  = global;
 			}
 		}
 	}
-	::printf("Decouple probe: %u double getter(s), %zu with both siblings (want 1) (KYTY_DECOUPLE_PROBE)\n",
-	         doubles, getters.size());
-	for (const uint64_t getter: getters) {
-		uint32_t callers = 0;
-		for (const auto& range: code) {
-			for (const auto* at = range.begin; at + 5 <= range.end; ++at) {
-				if (at[0] != 0xe8 || rel_target(at + 1, 0) != getter) {
-					continue;
+	if (found != 1) {
+		give_up(found == 0 ? "its timing code was not found" : "its timing code was found more than once");
+		return;
+	}
+	if (!IsInsideProgram(*main_program, numer, 8) || !IsInsideProgram(*main_program, denom, 0x18)) {
+		give_up("the timing values are outside the game");
+		return;
+	}
+	// The double getter's callers; the frame update's is the one whose next calls (within 0x100
+	// bytes) reach a function that reads the step global within its first 0x400 bytes.
+	const auto reads_step = [&](uint64_t function) {
+		if (!IsInsideProgram(*main_program, function, 0x400)) {
+			return false;
+		}
+		const auto* f = reinterpret_cast<const uint8_t*>(function);
+		for (size_t k = 0; k + 4 <= 0x400; k++) {
+			for (size_t tail = 0; tail <= 4; tail++) {
+				const uint64_t target = rel_target(f + k, tail);
+				if (target == denom || target == denom + 8 || target == denom + 0x10) {
+					return true;
 				}
-				if (++callers > 24) {
-					continue;
-				}
-				std::string next;
-				int         found = 0;
-				for (const auto* after = at + 5; after + 5 <= range.end && after < at + 0x100 && found < 3; ++after) {
-					if (*after == 0xe8) {
-						const uint64_t target = rel_target(after + 1, 0);
-						if (IsInsideProgram(*main_program, target, 1)) {
-							char text[48];
-							std::snprintf(text, sizeof(text), " +0x%llx->0x%llx",
-							              static_cast<unsigned long long>(after - at),
-							              static_cast<unsigned long long>(target - base));
-							next += text;
-							found++;
-							after += 4;
-						}
-					}
-				}
-				::printf("Decouple probe: call of game+0x%llx at game+0x%llx, next calls:%s (KYTY_DECOUPLE_PROBE)\n",
-				         off(getter), off(reinterpret_cast<uint64_t>(at)), next.c_str());
 			}
 		}
-		::printf("Decouple probe: %u direct call(s) of game+0x%llx (KYTY_DECOUPLE_PROBE)\n", callers, off(getter));
+		return false;
+	};
+	std::vector<uint64_t> callers;
+	std::vector<uint64_t> candidates;
+	for (const auto& range: code) {
+		for (const auto* at = range.begin; at + 5 <= range.end; ++at) {
+			if (at[0] != 0xe8 || rel_target(at + 1, 0) != getter) {
+				continue;
+			}
+			callers.push_back(reinterpret_cast<uint64_t>(at));
+			bool        limiter = false;
+			std::string next;
+			for (const auto* after = at + 5; after + 5 <= range.end && after < at + 0x100; ++after) {
+				if (*after != 0xe8) continue;
+				const uint64_t target = rel_target(after + 1, 0);
+				if (target == getter || !IsInsideProgram(*main_program, target, 1)) continue;
+				if (reads_step(target)) {
+					limiter = true;
+					char text[48];
+					std::snprintf(text, sizeof(text), " +0x%llx->0x%llx",
+					              static_cast<unsigned long long>(after - at), off(target));
+					next += text;
+				}
+				after += 4;
+			}
+			if (limiter) {
+				candidates.push_back(reinterpret_cast<uint64_t>(at));
+			}
+			if (verbose) {
+				::printf("Decouple probe: call of game+0x%llx at game+0x%llx%s%s (KYTY_DECOUPLE_PROBE)\n",
+				         off(getter), off(reinterpret_cast<uint64_t>(at)), limiter ? ", then reads the step:" : "",
+				         next.c_str());
+			}
+		}
 	}
+	uint64_t call = 0;
+	if (version == "01.018.000") {
+		// Pinned: the frame update's call, as the community mod hooks it.
+		const uint64_t pinned = base + 0x2a4a2b;
+		if (std::find(callers.begin(), callers.end(), pinned) != callers.end()) {
+			call = pinned;
+		}
+		const bool agree = candidates.size() == 1 && candidates[0] == pinned;
+		::printf("Decouple: the search for the frame update's call %s on 01.018.000 (%zu candidate(s)) "
+		         "(KYTY_ASTRO_DECOUPLE)\n",
+		         agree ? "agrees with the known one" : "does not agree with the known one", candidates.size());
+	} else if (candidates.size() == 1) {
+		call = candidates[0];
+	}
+	if (call == 0) {
+		give_up(candidates.empty() ? "the frame update's call was not found"
+		                           : "several calls could be the frame update's");
+		return;
+	}
+	const char* cap_text = "1/20 s";
+	double      cap      = 1.0 / 20.0;
+	if (const char* value = std::getenv("KYTY_ASTRO_DECOUPLE_DT_CAP"); value != nullptr) {
+		const int n = std::atoi(value);
+		if (n == 30) {
+			cap      = 1.0 / 30.0;
+			cap_text = "1/30 s";
+		} else if (n == 0) {
+			cap      = 0.1;
+			cap_text = "1/10 s";
+		}
+	}
+	// A code-cave page within reach of the game's code and data.
+	uint64_t cave = 0;
+	for (uint64_t offset = 0x12100000; offset < 0x12100000 + 64 * kPageSize; offset += kPageSize) {
+		const uint64_t page = base + offset;
+		if (!FitsRel32(page, getter) || !FitsRel32(page, numer) || !FitsRel32(page, denom) ||
+		    !FitsRel32(page + kPageSize, call)) {
+			break;
+		}
+		const auto allocated = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    page, kPageSize, Common::VirtualMemory::Mode::ExecuteReadWrite, "astro_decouple", true);
+		if (allocated == page) {
+			cave = page;
+			break;
+		}
+		if (allocated != 0) {
+			Libs::LibKernel::Memory::FreeGuestMemory(allocated, kPageSize);
+		}
+	}
+	if (cave == 0) {
+		give_up("no room for its code");
+		return;
+	}
+	// Cave: +0x000 the frame update's stub, +0x200 the getters, +0x800 data: dt (double, float,
+	// microseconds), the last frame's time, the on/off byte (0 on), the update function.
+	const uint64_t data    = cave + 0x800;
+	const uint64_t gate    = data + 0x20;
+	const uint64_t fn_ptr  = data + 0x28;
+	std::vector<uint8_t> out;
+	const auto emit_rel = [&](uint64_t target, uint64_t tail) {
+		AppendRel32(&out, cave + out.size() + 4 + tail, target);
+	};
+	out.insert(out.end(), std::begin(kDecoupleSave), std::end(kDecoupleSave));
+	out.insert(out.end(), {0x48, 0x8b, 0x05}); // mov rax, [fn_ptr]
+	emit_rel(fn_ptr, 0);
+	out.insert(out.end(), {0xff, 0xd0}); // call rax (returns dt in xmm0)
+	out.insert(out.end(), std::begin(kDecoupleRestore), std::end(kDecoupleRestore));
+	EXIT_IF(out.size() > 0x200);
+	out.resize(0x200, 0xcc);
+	// double getter
+	const uint64_t get_double = cave + out.size();
+	out.insert(out.end(), {0x80, 0x3d});
+	emit_rel(gate, 1);
+	out.push_back(0x00);
+	out.insert(out.end(), {0x75, 0x09, 0xc5, 0xfb, 0x10, 0x05});
+	emit_rel(data, 0);
+	out.push_back(0xc3);
+	out.insert(out.end(), {0xc5, 0xfb, 0x10, 0x05});
+	emit_rel(numer, 0);
+	out.insert(out.end(), {0xc5, 0xfb, 0x5e, 0x05});
+	emit_rel(denom, 0);
+	out.push_back(0xc3);
+	// microseconds getter
+	const uint64_t get_ticks = cave + out.size();
+	out.insert(out.end(), {0x80, 0x3d});
+	emit_rel(gate, 1);
+	out.push_back(0x00);
+	out.insert(out.end(), {0x75, 0x08, 0x48, 0x8b, 0x05});
+	emit_rel(data + 16, 0);
+	out.push_back(0xc3);
+	out.insert(out.end(), {0x48, 0x8b, 0x05});
+	emit_rel(denom + 0x10, 0);
+	out.push_back(0xc3);
+	// float getter
+	const uint64_t get_single = cave + out.size();
+	out.insert(out.end(), {0x80, 0x3d});
+	emit_rel(gate, 1);
+	out.push_back(0x00);
+	out.insert(out.end(), {0x75, 0x09, 0xc5, 0xfa, 0x10, 0x05});
+	emit_rel(data + 8, 0);
+	out.push_back(0xc3);
+	out.insert(out.end(), {0xc5, 0xfa, 0x10, 0x05});
+	emit_rel(denom + 8, 0);
+	out.push_back(0xc3);
+	EXIT_IF(out.size() > 0x800);
+	std::memcpy(reinterpret_cast<void*>(cave), out.data(), out.size());
+	// data: the game's own step to start with
+	const double step = *reinterpret_cast<const double*>(numer) / *reinterpret_cast<const double*>(denom);
+	const double start = std::isfinite(step) && step > 0.0 && step <= 0.1 ? step : 1.0 / 60.0;
+	*reinterpret_cast<double*>(data)        = start;
+	*reinterpret_cast<float*>(data + 8)     = static_cast<float>(start);
+	*reinterpret_cast<int64_t*>(data + 16)  = static_cast<int64_t>(start * 1000000.0 + 0.5);
+	*reinterpret_cast<uint64_t*>(data + 24) = 0;
+	*reinterpret_cast<uint8_t*>(gate)       = 0;
+	*reinterpret_cast<uint64_t*>(fn_ptr)    = reinterpret_cast<uint64_t>(&DecoupleUpdate);
+	// the game's code: the getters jump to the cave's, the frame update calls the stub
+	for (const auto& [from, to]: {std::pair {getter, get_double}, std::pair {ticks, get_ticks},
+	                              std::pair {single, get_single}}) {
+		std::vector<uint8_t> jump {0xe9};
+		AppendRel32(&jump, from + 5, to);
+		std::memcpy(reinterpret_cast<void*>(from), jump.data(), jump.size());
+		(void)Common::VirtualMemory::FlushInstructionCache(from, jump.size());
+	}
+	{
+		std::vector<uint8_t> call_stub {0xe8};
+		AppendRel32(&call_stub, call + 5, cave);
+		std::memcpy(reinterpret_cast<void*>(call), call_stub.data(), call_stub.size());
+		(void)Common::VirtualMemory::FlushInstructionCache(call, call_stub.size());
+	}
+	(void)Common::VirtualMemory::FlushInstructionCache(cave, 0x800);
+	g_decouple.active   = true;
+	g_decouple.base     = base;
+	g_decouple.gate     = gate;
+	g_decouple.last_us  = data + 24;
+	g_decouple.dt       = data;
+	g_decouple.numer    = numer;
+	g_decouple.denom    = denom;
+	g_decouple.getter   = getter;
+	g_decouple.ticks    = ticks;
+	g_decouple.single   = single;
+	g_decouple.call     = call;
+	g_decouple.cap      = cap;
+	::printf("Decouple: built-in one on (Astro Bot %s %s): game time follows the real frame time, "
+	         "steps capped at %s; getters at game+0x%llx, frame update's call at game+0x%llx "
+	         "(KYTY_ASTRO_DECOUPLE)\n",
+	         title_id.c_str(), version.c_str(), cap_text, off(getter), off(call));
 	std::fflush(stdout);
 }
 
@@ -1024,7 +1362,7 @@ void ApplyBuiltin(Program* main_program) {
 	         scale, scaled[0], scaled[1], scaled[2], scaled[3], scaled[4]);
 }
 
-// KYTY_ASTRO_RESCUE_LOG (default 1; 0 = off): one console line per call of the rescue-start and
+// KYTY_ASTRO_RESCUE_LOG (default 0; 1 = on): one console line per call of the rescue-start and
 // rescue-end functions the built-in rescue fix hooks, with the caller (an offset in the game) and the
 // time, to tell real rescues from the calls at a level's start (test build 22).
 // A value that points just after a call instruction in the game's code (call rel32, call [rip+d],
@@ -1046,7 +1384,7 @@ bool IsGameReturnAddress(uint64_t value) {
 void PrintRescueLog() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_ASTRO_RESCUE_LOG");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	const auto log = g_rescue_log.load(std::memory_order_relaxed);
 	if (!enabled || log == 0) {

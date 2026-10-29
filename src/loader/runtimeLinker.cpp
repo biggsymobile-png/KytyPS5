@@ -1550,7 +1550,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	RelocateAll();
 
 	if (!m_programs.empty()) {
-		GamePatch::ProbeDecouple(m_programs.front());
+		GamePatch::SetUpDecouple(m_programs.front());
 	}
 	if (!game_patch.empty()) {
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),

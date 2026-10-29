@@ -93,11 +93,12 @@ steady, fluid picture. In the tester's words, "ultra smooth because of the perfe
    **Frame rate limit**. Lower the render resolution if your PC cannot hold 60 in the busiest
    levels: evenly timed frames feel far smoother than a rate that keeps dipping.
 
-**Below 60** (40 or 45 gives beautifully even frames) Astro Bot needs a **"Decouple gameplay timers
-from render FPS" patch** to keep its speed. The community "[Fix] Bot rescue" mod that goes with it
-could leave Decouple switched off for a whole level (Pumpkin Peril played in slow motion until the
-level was left); this build replaces that mod with a built-in version that switches Decouple back
-on by itself (see Known issues). If you still see slow motion below 60, go back to 60 and please
+**Below 60** (40 or 45 gives beautifully even frames) Astro Bot keeps its speed with **Decouple
+built in** (since build 23): no patch file or button combination needed, any version of the game
+(US and EU). The console shows `Decouple: built-in one on`. If it says `not applied` instead, a
+"Decouple gameplay timers from render FPS" mod in the patch file is used as before; please report
+that line with your game version. The community "[Fix] Bot rescue" mod is skipped: it slowed the
+game down (see Known issues). If you still see slow motion below 60, go back to 60 and please
 report the level.
 
 Without a variable-refresh display keep FIFO. Astro's Playroom: keep the Vblank frequency at 60
@@ -277,6 +278,26 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   stays off for 6 s (15 s before build 22), it is switched back on (the console then shows `Game
   patch: bot rescue fix: Decouple was off ...`). Settings: `"KYTY_ASTRO_RESCUE_TIMEOUT_S": "6",`
   (2 to 600), and `"KYTY_ASTRO_RESCUE_FIX": "0",` to use the patch file's mod as before.
+- **New in build 23: Decouple built in, the rescue mod's slow motion gone, gyro re-centre key.**
+  - **Decouple built in.** The emulator now finds Astro Bot's timing code itself, in any version
+    and region, and lets game time follow the real frame time, with the community v3 mod's
+    smoothing and its "delta time capped at 1/20 s" safety (`"KYTY_ASTRO_DECOUPLE_DT_CAP": "30",`
+    for 1/30 s). The patch file's Decouple mod and the mods that need it (frame-limiter sleep,
+    precise frame caps, delta-time caps) are skipped while it is on; use the launcher's Frame
+    rate limit instead of the precise caps. `"KYTY_ASTRO_DECOUPLE": "0",` goes back to the patch
+    file's mod.
+  - **The "Bot rescue" mod is skipped.** Testing showed that its two hooks do not belong to
+    rescues at all: they mark entering and leaving a level (and some areas), and a real rescue
+    calls neither. So the mod switched Decouple off when a level started, and only the end of the
+    level or a safety timer switched it back on: the slow motion at level starts and in the middle
+    of stages. Rescues work normally without it. `"KYTY_ASTRO_RESCUE_FIX": "1",` still turns on the
+    built-in version with its 6 s safety timer; if a rescue goes wrong without it, please report
+    it with your log.
+  - **Gyro re-centre key.** Hold the controller the way you play and press the key in the game
+    window (launcher: the game's settings, Graphics & display, "Gyro re-centre key"; default F9): that becomes its
+    neutral position. Useful if the game started while the controller was held at an angle.
+  - The gyro offset is saved between sessions (from build 22b), so the view is centred from the
+    start; the test logs from builds 22 and 22b are off again.
 - **Build 22b (test): the gyro is centred from the start, and a deeper rescue log.** The gyro
   calibration only corrected once the pad had rested for a moment, so in the first minutes of a
   session the view could creep off centre and stay there. The learned offset is now saved per

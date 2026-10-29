@@ -25,6 +25,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(frame_generation);
 	KYTY_CFG_SET(upscaler);
 	KYTY_CFG_SET(render_resolution);
+	KYTY_CFG_SET(gyro_recenter_key);
 	KYTY_CFG_SET(smooth_frame_pacing);
 	KYTY_CFG_SET(relaxed_shader_maths);
 	KYTY_CFG_SET(frame_rate_limit);
@@ -81,6 +82,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	frame_generation = s.value("frame_generation", frame_generation).toInt();
 	upscaler         = s.value("upscaler", upscaler).toInt();
 	render_resolution = s.value("render_resolution", render_resolution).toInt();
+	gyro_recenter_key = s.value("gyro_recenter_key", gyro_recenter_key).toInt();
 	smooth_frame_pacing = s.value("smooth_frame_pacing", smooth_frame_pacing).toBool();
 	relaxed_shader_maths = s.value("relaxed_shader_maths", relaxed_shader_maths).toBool();
 	frame_rate_limit    = s.value("frame_rate_limit", frame_rate_limit).toInt();
@@ -188,6 +190,9 @@ bool Configuration::SetGameSettings(const QJsonObject& imported_settings, QStrin
 	}
 	if (render_resolution < 0 || render_resolution > 6) {
 		return fail(tr("Render resolution must be between 0 (the game's choice) and 4 (2160p)."));
+	}
+	if (gyro_recenter_key < 0 || gyro_recenter_key > 7) {
+		return fail(tr("Gyro re-centre key must be between 0 (off) and 7 (F12)."));
 	}
 	if (trophy_duration_seconds < 5 || trophy_duration_seconds > 10) {
 		return fail(tr("Trophy notification duration must be between 5 and 10 seconds."));

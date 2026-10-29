@@ -100,7 +100,7 @@ void OnDevice(vk::PhysicalDevice physical_device);
 // An upscaler is on: DLSS-SR (KYTY_DLSS=1) or FSR 3.1 (KYTY_FSR=1), available on the device.
 [[nodiscard]] bool UpscaleEnabled();
 
-// KYTY_COMPOSITE_PROBE (default 1; 0 = off): the games' last pass (CompositePixelShader) and their
+// KYTY_COMPOSITE_PROBE (default 0; 1 = on): the games' last pass (CompositePixelShader) and their
 // TAA pass, logged once per new combination of their images' and targets' sizes and formats
 // ("Composite probe: ..."), to plan an upscale before the last pass (Astro's Playroom).
 // GPU thread, every draw after its bindings are prepared.

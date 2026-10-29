@@ -197,6 +197,13 @@ public:
 	// Astro Bot's fixed render resolution (KYTY_ASTRO_RENDER_RES): 0 the game's choice, 1 1080p,
 	// 2 1368p, 3 1872p, 4 2160p.
 	int                    render_resolution           = 0;
+	// KYTY_GYRO_RECENTER_KEY: the key that re-centres the controller's orientation; an index into
+	// GyroRecenterKeys() (0 off).
+	int                    gyro_recenter_key           = 5;
+	static const char*     GyroRecenterKeyName(int index) {
+		static const char* const kKeys[] = {"off", "F3", "F4", "F5", "F6", "F9", "F10", "F12"};
+		return kKeys[index >= 0 && index < 8 ? index : 0];
+	}
 	// KYTY_PRESENT_ABS_VBLANK: the virtual vblank on an absolute timeline (a late frame skips a
 	// vblank instead of bunching the next flips together).
 	bool                   smooth_frame_pacing         = false;
@@ -248,6 +255,7 @@ public:
 		frame_generation            = other.frame_generation;
 		upscaler                    = other.upscaler;
 		render_resolution           = other.render_resolution;
+		gyro_recenter_key           = other.gyro_recenter_key;
 		smooth_frame_pacing         = other.smooth_frame_pacing;
 		relaxed_shader_maths        = other.relaxed_shader_maths;
 		frame_rate_limit            = other.frame_rate_limit;
