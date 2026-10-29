@@ -285,7 +285,7 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
   console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
   is skipped (its physics and ultrawide mods still apply).
-- **Build 23e (test): real DLSS/FSR upscaling in Astro's Playroom, first step.** With DLSS or FSR
+- **Build 23f (test): real DLSS/FSR upscaling in Astro's Playroom, first step.** (23e did not build on Windows; 23f is the same change with that fixed.) With DLSS or FSR
   upscaling on and a lower render resolution, Playroom renders the 3D scene at that resolution,
   and DLSS/FSR now upscales it to the full output size, as in Astro Bot (before, DLSS only cleaned
   up the low-resolution image and the game stretched it). The HUD stays at full size, so it is
