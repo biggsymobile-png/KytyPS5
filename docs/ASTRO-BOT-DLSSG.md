@@ -349,7 +349,8 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 
 ## Reporting problems
 
-Please include your GPU, driver version, game and version, and all the `Frame generation:`,
+Report problems on the fork's [Issues page](https://github.com/biggsymobile-png/KytyPS5/issues/new?template=bug_report.yml):
+the form asks for the build, game version, GPU and settings, and the console log. Please include your GPU, driver version, game and version, and all the `Frame generation:`,
 `DLSS upscaling:`, `FSR upscaling:`, `Game patch:` and `Streamline` lines from the console (or the
 lines just before a crash).
 
