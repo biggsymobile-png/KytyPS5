@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <mutex>
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -964,6 +965,38 @@ void OnDevice(vk::PhysicalDevice physical_device) {
 #else
 	(void)physical_device;
 #endif
+}
+
+void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
+               std::span<const RenderColorInfo> colors) {
+	const bool composite = pixel_shader == CompositePixelShader;
+	if (!composite && !IsTaaPixelShader(pixel_shader)) return;
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_COMPOSITE_PROBE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled) return;
+	static std::mutex                mutex;
+	static std::vector<std::string>  seen;
+	std::string line = fmt::format("Composite probe: {} pass (PS {:016x})", composite ? "last" : "TAA",
+	                               pixel_shader);
+	if (pixel != nullptr) {
+		for (size_t i = 0; i < pixel->images.size() && i < 8; i++) {
+			const auto& info = pixel->images[i].desc.info;
+			line += fmt::format("; image {} {}x{} {} at 0x{:x}", i, info.extent.width, info.extent.height,
+			                    vk::to_string(info.pixel_format), info.data.address);
+		}
+	}
+	for (size_t i = 0; i < colors.size() && i < 4; i++) {
+		const auto& info = colors[i].desc.info;
+		line += fmt::format("; target {} {}x{} {} at 0x{:x}", i, info.extent.width, info.extent.height,
+		                    vk::to_string(info.pixel_format), info.data.address);
+	}
+	std::lock_guard lock(mutex);
+	if (seen.size() >= 24 || std::find(seen.begin(), seen.end(), line) != seen.end()) return;
+	seen.push_back(line);
+	std::printf("%s (KYTY_COMPOSITE_PROBE)\n", line.c_str());
+	std::fflush(stdout);
 }
 
 void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,

@@ -3991,6 +3991,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count},
 		                        m_run_active);
 	}
+	if (state.ps_active && state.ps_input_info.stage.program != nullptr) {
+		FrameGen::ProbeDraw(state.ps_input_info.stage.program->shader_hash,
+		                    bindings.pixel ? &*bindings.pixel : nullptr,
+		                    std::span {state.color_info, state.color_count});
+	}
 	if (FrameGen::Gathering()) {
 		std::array<const PreparedBindings*, 3> fg_vertex {};
 		uint32_t                               fg_vertex_count = 0;
