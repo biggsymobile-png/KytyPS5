@@ -376,7 +376,7 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 			}
 			continue;
 		}
-		if (astro && g_decouple.active &&
+		if ((astro || plan->title_id == "PPSA01325") && g_decouple.active &&
 		    (mod_name.find("Decouple gameplay timers") != std::string::npos ||
 		     mod_name.find("needs Decouple") != std::string::npos || touches_decouple(mod))) {
 			if (decision == ModDecision::Apply) {
@@ -919,7 +919,8 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 }
 
 // The built-in Decouple (KYTY_ASTRO_DECOUPLE, default 1; 0 = the patch file's mod as before):
-// Astro Bot (PPSA21564 / PPSA21567), any version. The game advances by a fixed 1/60 s per frame
+// Astro Bot (PPSA21564 / PPSA21567) and Astro's Playroom (PPSA01325, same engine: getters at
+// 0x1b4b920-0x1b4b950 and the frame update's call at 0xafa4 in 01.905.000), any version. The game advances by a fixed 1/60 s per frame
 // (three small getters return it as a double, a float and microseconds: 1.0 / target fps, at
 // 0x3530, 0x3550 and 0x3520 in 01.018.000), so below 60 fps it runs slow. As the community
 // "Decouple gameplay timers from render FPS" mod (v3) does, the frame update's call of the double
@@ -1030,9 +1031,11 @@ void SetUpDecouple(Program* main_program) {
 	std::string version;
 	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
 	    !SystemContentParamSfoGetString("APP_VER", &version) ||
-	    (title_id != "PPSA21564" && title_id != "PPSA21567")) {
+	    (title_id != "PPSA21564" && title_id != "PPSA21567" && title_id != "PPSA01325")) {
 		return;
 	}
+	const bool        playroom = title_id == "PPSA01325";
+	const char* const game     = playroom ? "Astro's Playroom" : "Astro Bot";
 	if (const char* value = std::getenv("KYTY_ASTRO_DECOUPLE"); value != nullptr && value[0] == '0') {
 		::printf("Decouple: built-in one off; the patch file's Decouple mod applies if enabled "
 		         "(KYTY_ASTRO_DECOUPLE)\n");
@@ -1064,9 +1067,9 @@ void SetUpDecouple(Program* main_program) {
 	};
 	const auto off = [&](uint64_t address) { return static_cast<unsigned long long>(address - base); };
 	const auto give_up = [&](const char* why) {
-		::printf("Decouple: built-in one not applied (%s, Astro Bot %s %s); the patch file's Decouple "
+		::printf("Decouple: built-in one not applied (%s, %s %s %s); the patch file's Decouple "
 		         "mod applies if enabled (KYTY_ASTRO_DECOUPLE)\n",
-		         why, title_id.c_str(), version.c_str());
+		         why, game, title_id.c_str(), version.c_str());
 	};
 	// The getters: "vmovsd xmm0, [A]; vdivsd xmm0, [B]; ret" with "mov rax, [B+0x10]; ret" and
 	// "vmovss xmm0, [B+8]; ret" within 0x40 bytes.
@@ -1162,23 +1165,28 @@ void SetUpDecouple(Program* main_program) {
 		}
 	}
 	uint64_t call = 0;
-	if (version == "01.018.000") {
-		// Pinned: the frame update's call, as the community mod hooks it.
-		const uint64_t pinned = base + 0x2a4a2b;
+	// Pinned: the frame update's call, as the community mods hook it (Astro Bot 01.018.000,
+	// Astro's Playroom 01.905.000), used only when it is one of the getter's callers.
+	uint64_t pin = 0;
+	if (!playroom && version == "01.018.000") pin = 0x2a4a2b;
+	if (playroom && version == "01.905.000") pin = 0xafa4;
+	if (pin != 0) {
+		const uint64_t pinned = base + pin;
 		if (std::find(callers.begin(), callers.end(), pinned) != callers.end()) {
 			call = pinned;
 		}
 		const bool agree = candidates.size() == 1 && candidates[0] == pinned;
-		::printf("Decouple: the search for the frame update's call %s on 01.018.000 (%zu candidate(s)) "
+		::printf("Decouple: the search for the frame update's call %s on %s (%zu candidate(s)) "
 		         "(KYTY_ASTRO_DECOUPLE)\n",
-		         agree ? "agrees with the known one" : "does not agree with the known one", candidates.size());
+		         agree ? "agrees with the known one" : "does not agree with the known one", version.c_str(),
+		         candidates.size());
 	} else if (candidates.size() == 1) {
 		call = candidates[0];
 	}
 	// Test build 23b: the code around the frame update's call (from 0x60 before it to 0x90 after,
 	// which covers the frame limiter's call at +0x7d) and the start of the functions it calls next,
 	// for a search by shape in other versions. Instruction bytes only, as a patch file holds.
-	if (call != 0 && version == "01.018.000") {
+	if (call != 0 && pin != 0) {
 		const auto dump = [&](const char* what, uint64_t from, size_t size) {
 			if (!IsInsideProgram(*main_program, from, size)) return;
 			const auto* b = reinterpret_cast<const uint8_t*>(from);
@@ -1335,10 +1343,10 @@ void SetUpDecouple(Program* main_program) {
 	g_decouple.single   = single;
 	g_decouple.call     = call;
 	g_decouple.cap      = cap;
-	::printf("Decouple: built-in one on (Astro Bot %s %s): game time follows the real frame time, "
+	::printf("Decouple: built-in one on (%s %s %s): game time follows the real frame time, "
 	         "steps capped at %s; getters at game+0x%llx, frame update's call at game+0x%llx "
 	         "(KYTY_ASTRO_DECOUPLE)\n",
-	         title_id.c_str(), version.c_str(), cap_text, off(getter), off(call));
+	         game, title_id.c_str(), version.c_str(), cap_text, off(getter), off(call));
 	std::fflush(stdout);
 }
 
