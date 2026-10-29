@@ -285,6 +285,17 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
   console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
   is skipped (its physics and ultrawide mods still apply).
+- **Build 23i (test): a reactive mask for Playroom's particles, reflections and transparency.**
+  What the game draws into its scene after the lighting (particles, decals such as the shadow
+  under Astro, glass and water refraction, reflections) has no motion vectors of its own, so the
+  upscaler smeared or dropped it. Now the scene is copied just before those draws (after the sky),
+  and at the TAA the difference becomes a mask telling the upscaler to trust the current frame
+  there: DLSS's bias-current-colour hint, FSR's reactive mask. The cost is one render-size copy
+  and a small compute pass per frame. The console shows `Playroom mask: on` and, every 600
+  frames, how many masks came from a snapshot. `"KYTY_PLAYROOM_MASK": "0",` turns it off (23h
+  behaviour); `"KYTY_PLAYROOM_MASK_SCALE": "2"` (default 1) makes it stronger, `"0.5"` weaker.
+  For tuning, `"KYTY_PLAYROOM_MASK_VIEW": "1",` shows the mask in place of the picture (white:
+  the upscaler leans on the current frame; black: normal); it changes nothing when unset.
 - **Build 23h (test): Playroom keeps the game's own TAA beside DLSS/FSR.** In 23g the upscaler
   replaced the game's TAA, and shadows, particles and reflections went missing or flickered: the
   TAA's second (output-size) target is read by the last pass too, and only the game's TAA fills it

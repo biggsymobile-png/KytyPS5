@@ -56,6 +56,7 @@
 #if defined(KYTY_FRAMEGEN_STREAMLINE) || defined(KYTY_FSR_NATIVE)
 #define KYTY_UPSCALER_CODE 1
 #include "gpu_playroom_shaders/gpu_playroom_mix_spv.h"
+#include "gpu_playroom_shaders/gpu_playroom_mask_spv.h"
 
 #include <array>
 #include <chrono>
@@ -253,6 +254,9 @@ uint32_t g_dump_lines   = 0;
 // counted ("Pre-TAA dump N.k: ..."): where the particles, decals and shadows are drawn, for a
 // reactive mask. GPU thread.
 std::atomic<uint64_t> g_taa_input_address {0};
+// Astro's Playroom reactive mask (Mask, SnapScene): a dispatch wrote the scene (the TAA's colour
+// input) since the last snapshot of it, so the next draw into it takes a new one. GPU thread.
+bool g_scene_armed = false;
 bool                  g_pre_on        = false;
 uint32_t              g_pre_lines     = 0;
 uint64_t              g_pre_last_hash = 0;
@@ -1266,6 +1270,14 @@ void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
 }
 
 void ProbeDispatch(uint64_t compute_shader, const PreparedBindings& bindings, uint32_t written_mask) {
+	if (const uint64_t scene = g_taa_input_address.load(std::memory_order_relaxed); scene != 0 && !g_scene_armed) {
+		for (size_t i = 0; i < bindings.images.size() && i < 32; i++) {
+			if ((written_mask & (1u << i)) != 0 && bindings.images[i].desc.info.data.address == scene) {
+				g_scene_armed = true; // (the lighting: the Playroom mask's snapshot is taken after it)
+				break;
+			}
+		}
+	}
 	if (!ChainProbeOn()) return;
 	ChainStep(compute_shader, true, &bindings, {}, written_mask, false);
 }
@@ -1480,6 +1492,218 @@ struct Mix {
 };
 Mix g_mix;
 
+// Astro's Playroom reactive mask (KYTY_PLAYROOM_MASK, default on; test build 23i): what the game
+// drew into its scene after the lighting passes (particles, decals, refraction, reflections) has no
+// motion vectors of its own, so the upscaler is told to lean on the current frame there. The scene
+// is copied at the first draw into it after the last dispatch that wrote it (the sky's excepted:
+// SnapScene); at the TAA the change since then is the mask (shaders/gpu_playroom_mask.comp), DLSS's
+// kBufferTypeBiasCurrentColorHint and FSR's reactive mask. GPU thread.
+struct Mask {
+	VulkanImage             snap, mask;    // the scene's copy (its format), the mask (R8, render size)
+	vk::ImageView           snap_view = nullptr, mask_view = nullptr, grey_view = nullptr;
+	vk::Sampler             sampler    = nullptr;
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	bool                    tried = false, ok = false;
+	bool                    snapped = false; // the snapshot holds this frame's scene
+	bool                    ready   = false; // the mask holds the last TAA's (KYTY_PLAYROOM_MASK_VIEW)
+	uint64_t                snap_shader = 0; // the pixel shader of the draw it was taken at
+	uint32_t                snaps       = 0; // this frame's snapshots
+	uint64_t                made = 0, from_snap = 0, empty = 0; // masks (since the last status line)
+};
+Mask g_mask;
+
+// The sky's pixel shader (its first 32 bits, as logged): drawn after the lighting, but opaque.
+constexpr uint32_t SkyPixelShaderPrefix = 0x113acd3eu;
+
+bool MaskAllowed() {
+	static const bool allowed = [] {
+		const char* value = std::getenv("KYTY_PLAYROOM_MASK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return allowed;
+}
+
+float MaskScale() {
+	static const float scale = [] {
+		const char* value = std::getenv("KYTY_PLAYROOM_MASK_SCALE");
+		return value == nullptr || value[0] == '\0' ? 1.0f
+		                                            : std::clamp(static_cast<float>(std::atof(value)), 0.0f, 16.0f);
+	}();
+	return scale;
+}
+
+// KYTY_PLAYROOM_MASK_VIEW=1 (tuning): the last pass shows the mask, greyscale, in place of the picture.
+bool MaskViewOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PLAYROOM_MASK_VIEW");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+bool EnsureMaskPipeline(GraphicContext& graphics) {
+	if (g_mask.tried) return g_mask.ok;
+	g_mask.tried = true;
+	if (graphics.max_push_descriptors < 3) {
+		std::printf("Playroom mask: needs push descriptors; off\n");
+		std::fflush(stdout);
+		return false;
+	}
+	vk::SamplerCreateInfo sampler {};
+	sampler.magFilter    = vk::Filter::eNearest;
+	sampler.minFilter    = vk::Filter::eNearest;
+	sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
+	sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+	sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+	sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+	sampler.maxLod       = 0.0f;
+	RequireVulkanSuccess(graphics.device.createSampler(&sampler, nullptr, &g_mask.sampler), "Playroom mask sampler");
+	const std::array<vk::DescriptorSetLayoutBinding, 3> bindings {{
+	    {0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {1, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {2, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	}};
+	vk::DescriptorSetLayoutCreateInfo set_info {};
+	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+	set_info.pBindings    = bindings.data();
+	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&set_info, nullptr, &g_mask.set_layout),
+	                     "Playroom mask descriptor layout");
+	const vk::PushConstantRange push_range {vk::ShaderStageFlagBits::eCompute, 0, 4 * sizeof(uint32_t)};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = 1;
+	layout_info.pSetLayouts            = &g_mask.set_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push_range;
+	RequireVulkanSuccess(graphics.device.createPipelineLayout(&layout_info, nullptr, &g_mask.layout),
+	                     "Playroom mask pipeline layout");
+	const auto module = CompileSPV(std::span<const uint32_t> {GPU_PLAYROOM_MASK_SPV}, graphics.device);
+	vk::ComputePipelineCreateInfo create {};
+	create.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	create.stage.module = module;
+	create.stage.pName  = "main";
+	create.layout       = g_mask.layout;
+	const auto result = graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &g_mask.pipeline);
+	graphics.device.destroyShaderModule(module, nullptr);
+	RequireVulkanSuccess(result, "Playroom mask pipeline");
+	g_mask.ok = true;
+	return true;
+}
+
+// (Re)creates the mask image (R8, render size) and its views (its own; greyscale for MASK_VIEW).
+bool EnsureMaskImage(GraphicContext& graphics, vk::Extent2D size) {
+	auto& image = g_mask.mask;
+	if (image.image != nullptr && image.extent.width == size.width && image.extent.height == size.height) {
+		return true;
+	}
+	for (auto* view: {&g_mask.mask_view, &g_mask.grey_view}) {
+		if (*view != nullptr) {
+			graphics.device.destroyImageView(*view, nullptr);
+			*view = nullptr;
+		}
+	}
+	if (image.image != nullptr) {
+		graphics.DeleteImage(image);
+	}
+	g_mask.ready = false;
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {size.width, size.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = vk::Format::eR8Unorm;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+	               vk::ImageUsageFlagBits::eTransferDst;
+	create.sharingMode = vk::SharingMode::eExclusive;
+	create.samples     = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, image)) return false;
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = image.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = vk::Format::eR8Unorm;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (graphics.device.createImageView(&view_info, nullptr, &g_mask.mask_view) != vk::Result::eSuccess) {
+		g_mask.mask_view = nullptr;
+		graphics.DeleteImage(image);
+		return false;
+	}
+	view_info.components = vk::ComponentMapping {vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eR,
+	                                              vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eOne};
+	if (graphics.device.createImageView(&view_info, nullptr, &g_mask.grey_view) != vk::Result::eSuccess) {
+		g_mask.grey_view = nullptr;
+	}
+	return true;
+}
+
+// At the TAA, outside rendering, with the scene already copied into g_sr.color: the mask from the
+// change since the snapshot (or zero without one: nothing drawn after the lighting). Leaves it
+// readable by the upscaler and the last pass. True: the mask is valid this frame.
+bool MaskAtTaa(GraphicContext& graphics, CommandBuffer& command, vk::CommandBuffer vk_command, vk::Extent2D in,
+               bool fsr) {
+	const bool snapped = g_mask.snapped;
+	g_mask.snapped = false;
+	g_scene_armed  = false;
+	const uint32_t snaps = g_mask.snaps;
+	g_mask.snaps   = 0;
+	if (!MaskAllowed() || !EnsureMaskPipeline(graphics) || !EnsureMaskImage(graphics, in)) return false;
+	const bool use_snap = snapped && g_mask.snap.image != nullptr && g_mask.snap.extent.width == in.width &&
+	                      g_mask.snap.extent.height == in.height;
+	if (use_snap) {
+		Transition(vk_command, g_mask.mask, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eComputeShader);
+		const vk::DescriptorImageInfo now_info {g_mask.sampler, g_sr.color_view, vk::ImageLayout::eShaderReadOnlyOptimal};
+		const vk::DescriptorImageInfo snap_info {g_mask.sampler, g_mask.snap_view,
+		                                         vk::ImageLayout::eShaderReadOnlyOptimal};
+		const vk::DescriptorImageInfo out_info {nullptr, g_mask.mask_view, vk::ImageLayout::eGeneral};
+		std::array<vk::WriteDescriptorSet, 3> writes {};
+		for (uint32_t i = 0; i < writes.size(); i++) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = i == 2 ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eCombinedImageSampler;
+		}
+		writes[0].pImageInfo = &now_info;
+		writes[1].pImageInfo = &snap_info;
+		writes[2].pImageInfo = &out_info;
+		command.PushDescriptors(vk::PipelineBindPoint::eCompute, g_mask.layout, 0,
+		                        static_cast<uint32_t>(writes.size()), writes.data(), true);
+		command.BindPipeline(vk::PipelineBindPoint::eCompute, g_mask.pipeline);
+		struct {
+			uint32_t width, height;
+			float    scale, cap;
+		} push {in.width, in.height, MaskScale(), fsr ? 0.9f : 1.0f};
+		vk_command.pushConstants(g_mask.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+		vk_command.dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
+		g_mask.from_snap++;
+	} else {
+		Transition(vk_command, g_mask.mask, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+		           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+		const vk::ClearColorValue zero {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
+		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk_command.clearColorImage(g_mask.mask.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &range);
+		g_mask.empty++;
+	}
+	Transition(vk_command, g_mask.mask, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderSampledRead, vk::PipelineStageFlagBits2::eAllCommands);
+	g_mask.ready = true;
+	if (g_mask.made++ == 0) {
+		std::printf("Playroom mask: on (%s, scale %.2f; KYTY_PLAYROOM_MASK, KYTY_PLAYROOM_MASK_SCALE)\n",
+		            fsr ? "FSR reactive mask" : "DLSS bias-current-colour hint", MaskScale());
+		std::fflush(stdout);
+	}
+	if (g_mask.made % 600 == 1 || (use_snap && g_mask.from_snap == 1)) {
+		std::printf("Playroom mask: %llu from a snapshot, %llu empty; this frame %u snapshot(s), the last at "
+		            "PS %016llx\n",
+		            static_cast<unsigned long long>(g_mask.from_snap), static_cast<unsigned long long>(g_mask.empty),
+		            snaps, static_cast<unsigned long long>(g_mask.snap_shader));
+		std::fflush(stdout);
+	}
+	return true;
+}
+
 bool MixAllowed() {
 	static const bool allowed = [] {
 		const char* value = std::getenv("KYTY_PLAYROOM_MIX");
@@ -1662,6 +1886,7 @@ struct FsrFrame {
 	bool              reset      = false;
 	float             near_plane = 0.1f, far_plane = 1000.0f, fov = 1.0f;
 	float             mv_x = 1.0f, mv_y = 1.0f; // Playroom's motion-vector test factors
+	bool              reactive = false;             // g_mask.mask is this frame's reactive mask
 };
 
 void FsrFrameTime(std::chrono::steady_clock::time_point& last, uint64_t dispatches, float& frame_ms) {
@@ -1873,6 +2098,7 @@ bool FsrDispatch(const FsrFrame& frame, std::string& failure) {
 	dispatch.depth             = FsrResource(g_sr.depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
 	dispatch.motionVectors     = FsrResource(g_sr.motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
 	dispatch.output            = FsrResource(g_sr.output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+	if (frame.reactive) dispatch.reactive = FsrResource(g_mask.mask, FFX_API_RESOURCE_STATE_COMPUTE_READ);
 	dispatch.jitterOffset      = {frame.jitter_x, frame.jitter_y};
 	// The game's UV-unit vectors (current minus previous) to FSR's render-size pixels.
 	dispatch.motionVectorScale = {MotionVectorSign() * frame.mv_x * static_cast<float>(frame.in.width),
@@ -2057,6 +2283,7 @@ bool FsrDispatch(const FsrFrame& frame, std::string& failure) {
 	dispatch.depth         = FsrNativeResource(g_sr.depth, L"KytyFsrDepth", false);
 	dispatch.motionVectors = FsrNativeResource(g_sr.motion, L"KytyFsrMotion", false);
 	dispatch.output        = FsrNativeResource(g_sr.output, L"KytyFsrOutput", true);
+	if (frame.reactive) dispatch.reactive = FsrNativeResource(g_mask.mask, L"KytyFsrReactive", false);
 	dispatch.jitterOffset  = {frame.jitter_x, frame.jitter_y};
 	// The game's UV-unit vectors (current minus previous) to FSR's render-size pixels.
 	dispatch.motionVectorScale = {MotionVectorSign() * frame.mv_x * static_cast<float>(frame.in.width),
@@ -2296,6 +2523,8 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	CopyInto(vk_command, color, g_sr.color);
 	CopyInto(vk_command, depth, g_sr.depth);
 	CopyInto(vk_command, motion, g_sr.motion);
+	// Astro's Playroom: the reactive mask (what was drawn after the lighting).
+	const bool masked = redirect && MaskAtTaa(graphics, command, vk_command, in, fsr);
 	Transition(vk_command, g_sr.output, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
 	           vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite,
 	           vk::PipelineStageFlagBits2::eComputeShader);
@@ -2314,6 +2543,7 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		frame.fov        = constants.cameraFOV;
 		frame.mv_x       = mv_adjust.x;
 		frame.mv_y       = mv_adjust.y;
+		frame.reactive   = masked;
 		ok               = FsrDispatch(frame, failure);
 	} else {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -2343,9 +2573,12 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		                                 sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent);
 		const sl::ResourceTag output_tag(&output_resource, sl::kBufferTypeScalingOutputColor,
 		                                 sl::ResourceLifecycle::eValidUntilEvaluate, &out_extent);
-		const sl::BaseStructure* inputs[] {&viewport, &color_tag, &depth_tag, &motion_tag, &output_tag};
+		sl::Resource          mask_resource = resource(g_mask.mask, g_mask.mask_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+		const sl::ResourceTag mask_tag(&mask_resource, sl::kBufferTypeBiasCurrentColorHint,
+		                               sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent);
+		const sl::BaseStructure* inputs[] {&viewport, &color_tag, &depth_tag, &motion_tag, &output_tag, &mask_tag};
 		const auto result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, inputs,
-		                                           static_cast<uint32_t>(std::size(inputs)),
+		                                           static_cast<uint32_t>(std::size(inputs)) - (masked ? 0u : 1u),
 		                                           static_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(vk_command)));
 		ok = result == sl::Result::eOk;
 		if (!ok) failure = std::string("slEvaluateFeature ") + sl::getResultAsStr(result);
@@ -2540,6 +2773,62 @@ bool SnapAfterTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& 
 #endif
 }
 
+bool SceneSnapArmed() {
+#ifdef KYTY_UPSCALER_CODE
+	return g_scene_armed && g_redirect.address != 0 && MaskAllowed();
+#else
+	return false;
+#endif
+}
+
+bool SnapScene(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command, uint64_t pixel_shader,
+               std::span<const RenderColorInfo> colors) {
+#ifdef KYTY_UPSCALER_CODE
+	const uint64_t scene_address = g_taa_input_address.load(std::memory_order_relaxed);
+	if (!g_scene_armed || scene_address == 0 || IsTaaPixelShader(pixel_shader) ||
+	    pixel_shader == CompositePixelShader) {
+		return false;
+	}
+	const RenderColorInfo* target = nullptr;
+	for (const auto& color: colors) {
+		if (color.image_id && color.desc.info.data.address == scene_address && color.guest_mip_level == 0 &&
+		    color.guest_array_layer == 0) {
+			target = &color;
+			break;
+		}
+	}
+	if (target == nullptr) return false;
+	// (The sky: opaque, drawn after the lighting; the snapshot follows it.)
+	if (static_cast<uint32_t>(pixel_shader >> 32) == SkyPixelShaderPrefix ||
+	    static_cast<uint32_t>(pixel_shader) == SkyPixelShaderPrefix) {
+		return false;
+	}
+	g_scene_armed = false;
+	auto& scene   = cache.GetImage(target->image_id);
+	if (scene.backing.image == nullptr || IsDepthFormat(scene.backing.format)) return false;
+	command.EndRendering();
+	auto vk_command = command.Handle();
+	Configure(graphics, g_mask.snap, g_mask.snap_view, scene.backing);
+	const auto keep = scene.backing.state;
+	CopyInto(vk_command, scene, g_mask.snap);
+	if (keep.layout != vk::ImageLayout::eUndefined) {
+		scene.Transit(keep.layout, keep.access_mask, {}, vk_command);
+	}
+	command.ForgetBoundState();
+	g_mask.snapped     = true;
+	g_mask.snap_shader = pixel_shader;
+	g_mask.snaps++;
+	return true;
+#else
+	(void)graphics;
+	(void)cache;
+	(void)command;
+	(void)pixel_shader;
+	(void)colors;
+	return false;
+#endif
+}
+
 bool RedirectComposite(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                        PreparedBindings& pixel, std::span<const RenderColorInfo> colors) {
 #ifdef KYTY_UPSCALER_CODE
@@ -2581,6 +2870,18 @@ bool RedirectComposite(GraphicContext& graphics, TextureCache& cache, CommandBuf
 		}
 	}
 	if (target == nullptr) return false;
+	if (MaskViewOn() && MaskAllowed() && g_mask.ready && g_mask.grey_view != nullptr) {
+		// (Tuning: the mask in place of the picture; white leans on the current frame.)
+		target->image_view      = g_mask.grey_view;
+		target->external_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			std::printf("Playroom mask: shown in place of the picture (KYTY_PLAYROOM_MASK_VIEW)\n");
+			std::fflush(stdout);
+		}
+		return true;
+	}
 	const char* name      = g_fsr ? "FSR upscaling" : "DLSS upscaling";
 	vk::ImageView view    = r.view;
 	bool          mixed   = false;

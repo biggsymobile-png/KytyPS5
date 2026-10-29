@@ -4327,6 +4327,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitStats::StepMark(CommitStats::Step::Acquire);
 	CommitStats::Mark(CommitStats::Phase::AcquireTargets);
+	// Astro's Playroom reactive mask: the scene before what is drawn into it after the lighting.
+	if (FrameGen::SceneSnapArmed() && state.ps_active && state.ps_input_info.stage.program != nullptr &&
+	    FrameGen::SnapScene(buffer.GetGraphics(), m_context.GetTextureCache(), buffer,
+	                        state.ps_input_info.stage.program->shader_hash,
+	                        std::span {state.color_info, state.color_count})) {
+		m_run.valid           = false;
+		m_run_active          = false;
+		m_run_targets_kept    = false;
+		m_dynamic_state.valid = false;
+		for (auto& record: m_run_kept) {
+			record.valid = false;
+		}
+	}
 	// KYTY_DLSS: DLSS super resolution writes Astro Bot's TAA outputs instead of its TAA draw.
 	if (FrameGen::UpscaleEnabled() && state.ps_active && bindings.pixel &&
 	    state.ps_input_info.stage.program != nullptr &&

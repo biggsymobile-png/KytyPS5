@@ -519,6 +519,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${gpu_playroom_mix_header}")
+# Its reactive mask (the upscaler's, at the TAA): what the game drew after its lighting passes.
+set(gpu_playroom_mask_source "${gpu_tiler_shader_dir}/gpu_playroom_mask.comp")
+set(gpu_playroom_mask_spv "${gpu_playroom_generated_dir}/gpu_playroom_mask.spv")
+set(gpu_playroom_mask_header "${gpu_playroom_generated_dir}/gpu_playroom_mask_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_playroom_mask_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_playroom_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_playroom_mask_spv}" "${gpu_playroom_mask_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_playroom_mask_spv} -DOUTPUT=${gpu_playroom_mask_header}
+	        -DSYMBOL=GPU_PLAYROOM_MASK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_playroom_mask_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_playroom_mask_header}")
 
 # Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
 # (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating

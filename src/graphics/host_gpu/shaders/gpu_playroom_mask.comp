@@ -1,0 +1,46 @@
+#version 450
+// Astro's Playroom upscale (frameGenDlssg.cpp, MaskAtTaa): the upscaler's reactive mask, at the
+// render size. What the game drew into its scene after the lighting passes (particles, decals,
+// refraction and reflections, transparency) is the change from a snapshot of the scene taken at
+// the first of those draws (SnapScene). Where it changed, the upscaler leans on the current frame
+// (DLSS: kBufferTypeBiasCurrentColorHint, FSR: its reactive mask), since those draws have no
+// motion vectors of their own.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D now;  // the scene at the TAA (the upscaler's colour input)
+layout(binding = 1) uniform sampler2D snap; // the scene before the post-lighting draws
+layout(binding = 2, r8) uniform writeonly image2D mask;
+
+layout(push_constant) uniform Push {
+	uvec2 size;  // render size
+	float scale; // KYTY_PLAYROOM_MASK_SCALE
+	float cap;   // the largest value written (FSR: 0.9, DLSS: 1)
+} push;
+
+// How much of the scene changed at `p` (0..1), relative to its brightness so HDR highlights and
+// dark corners weigh the same; under 2% counts as none (noise, precision).
+float Change(ivec2 p) {
+	p      = clamp(p, ivec2(0), ivec2(push.size) - 1);
+	vec3 a = clamp(texelFetch(now, p, 0).rgb, vec3(0.0), vec3(65504.0));
+	vec3 b = clamp(texelFetch(snap, p, 0).rgb, vec3(0.0), vec3(65504.0));
+	vec3 d = abs(a - b);
+	float change = max(d.r, max(d.g, d.b));
+	float bright = max(max(a.r, max(a.g, a.b)), max(b.r, max(b.g, b.b)));
+	return max(change / (bright + 0.05) - 0.02, 0.0);
+}
+
+void main() {
+	ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+	if (xy.x >= int(push.size.x) || xy.y >= int(push.size.y)) {
+		return;
+	}
+	// A 3x3 maximum: the edges of particles and decals count too.
+	float m = 0.0;
+	for (int y = -1; y <= 1; y++) {
+		for (int x = -1; x <= 1; x++) {
+			m = max(m, Change(xy + ivec2(x, y)));
+		}
+	}
+	imageStore(mask, xy, vec4(clamp(m * 2.0 * push.scale, 0.0, push.cap)));
+}

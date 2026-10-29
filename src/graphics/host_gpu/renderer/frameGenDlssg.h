@@ -131,6 +131,16 @@ void ProbeDispatch(uint64_t compute_shader, const PreparedBindings& bindings, ui
 // the snapshot (outside rendering). True: commands were recorded (the draw run state is stale).
 [[nodiscard]] bool SnapAfterTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command);
 
+// Astro's Playroom reactive mask (KYTY_PLAYROOM_MASK=0: off; test build 23i): whether a dispatch
+// wrote the scene (the TAA's colour input) since its last snapshot (one load; GPU thread).
+[[nodiscard]] bool SceneSnapArmed();
+// At a draw with its colour targets acquired, before anything of it is recorded: the first draw
+// into the scene after the lighting dispatches (the sky's excepted) copies the scene first (outside
+// rendering); the TAA's upscaler is told to lean on the current frame where it changed since.
+// True: commands were recorded (the draw run state is stale).
+[[nodiscard]] bool SnapScene(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
+                             uint64_t pixel_shader, std::span<const RenderColorInfo> colors);
+
 // GPU thread, every draw after its bindings are prepared (while Enabled()).
 void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
             std::span<const PreparedBindings* const> vertex, std::span<const RenderColorInfo> colors,
