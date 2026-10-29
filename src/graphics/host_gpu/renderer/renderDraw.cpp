@@ -3835,6 +3835,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                     bool primitive_restart_enable) {
 	KYTY_GPU_OP_SITE("draw.execute");
 	KYTY_PROFILER_DETAIL_FUNCTION();
+	// Astro's Playroom, its TAA kept: the draw after the TAA copies the game's TAA output first.
+	if (FrameGen::SnapPending() &&
+	    FrameGen::SnapAfterTaa(buffer.GetGraphics(), m_context.GetTextureCache(), buffer)) {
+		m_run.valid           = false;
+		m_run_active          = false;
+		m_run_targets_kept    = false;
+		m_dynamic_state.valid = false;
+		for (auto& record: m_run_kept) {
+			record.valid = false;
+		}
+	}
 	auto& ucfg = buffer.GetUserConfig();
 	if (m_context.GetOcclusionCounter().DebugLogActive()) {
 		OcclusionCounter::DebugLog("e n=%u inst=%u vs=0x%" PRIx64 "\n", draw.index_count, draw.instance_count,
@@ -4334,6 +4345,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				record.valid = false;
 			}
 			return;
+		}
+		if (FrameGen::TakeUpscaleStateTouched()) {
+			// (Playroom, its TAA kept: the upscaler ran outside rendering; the game's TAA draws now.)
+			m_run.valid           = false;
+			m_run_active          = false;
+			m_run_targets_kept    = false;
+			m_dynamic_state.valid = false;
+			for (auto& record: m_run_kept) {
+				record.valid = false;
+			}
 		}
 	}
 

@@ -171,6 +171,7 @@ struct Redirect {
 	vk::Format    format = vk::Format::eUndefined; // the TAA output's
 };
 Redirect          g_redirect;               // GPU thread
+bool              g_state_touched = false; // UpscaleTaa recorded commands but the TAA still draws (GPU thread)
 std::atomic<bool> g_redirect_used {false};  // the last pass read it once (turns the chain probe on)
 
 bool PlayroomUpscaleAllowed() {
@@ -179,6 +180,45 @@ bool PlayroomUpscaleAllowed() {
 		return value == nullptr || value[0] != '0';
 	}();
 	return allowed;
+}
+
+// KYTY_PLAYROOM_TAA_KEEP (default on; 0: build 23g's behaviour): the game's own TAA draws as
+// usual, so both of its targets hold what the game expects (its second, output-size target is
+// read by the last pass too); the upscaler runs on the same inputs beside it, and only the last
+// pass's render-size image is replaced (RedirectComposite).
+bool TaaKeepAllowed() {
+	static const bool allowed = [] {
+		const char* value = std::getenv("KYTY_PLAYROOM_TAA_KEEP");
+		return value == nullptr || value[0] != '0';
+	}();
+	return allowed;
+}
+
+// Playroom motion-vector test switches: KYTY_PLAYROOM_MV_FLIP=x|y|xy negates that axis,
+// KYTY_PLAYROOM_MV_SCALE=<factor> scales both (default 1), on top of the usual scale.
+struct MvAdjust {
+	float x = 1.0f, y = 1.0f;
+};
+MvAdjust PlayroomMvAdjust() {
+	static const MvAdjust adjust = [] {
+		MvAdjust result;
+		if (const char* scale = std::getenv("KYTY_PLAYROOM_MV_SCALE"); scale != nullptr) {
+			const float value = static_cast<float>(std::atof(scale));
+			if (value != 0.0f) result.x = result.y = value;
+		}
+		if (const char* flip = std::getenv("KYTY_PLAYROOM_MV_FLIP"); flip != nullptr) {
+			if (std::strchr(flip, 'x') != nullptr || std::strchr(flip, 'X') != nullptr) result.x = -result.x;
+			if (std::strchr(flip, 'y') != nullptr || std::strchr(flip, 'Y') != nullptr) result.y = -result.y;
+		}
+		if (result.x != 1.0f || result.y != 1.0f) {
+			std::printf("Playroom upscale: motion vectors scaled by %.3f, %.3f (KYTY_PLAYROOM_MV_FLIP, "
+			            "KYTY_PLAYROOM_MV_SCALE)\n",
+			            result.x, result.y);
+			std::fflush(stdout);
+		}
+		return result;
+	}();
+	return adjust;
 }
 
 // Chain probe (test build): from each TAA pass, the passes that read its output, or what those
@@ -208,8 +248,79 @@ uint32_t g_dump_lines   = 0;
 	if (frame == 600 || frame == 1800 || frame == 3600 || frame == 7200) g_dump_pending = true;
 }
 
+// Pre-TAA dump (test build 23h): after a frame dump's last pass, up to the next TAA, the passes
+// that draw into or write the TAA's colour input (the scene), a shader's consecutive repeats
+// counted ("Pre-TAA dump N.k: ..."): where the particles, decals and shadows are drawn, for a
+// reactive mask. GPU thread.
+std::atomic<uint64_t> g_taa_input_address {0};
+bool                  g_pre_on        = false;
+uint32_t              g_pre_lines     = 0;
+uint64_t              g_pre_last_hash = 0;
+uint32_t              g_pre_repeat    = 0;
+
+void PreDumpRepeats() {
+	if (g_pre_repeat > 1) {
+		std::printf("Pre-TAA dump %u.%u: (x%u in a row)\n", g_dump_number, g_pre_lines, g_pre_repeat);
+	}
+	g_pre_repeat = 0;
+}
+
+void PreDumpStep(uint64_t hash, bool compute, const PreparedBindings* bindings,
+                 std::span<const RenderColorInfo> colors, uint32_t written_mask, bool taa) {
+	if (!g_pre_on) return;
+	if (taa) {
+		PreDumpRepeats();
+		g_pre_on = false;
+		std::printf("Pre-TAA dump %u: end (the TAA)\n", g_dump_number);
+		std::fflush(stdout);
+		return;
+	}
+	const uint64_t scene = g_taa_input_address.load(std::memory_order_relaxed);
+	if (scene == 0) return;
+	bool hits = false;
+	for (const auto& color: colors) {
+		hits = hits || color.desc.info.data.address == scene;
+	}
+	const size_t image_count = bindings == nullptr ? 0 : bindings->images.size();
+	for (size_t i = 0; i < image_count && i < 32; i++) {
+		hits = hits || ((written_mask & (1u << i)) != 0 && bindings->images[i].desc.info.data.address == scene);
+	}
+	if (!hits) return;
+	if (hash == g_pre_last_hash) {
+		g_pre_repeat++;
+		return;
+	}
+	PreDumpRepeats();
+	if (g_pre_lines >= 160) {
+		g_pre_on = false;
+		std::printf("Pre-TAA dump %u: end (160 passes)\n", g_dump_number);
+		std::fflush(stdout);
+		return;
+	}
+	std::string line = fmt::format("Pre-TAA dump {}.{}: {} {:016x}", g_dump_number, ++g_pre_lines,
+	                               compute ? "dispatch CS" : "draw PS", hash);
+	for (size_t i = 0; i < image_count && i < 8; i++) {
+		const auto& info    = bindings->images[i].desc.info;
+		const bool  written = (written_mask & (1u << i)) != 0;
+		line += fmt::format("; {} {} {}x{} {} at 0x{:x}", written ? "writes image" : "image", i,
+		                    info.extent.width, info.extent.height, vk::to_string(info.pixel_format),
+		                    info.data.address);
+	}
+	for (size_t i = 0; i < colors.size() && i < 4; i++) {
+		const auto& info = colors[i].desc.info;
+		line += fmt::format("; target {} {}x{} {} at 0x{:x}{}", i, info.extent.width, info.extent.height,
+		                    vk::to_string(info.pixel_format), info.data.address,
+		                    info.data.address == scene ? " (scene)" : "");
+	}
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
+	g_pre_last_hash = hash;
+	g_pre_repeat    = 1;
+}
+
 void ChainStep(uint64_t hash, bool compute, const PreparedBindings* bindings,
                std::span<const RenderColorInfo> colors, uint32_t written_mask, bool taa) {
+	PreDumpStep(hash, compute, bindings, colors, written_mask, taa);
 	if (taa && g_dump_on) {
 		g_dump_on = false;
 		std::printf("Frame dump %u: the next TAA came first (no last pass seen)\n", g_dump_number);
@@ -284,6 +395,16 @@ void ChainStep(uint64_t hash, bool compute, const PreparedBindings* bindings,
 		if (last || g_dump_lines >= 96) {
 			g_dump_on = false;
 			std::printf("Frame dump %u: end (%s)\n", g_dump_number, last ? "the last pass" : "96 passes");
+			if (last && g_taa_input_address.load(std::memory_order_relaxed) != 0) {
+				// The next frame's scene passes, up to its TAA.
+				g_pre_on        = true;
+				g_pre_lines     = 0;
+				g_pre_last_hash = 0;
+				g_pre_repeat    = 0;
+				std::printf("Pre-TAA dump %u: the passes that draw into the TAA's colour input (0x%" PRIx64
+				            "), up to the next TAA\n",
+				            g_dump_number, g_taa_input_address.load(std::memory_order_relaxed));
+			}
 		}
 		std::fflush(stdout);
 		return;
@@ -1119,7 +1240,8 @@ void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
 		// (also on for the Playroom render resolution test, KYTY_PLAYROOM_RES_KEEP)
 		return (value != nullptr && value[0] == '1') || std::getenv("KYTY_PLAYROOM_RES_KEEP") != nullptr;
 	}();
-	if (!enabled) return;
+	// (also once the Playroom upscale keeps the game's TAA: its pass's images and targets, 23h)
+	if (!enabled && !(TaaKeepAllowed() && g_redirect_used.load(std::memory_order_relaxed))) return;
 	static std::mutex                mutex;
 	static std::vector<std::string>  seen;
 	std::string line = fmt::format("Composite probe: {} pass (PS {:016x})", composite ? "last" : "TAA",
@@ -1351,6 +1473,10 @@ struct Mix {
 	bool                    tried = false, ok = false;
 	bool                    snapped = false; // the snapshot holds this frame's TAA output
 	uint64_t                used    = 0;
+	// (TAA kept: the game's TAA output, copied into the snapshot at the next draw.)
+	bool    snap_pending = false;
+	ImageId snap_source {};
+	uint64_t snap_address = 0;
 };
 Mix g_mix;
 
@@ -1535,6 +1661,7 @@ struct FsrFrame {
 	float             jitter_x = 0.0f, jitter_y = 0.0f;
 	bool              reset      = false;
 	float             near_plane = 0.1f, far_plane = 1000.0f, fov = 1.0f;
+	float             mv_x = 1.0f, mv_y = 1.0f; // Playroom's motion-vector test factors
 };
 
 void FsrFrameTime(std::chrono::steady_clock::time_point& last, uint64_t dispatches, float& frame_ms) {
@@ -1748,8 +1875,8 @@ bool FsrDispatch(const FsrFrame& frame, std::string& failure) {
 	dispatch.output            = FsrResource(g_sr.output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
 	dispatch.jitterOffset      = {frame.jitter_x, frame.jitter_y};
 	// The game's UV-unit vectors (current minus previous) to FSR's render-size pixels.
-	dispatch.motionVectorScale = {MotionVectorSign() * static_cast<float>(frame.in.width),
-	                              MotionVectorSign() * static_cast<float>(frame.in.height)};
+	dispatch.motionVectorScale = {MotionVectorSign() * frame.mv_x * static_cast<float>(frame.in.width),
+	                              MotionVectorSign() * frame.mv_y * static_cast<float>(frame.in.height)};
 	dispatch.renderSize        = {frame.in.width, frame.in.height};
 	dispatch.upscaleSize       = {frame.out.width, frame.out.height};
 	dispatch.enableSharpening  = g_fsr_api.sharpness > 0.0f;
@@ -1932,8 +2059,8 @@ bool FsrDispatch(const FsrFrame& frame, std::string& failure) {
 	dispatch.output        = FsrNativeResource(g_sr.output, L"KytyFsrOutput", true);
 	dispatch.jitterOffset  = {frame.jitter_x, frame.jitter_y};
 	// The game's UV-unit vectors (current minus previous) to FSR's render-size pixels.
-	dispatch.motionVectorScale = {MotionVectorSign() * static_cast<float>(frame.in.width),
-	                              MotionVectorSign() * static_cast<float>(frame.in.height)};
+	dispatch.motionVectorScale = {MotionVectorSign() * frame.mv_x * static_cast<float>(frame.in.width),
+	                              MotionVectorSign() * frame.mv_y * static_cast<float>(frame.in.height)};
 	dispatch.renderSize        = {frame.in.width, frame.in.height};
 	dispatch.upscaleSize       = {frame.out.width, frame.out.height};
 	dispatch.enableSharpening  = f.sharpness > 0.0f;
@@ -2107,6 +2234,13 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	}();
 	constants.motionVectorsJittered = mv_jittered ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	constants.reset                 = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+	const MvAdjust mv_adjust = redirect ? PlayroomMvAdjust() : MvAdjust {};
+	constants.mvecScale.x *= mv_adjust.x;
+	constants.mvecScale.y *= mv_adjust.y;
+	// Astro's Playroom, its TAA kept (23h): the game's TAA draws after the upscaler, from the same
+	// inputs, and its targets are left to it.
+	const bool keep_taa = redirect && TaaKeepAllowed();
+	if (redirect) g_taa_input_address.store(color_address, std::memory_order_relaxed);
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	std::unique_lock sl_lock(g_sl_mutex, std::defer_lock);
@@ -2178,6 +2312,8 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		frame.near_plane = constants.cameraNear;
 		frame.far_plane  = constants.cameraFar;
 		frame.fov        = constants.cameraFOV;
+		frame.mv_x       = mv_adjust.x;
+		frame.mv_y       = mv_adjust.y;
 		ok               = FsrDispatch(frame, failure);
 	} else {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -2226,11 +2362,19 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		return false;
 	}
 	g_sr.failures = 0;
+	g_state_touched = true;
+	if (keep_taa) {
+		// The game's TAA draws next: its textures as its bindings expect them.
+		color.Transit(keep_color.layout, keep_color.access_mask, {}, vk_command);
+		motion.Transit(keep_motion.layout, keep_motion.access_mask, {}, vk_command);
+		depth.Transit(keep_depth.layout, keep_depth.access_mask, {}, vk_command);
+	}
 	// The output and the next frame's history (read by the game's reprojection passes too).
 	Transition(vk_command, g_sr.output, vk::ImageAspectFlagBits::eColor,
 	           vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	           vk::PipelineStageFlagBits2::eTransfer);
 	for (auto* target: {&out0, &out1}) {
+		if (keep_taa) break; // (the game's TAA writes both)
 		if (redirect && target == &out1 && !HistoryCopyAllowed()) continue;
 		target->Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
 		                vk_command);
@@ -2255,8 +2399,15 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		}
 		target->NoteContentWrite();
 	}
-	g_mix.snapped = false;
-	if (redirect && MixAllowed() && out0.backing.format == vk::Format::eR16G16B16A16Sfloat) {
+	g_mix.snapped      = false;
+	g_mix.snap_pending = false;
+	if (keep_taa && MixAllowed() && out0.backing.format == vk::Format::eR16G16B16A16Sfloat) {
+		// The snapshot is the game's own TAA output, copied once its draw is recorded (at the next
+		// draw, SnapAfterTaa).
+		g_mix.snap_pending = true;
+		g_mix.snap_source  = colors[0].image_id;
+		g_mix.snap_address = out0.info.data.address;
+	} else if (redirect && MixAllowed() && out0.backing.format == vk::Format::eR16G16B16A16Sfloat) {
 		// The composite's snapshot: the TAA output as the game's image holds it now (the same blit),
 		// so what the game draws into it later is the change (RedirectComposite, MixComposite).
 		Configure(graphics, g_mix.snap, g_mix.snap_view, out0.backing);
@@ -2312,6 +2463,17 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		g_sr.jitter_max_x = g_sr.jitter_max_y = -1e9f;
 		g_sr.resets = 0;
 	}
+	if (keep_taa) {
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			std::printf("%s: the game's TAA draws too (its two targets are its own; the last pass reads the "
+			            "upscaled image in place of the render-size one; KYTY_PLAYROOM_TAA_KEEP)\n",
+			            name);
+			std::fflush(stdout);
+		}
+		return false;
+	}
 	return true;
 #else
 	(void)graphics;
@@ -2320,6 +2482,60 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	(void)pixel;
 	(void)user_data;
 	(void)colors;
+	return false;
+#endif
+}
+
+bool TakeUpscaleStateTouched() {
+	const bool touched = g_state_touched;
+	g_state_touched    = false;
+	return touched;
+}
+
+bool SnapPending() {
+#ifdef KYTY_UPSCALER_CODE
+	return g_mix.snap_pending;
+#else
+	return false;
+#endif
+}
+
+bool SnapAfterTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command) {
+#ifdef KYTY_UPSCALER_CODE
+	if (!g_mix.snap_pending) return false;
+	g_mix.snap_pending = false;
+	if (!g_mix.snap_source) return false;
+	auto& game = cache.GetImage(g_mix.snap_source);
+	if (game.backing.image == nullptr || game.info.data.address != g_mix.snap_address ||
+	    game.backing.format != vk::Format::eR16G16B16A16Sfloat) {
+		return false;
+	}
+	command.EndRendering();
+	auto vk_command = command.Handle();
+	Configure(graphics, g_mix.snap, g_mix.snap_view, game.backing);
+	const auto keep = game.backing.state;
+	game.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, vk_command);
+	Transition(vk_command, g_mix.snap, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal,
+	           vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {std::min(game.backing.extent.width, g_mix.snap.extent.width),
+                                std::min(game.backing.extent.height, g_mix.snap.extent.height), 1};
+	vk_command.copyImage(game.backing.image, vk::ImageLayout::eTransferSrcOptimal, g_mix.snap.image,
+	                     vk::ImageLayout::eTransferDstOptimal, copy);
+	Transition(vk_command, g_mix.snap, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eShaderReadOnlyOptimal,
+	           vk::AccessFlagBits2::eShaderSampledRead, vk::PipelineStageFlagBits2::eComputeShader);
+	if (keep.layout != vk::ImageLayout::eUndefined) {
+		game.Transit(keep.layout, keep.access_mask, {}, vk_command);
+	}
+	command.ForgetBoundState();
+	g_mix.snapped = true;
+	return true;
+#else
+	(void)graphics;
+	(void)cache;
+	(void)command;
 	return false;
 #endif
 }

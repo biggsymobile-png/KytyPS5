@@ -285,6 +285,18 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
   console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
   is skipped (its physics and ultrawide mods still apply).
+- **Build 23h (test): Playroom keeps the game's own TAA beside DLSS/FSR.** In 23g the upscaler
+  replaced the game's TAA, and shadows, particles and reflections went missing or flickered: the
+  TAA's second (output-size) target is read by the last pass too, and only the game's TAA fills it
+  correctly. Now the game's TAA draws as usual, the upscaler runs beside it from the same inputs,
+  and the last pass gets the upscaled image (plus what the game drew after its TAA) in place of the
+  render-size one. The scene still renders at the lower resolution; the game's TAA pass costs a
+  little extra. The console shows `the game's TAA draws too`. `"KYTY_PLAYROOM_TAA_KEEP": "0",`
+  goes back to 23g's behaviour. Tests in this build: `"KYTY_PLAYROOM_MV_FLIP": "x"` (or `"y"`,
+  `"xy"`) and `"KYTY_PLAYROOM_MV_SCALE": "2"` change the motion vectors given to the upscaler (try
+  them if there is ghosting); the console also logs the TAA pass's images (`Composite probe: TAA
+  pass`) and, after each `Frame dump`, a `Pre-TAA dump` of the passes that draw into the scene
+  before the TAA.
 - **Build 23g (test): Playroom upscaling keeps the effects drawn after the TAA.** In 23f the
   upscaled image replaced the game's whole picture, so what the game draws after its TAA (bloom,
   explosion debris, other particles and late effects) disappeared, and in gameplay the image often

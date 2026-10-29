@@ -121,6 +121,16 @@ void ProbeDispatch(uint64_t compute_shader, const PreparedBindings& bindings, ui
 [[nodiscard]] bool RedirectComposite(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                                      PreparedBindings& pixel, std::span<const RenderColorInfo> colors);
 
+// Astro's Playroom, the game's TAA kept (KYTY_PLAYROOM_TAA_KEEP, test build 23h): UpscaleTaa ran
+// the upscaler but returned false so the game's TAA draws; true once: it recorded commands (the
+// draw run state is stale). GPU thread.
+[[nodiscard]] bool TakeUpscaleStateTouched();
+// Whether the game's TAA output is still to be copied into the composite's snapshot (one load).
+[[nodiscard]] bool SnapPending();
+// At the draw after the TAA, before anything of it is recorded: copies the game's TAA output into
+// the snapshot (outside rendering). True: commands were recorded (the draw run state is stale).
+[[nodiscard]] bool SnapAfterTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command);
+
 // GPU thread, every draw after its bindings are prepared (while Enabled()).
 void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
             std::span<const PreparedBindings* const> vertex, std::span<const RenderColorInfo> colors,
