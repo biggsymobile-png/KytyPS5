@@ -290,6 +290,9 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   TAA outputs and HUD, which should keep their full size so that DLSS/FSR upscales for real and the
   HUD stays sharp. `"KYTY_PLAYROOM_RES_KEEP": "3",` (in `u59-preset.json`) keeps group 3 at the
   game's own sizes, and so on for 1 to 5, and logs `Composite probe:` lines. Testers only.
+  Also two fixes from [moooohung](https://github.com/moooohung) (pull request #2): Korean and
+  Japanese text in games no longer shows as `?` (every installed CJK font is tried, not only the
+  first), and FSR frame generation enables the Vulkan extensions FSR needs without FSR upscaling.
 - **Build 23c (test): the built-in Decouple finds the game's frame update by its shape**, so it
   should work in other versions of both games too (the console says `agrees with the known one`
   on 01.018.000 and 01.905.000; on another version, `built-in one on` or, if it is not sure,
