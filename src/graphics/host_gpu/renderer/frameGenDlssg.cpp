@@ -55,6 +55,9 @@
 // from the built-in FidelityFX SDK sources (KYTY_FSR_NATIVE: Linux, macOS).
 #if defined(KYTY_FRAMEGEN_STREAMLINE) || defined(KYTY_FSR_NATIVE)
 #define KYTY_UPSCALER_CODE 1
+#include "gpu_playroom_shaders/gpu_playroom_mix_spv.h"
+
+#include <array>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -165,6 +168,7 @@ struct Redirect {
 	vk::Extent2D  big {};      // the upscaled image's
 	vk::ImageView view = nullptr;
 	uint64_t      flip = 0;
+	vk::Format    format = vk::Format::eUndefined; // the TAA output's
 };
 Redirect          g_redirect;               // GPU thread
 std::atomic<bool> g_redirect_used {false};  // the last pass read it once (turns the chain probe on)
@@ -191,8 +195,34 @@ bool ChainProbeOn() {
 	return forced || g_redirect_used.load(std::memory_order_relaxed);
 }
 
+// Frame dump (test build): from the TAA of upscaled frames 600, 1800, 3600 and 7200 (UpscaleTaa,
+// ChainDumpFrame), every pass up to the last pass that reads or writes an image made from the TAA
+// output, in order and with repeats ("Frame dump N.k: ..."), unlike the chain probe's first-seen
+// lines. GPU thread.
+bool     g_dump_pending = false;
+bool     g_dump_on      = false;
+uint32_t g_dump_number  = 0;
+uint32_t g_dump_lines   = 0;
+
+[[maybe_unused]] void ChainDumpFrame(uint64_t frame) {
+	if (frame == 600 || frame == 1800 || frame == 3600 || frame == 7200) g_dump_pending = true;
+}
+
 void ChainStep(uint64_t hash, bool compute, const PreparedBindings* bindings,
                std::span<const RenderColorInfo> colors, uint32_t written_mask, bool taa) {
+	if (taa && g_dump_on) {
+		g_dump_on = false;
+		std::printf("Frame dump %u: the next TAA came first (no last pass seen)\n", g_dump_number);
+		std::fflush(stdout);
+	}
+	if (!taa && g_dump_pending) {
+		g_dump_pending = false;
+		g_dump_on      = true;
+		g_dump_lines   = 0;
+		std::printf("Frame dump %u: the passes after the TAA that read or write its output's chain\n",
+		            ++g_dump_number);
+		std::fflush(stdout);
+	}
 	if (taa) {
 		const uint64_t address = colors.empty() ? 0 : colors[0].desc.info.data.address;
 		g_chain_count.store(0, std::memory_order_relaxed);
@@ -203,7 +233,7 @@ void ChainStep(uint64_t hash, bool compute, const PreparedBindings* bindings,
 		return;
 	}
 	const uint32_t count = g_chain_count.load(std::memory_order_relaxed);
-	if (count == 0 || bindings == nullptr) return;
+	if (count == 0) return;
 	const auto tracked = [&](uint64_t address) {
 		if (address == 0) return false;
 		for (uint32_t i = 0; i < count; i++) {
@@ -211,15 +241,25 @@ void ChainStep(uint64_t hash, bool compute, const PreparedBindings* bindings,
 		}
 		return false;
 	};
-	bool reads = false;
-	for (size_t i = 0; i < bindings->images.size() && !reads; i++) {
-		if (i < 32 && (written_mask & (1u << i)) != 0) continue;
-		reads = tracked(bindings->images[i].desc.info.data.address);
+	const size_t image_count = bindings == nullptr ? 0 : bindings->images.size();
+	bool reads = false, writes = false;
+	for (size_t i = 0; i < image_count; i++) {
+		const bool written = i < 32 && (written_mask & (1u << i)) != 0;
+		const bool in_chain = tracked(bindings->images[i].desc.info.data.address);
+		reads  = reads || (!written && in_chain);
+		writes = writes || (written && in_chain);
 	}
-	if (!reads) return;
-	std::string line = fmt::format("Chain probe: {} {:016x}", compute ? "dispatch CS" : "draw PS", hash);
+	for (const auto& color: colors) {
+		writes = writes || tracked(color.desc.info.data.address);
+	}
+	const bool last = !compute && hash == CompositePixelShader;
+	const bool dump = g_dump_on && (reads || writes || last);
+	if (!reads && !dump) return;
+	std::string line = dump ? fmt::format("Frame dump {}.{}: {} {:016x}", g_dump_number, ++g_dump_lines,
+	                                      compute ? "dispatch CS" : "draw PS", hash)
+	                        : fmt::format("Chain probe: {} {:016x}", compute ? "dispatch CS" : "draw PS", hash);
 	std::vector<uint64_t> outputs;
-	for (size_t i = 0; i < bindings->images.size() && i < 8; i++) {
+	for (size_t i = 0; i < image_count && i < 8; i++) {
 		const auto& info    = bindings->images[i].desc.info;
 		const bool  written = i < 32 && (written_mask & (1u << i)) != 0;
 		line += fmt::format("; {} {} {}x{} {} at 0x{:x}{}", written ? "writes image" : "image", i,
@@ -239,6 +279,15 @@ void ChainStep(uint64_t hash, bool compute, const PreparedBindings* bindings,
 		g_chain[n++].store(address, std::memory_order_relaxed);
 	}
 	g_chain_count.store(n, std::memory_order_relaxed);
+	if (dump) {
+		std::printf("%s\n", line.c_str());
+		if (last || g_dump_lines >= 96) {
+			g_dump_on = false;
+			std::printf("Frame dump %u: end (%s)\n", g_dump_number, last ? "the last pass" : "96 passes");
+		}
+		std::fflush(stdout);
+		return;
+	}
 	static std::mutex               mutex;
 	static std::vector<std::string> seen;
 	std::lock_guard lock(mutex);
@@ -1289,6 +1338,131 @@ bool ConfigureOutput(GraphicContext& graphics, vk::Extent2D size, vk::Format for
 	return true;
 }
 
+// Astro's Playroom upscale, the last pass's image (KYTY_PLAYROOM_UPSCALE): the upscaled TAA output
+// plus what the game drew into its render-size image after the TAA (bloom, particles, late
+// effects), as the change from a snapshot taken at the TAA (shaders/gpu_playroom_mix.comp).
+struct Mix {
+	VulkanImage             snap, out;     // render size (at the TAA), output size (the last pass's)
+	vk::ImageView           snap_view = nullptr, out_view = nullptr;
+	vk::Sampler             sampler    = nullptr;
+	vk::DescriptorSetLayout set_layout = nullptr;
+	vk::PipelineLayout      layout     = nullptr;
+	vk::Pipeline            pipeline   = nullptr;
+	bool                    tried = false, ok = false;
+	bool                    snapped = false; // the snapshot holds this frame's TAA output
+	uint64_t                used    = 0;
+};
+Mix g_mix;
+
+bool MixAllowed() {
+	static const bool allowed = [] {
+		const char* value = std::getenv("KYTY_PLAYROOM_MIX");
+		return value == nullptr || value[0] != '0';
+	}();
+	return allowed;
+}
+
+// KYTY_PLAYROOM_HISTORY_COPY=0: the upscaler's output is not copied into the TAA pass's second
+// target (the next frame's history), only into its output (test: the flashing shadow).
+bool HistoryCopyAllowed() {
+	static const bool allowed = [] {
+		const char* value = std::getenv("KYTY_PLAYROOM_HISTORY_COPY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return allowed;
+}
+
+bool EnsureMixPipeline(GraphicContext& graphics) {
+	if (g_mix.tried) return g_mix.ok;
+	g_mix.tried = true;
+	if (graphics.max_push_descriptors < 4) {
+		std::printf("DLSS upscaling: the Playroom composite needs push descriptors; the last pass "
+		            "reads the upscaled image alone\n");
+		std::fflush(stdout);
+		return false;
+	}
+	vk::SamplerCreateInfo sampler {};
+	sampler.magFilter    = vk::Filter::eLinear;
+	sampler.minFilter    = vk::Filter::eLinear;
+	sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
+	sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+	sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+	sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+	sampler.maxLod       = 0.0f;
+	RequireVulkanSuccess(graphics.device.createSampler(&sampler, nullptr, &g_mix.sampler),
+	                     "Playroom composite sampler");
+	const std::array<vk::DescriptorSetLayoutBinding, 4> bindings {{
+	    {0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {1, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {2, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {3, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	}};
+	vk::DescriptorSetLayoutCreateInfo set_info {};
+	set_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	set_info.bindingCount = static_cast<uint32_t>(bindings.size());
+	set_info.pBindings    = bindings.data();
+	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&set_info, nullptr, &g_mix.set_layout),
+	                     "Playroom composite descriptor layout");
+	const vk::PushConstantRange push_range {vk::ShaderStageFlagBits::eCompute, 0, 2 * sizeof(uint32_t)};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount         = 1;
+	layout_info.pSetLayouts            = &g_mix.set_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges    = &push_range;
+	RequireVulkanSuccess(graphics.device.createPipelineLayout(&layout_info, nullptr, &g_mix.layout),
+	                     "Playroom composite pipeline layout");
+	const auto module = CompileSPV(std::span<const uint32_t> {GPU_PLAYROOM_MIX_SPV}, graphics.device);
+	vk::ComputePipelineCreateInfo create {};
+	create.stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	create.stage.module = module;
+	create.stage.pName  = "main";
+	create.layout       = g_mix.layout;
+	const auto result = graphics.device.createComputePipelines(nullptr, 1, &create, nullptr, &g_mix.pipeline);
+	graphics.device.destroyShaderModule(module, nullptr);
+	RequireVulkanSuccess(result, "Playroom composite pipeline");
+	g_mix.ok = true;
+	return true;
+}
+
+// (Re)creates the composite's output-size image.
+bool EnsureMixOutput(GraphicContext& graphics, vk::Extent2D size, vk::Format format) {
+	auto& image = g_mix.out;
+	if (image.image != nullptr && image.format == format && image.extent.width == size.width &&
+	    image.extent.height == size.height) {
+		return true;
+	}
+	if (g_mix.out_view != nullptr) {
+		graphics.device.destroyImageView(g_mix.out_view, nullptr);
+		g_mix.out_view = nullptr;
+	}
+	if (image.image != nullptr) {
+		graphics.DeleteImage(image);
+	}
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {size.width, size.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, image)) return false;
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = image.image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = format;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	if (graphics.device.createImageView(&view_info, nullptr, &g_mix.out_view) != vk::Result::eSuccess) {
+		g_mix.out_view = nullptr;
+		graphics.DeleteImage(image);
+		return false;
+	}
+	return true;
+}
+
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 const char* ModeName(sl::DLSSMode mode) {
 	switch (mode) {
@@ -2057,6 +2231,7 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	           vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	           vk::PipelineStageFlagBits2::eTransfer);
 	for (auto* target: {&out0, &out1}) {
+		if (redirect && target == &out1 && !HistoryCopyAllowed()) continue;
 		target->Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
 		                vk_command);
 		const auto& size = target->backing.extent;
@@ -2080,6 +2255,27 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		}
 		target->NoteContentWrite();
 	}
+	g_mix.snapped = false;
+	if (redirect && MixAllowed() && out0.backing.format == vk::Format::eR16G16B16A16Sfloat) {
+		// The composite's snapshot: the TAA output as the game's image holds it now (the same blit),
+		// so what the game draws into it later is the change (RedirectComposite, MixComposite).
+		Configure(graphics, g_mix.snap, g_mix.snap_view, out0.backing);
+		Transition(vk_command, g_mix.snap, vk::ImageAspectFlagBits::eColor,
+		           vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+		           vk::PipelineStageFlagBits2::eTransfer);
+		vk::ImageBlit blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(out.width), static_cast<int32_t>(out.height), 1};
+		blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(g_mix.snap.extent.width),
+		                                    static_cast<int32_t>(g_mix.snap.extent.height), 1};
+		vk_command.blitImage(g_sr.output.image, vk::ImageLayout::eTransferSrcOptimal, g_mix.snap.image,
+		                     vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+		Transition(vk_command, g_mix.snap, vk::ImageAspectFlagBits::eColor,
+		           vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead,
+		           vk::PipelineStageFlagBits2::eComputeShader);
+		g_mix.snapped = true;
+	}
 	if (redirect) {
 		// Sampled by the last pass (RedirectComposite) until the next frame's upscale.
 		Transition(vk_command, g_sr.output, vk::ImageAspectFlagBits::eColor,
@@ -2090,6 +2286,8 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		g_redirect.big     = out;
 		g_redirect.view    = g_sr.output_view;
 		g_redirect.flip    = flip;
+		g_redirect.format  = out0.backing.format;
+		ChainDumpFrame(g_sr.evaluated + 1);
 	} else {
 		g_redirect.address = 0;
 	}
@@ -2126,7 +2324,8 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 #endif
 }
 
-bool RedirectComposite(PreparedBindings& pixel, std::span<const RenderColorInfo> colors) {
+bool RedirectComposite(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
+                       PreparedBindings& pixel, std::span<const RenderColorInfo> colors) {
 #ifdef KYTY_UPSCALER_CODE
 	if (!g_sr_ready.load(std::memory_order_relaxed) || g_sr.disabled || !PlayroomUpscaleAllowed()) {
 		return false;
@@ -2141,27 +2340,98 @@ bool RedirectComposite(PreparedBindings& pixel, std::span<const RenderColorInfo>
 	if (r.address == 0 || r.view == nullptr || r.view != g_sr.output_view || flip > r.flip + 1) {
 		return false;
 	}
-	bool changed = false;
-	for (auto& image: pixel.images) {
+	// The game's render-size image the last pass reads: its TAA output, or (gameplay) an image a
+	// pass after the TAA made from it; the same size and format either way.
+	const auto candidate = [&](const TextureBinding& image) {
 		const auto& info = image.desc.info;
-		if (info.data.address != r.address || info.extent.width != r.small_extent.width ||
-		    info.extent.height != r.small_extent.height || !image.mip_views.empty() ||
-		    image.desc.type == TextureCache::BindingType::Storage) {
-			continue;
+		return info.extent.width == r.small_extent.width && info.extent.height == r.small_extent.height &&
+		       image.mip_views.empty() && image.desc.type != TextureCache::BindingType::Storage &&
+		       static_cast<bool>(image.image_id);
+	};
+	TextureBinding* target = nullptr;
+	for (auto& image: pixel.images) {
+		if (candidate(image) && image.desc.info.data.address == r.address) {
+			target = &image;
+			break;
 		}
-		image.image_view      = r.view;
-		image.external_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
-		changed               = true;
 	}
-	if (changed && !g_redirect_used.exchange(true, std::memory_order_relaxed)) {
+	const bool mix = MixAllowed() && g_mix.snapped;
+	if (target == nullptr && mix) {
+		for (auto& image: pixel.images) {
+			if (candidate(image)) {
+				target = &image;
+				break;
+			}
+		}
+	}
+	if (target == nullptr) return false;
+	const char* name      = g_fsr ? "FSR upscaling" : "DLSS upscaling";
+	vk::ImageView view    = r.view;
+	bool          mixed   = false;
+	auto&         game    = cache.GetImage(target->image_id);
+	if (mix && game.backing.image != nullptr && game.backing.format == r.format &&
+	    game.backing.extent.width == r.small_extent.width &&
+	    game.backing.extent.height == r.small_extent.height && EnsureMixPipeline(graphics) &&
+	    EnsureMixOutput(graphics, r.big, r.format)) {
+		// Outside rendering: out = upscaled + (the game's image now - its snapshot at the TAA).
+		command.EndRendering();
+		auto vk_command = command.Handle();
+		game.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
+		             vk_command);
+		Transition(vk_command, g_mix.out, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+		           vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eComputeShader);
+		const vk::DescriptorImageInfo upscaled_info {g_mix.sampler, r.view,
+		                                             vk::ImageLayout::eShaderReadOnlyOptimal};
+		const vk::DescriptorImageInfo now_info {g_mix.sampler, target->image_view,
+		                                        vk::ImageLayout::eShaderReadOnlyOptimal};
+		const vk::DescriptorImageInfo snap_info {g_mix.sampler, g_mix.snap_view,
+		                                         vk::ImageLayout::eShaderReadOnlyOptimal};
+		const vk::DescriptorImageInfo out_info {nullptr, g_mix.out_view, vk::ImageLayout::eGeneral};
+		std::array<vk::WriteDescriptorSet, 4> writes {};
+		for (uint32_t i = 0; i < writes.size(); i++) {
+			writes[i].dstBinding      = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType  = i == 3 ? vk::DescriptorType::eStorageImage
+			                                   : vk::DescriptorType::eCombinedImageSampler;
+		}
+		writes[0].pImageInfo = &upscaled_info;
+		writes[1].pImageInfo = &now_info;
+		writes[2].pImageInfo = &snap_info;
+		writes[3].pImageInfo = &out_info;
+		command.PushDescriptors(vk::PipelineBindPoint::eCompute, g_mix.layout, 0,
+		                        static_cast<uint32_t>(writes.size()), writes.data(), true);
+		command.BindPipeline(vk::PipelineBindPoint::eCompute, g_mix.pipeline);
+		const uint32_t push[2] {r.big.width, r.big.height};
+		vk_command.pushConstants(g_mix.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push);
+		vk_command.dispatch((r.big.width + 7) / 8, (r.big.height + 7) / 8, 1);
+		Transition(vk_command, g_mix.out, vk::ImageAspectFlagBits::eColor,
+		           vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead,
+		           vk::PipelineStageFlagBits2::eFragmentShader);
+		command.ForgetBoundState();
+		view  = g_mix.out_view;
+		mixed = true;
+		if (g_mix.used++ == 0) {
+			std::printf("%s: the last pass reads the %ux%u upscaled image plus what the game drew "
+			            "after its TAA (KYTY_PLAYROOM_MIX)\n",
+			            name, r.big.width, r.big.height);
+			std::fflush(stdout);
+		}
+	} else if (target->desc.info.data.address != r.address) {
+		return false; // (an image made after the TAA: the upscaled image alone would lose it)
+	}
+	target->image_view      = view;
+	target->external_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	if (!g_redirect_used.exchange(true, std::memory_order_relaxed) && !mixed) {
 		std::printf("%s: the last pass reads the %ux%u upscaled image in place of the game's %ux%u "
 		            "TAA output (KYTY_PLAYROOM_UPSCALE)\n",
-		            g_fsr ? "FSR upscaling" : "DLSS upscaling", r.big.width, r.big.height,
-		            r.small_extent.width, r.small_extent.height);
+		            name, r.big.width, r.big.height, r.small_extent.width, r.small_extent.height);
 		std::fflush(stdout);
 	}
-	return changed;
+	return true;
 #else
+	(void)graphics;
+	(void)cache;
+	(void)command;
 	(void)pixel;
 	(void)colors;
 	return false;

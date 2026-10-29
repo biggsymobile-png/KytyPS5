@@ -1,0 +1,39 @@
+#version 450
+// Astro's Playroom upscale (frameGenDlssg.cpp, MixComposite): the image its last pass reads, at
+// the output size: the upscaled TAA output plus what the game drew into its render-size image
+// after the TAA (bloom, particles, other late effects), taken as the change from a snapshot of
+// that image made at the TAA. Where the late change is small next to the scene (a glow over it),
+// the upscaled detail stays; where it covers the scene (debris, an opaque effect), the game's own
+// image shows, filtered up from the render size.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D upscaled; // output size: the upscaler's output
+layout(binding = 1) uniform sampler2D now;      // render size: the game's image, as the last pass reads it
+layout(binding = 2) uniform sampler2D snap;     // render size: that image at the TAA
+layout(binding = 3, rgba16f) uniform writeonly image2D result;
+
+layout(push_constant) uniform Push {
+	uvec2 size; // output size
+} push;
+
+float Luma(vec3 c) {
+	return dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+	uvec2 xy = gl_GlobalInvocationID.xy;
+	if (xy.x >= push.size.x || xy.y >= push.size.y) {
+		return;
+	}
+	vec2 uv     = (vec2(xy) + 0.5) / vec2(push.size);
+	vec4 base   = texelFetch(upscaled, ivec2(xy), 0);
+	vec4 late   = textureLod(now, uv, 0.0);
+	vec4 before = textureLod(snap, uv, 0.0);
+	// The upscaled image's detail over the render-size one it was reduced to.
+	vec4 detail = base - before;
+	// How much the late passes replaced the scene here (0: untouched or a faint glow, 1: covered).
+	float change  = Luma(abs(late.rgb - before.rgb));
+	float covered = smoothstep(0.15, 0.6, change / max(Luma(before.rgb), 1e-3));
+	imageStore(result, ivec2(xy), max(late + detail * (1.0 - covered), vec4(0.0)));
+}

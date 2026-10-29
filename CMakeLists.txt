@@ -502,6 +502,24 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gpu_mesh_indirect_header}")
 
+# Astro's Playroom upscale (renderer/frameGenDlssg.cpp): the last pass's image, the upscaled TAA
+# output plus what the game drew after its TAA.
+set(gpu_playroom_generated_dir "${PROJECT_BINARY_DIR}/gpu_playroom_shaders")
+set(gpu_playroom_mix_source "${gpu_tiler_shader_dir}/gpu_playroom_mix.comp")
+set(gpu_playroom_mix_spv "${gpu_playroom_generated_dir}/gpu_playroom_mix.spv")
+set(gpu_playroom_mix_header "${gpu_playroom_generated_dir}/gpu_playroom_mix_spv.h")
+add_custom_command(
+	OUTPUT "${gpu_playroom_mix_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_playroom_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${gpu_playroom_mix_spv}" "${gpu_playroom_mix_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_playroom_mix_spv} -DOUTPUT=${gpu_playroom_mix_header}
+	        -DSYMBOL=GPU_PLAYROOM_MIX_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${gpu_playroom_mix_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${gpu_playroom_mix_header}")
+
 # Persistent program cache (KYTY_PROGRAM_CACHE, pipeline/programDiskCache.h): the codegen version
 # (recompiler/CodegenFingerprint.h) hashes these files, the code that determines what translating
 # a program produces. src/codegen_version.cmake fails the build when one of them includes a

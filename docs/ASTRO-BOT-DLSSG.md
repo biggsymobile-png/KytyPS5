@@ -285,6 +285,17 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
   console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
   is skipped (its physics and ultrawide mods still apply).
+- **Build 23g (test): Playroom upscaling keeps the effects drawn after the TAA.** In 23f the
+  upscaled image replaced the game's whole picture, so what the game draws after its TAA (bloom,
+  explosion debris, other particles and late effects) disappeared, and in gameplay the image often
+  stayed at 720p. Now the last pass gets the upscaled image plus whatever the game drew after the
+  TAA: the 3D scene is upscaled, and the late effects are drawn over it at the render resolution.
+  The console shows `the last pass reads the ... upscaled image plus what the game drew after its
+  TAA`. `"KYTY_PLAYROOM_MIX": "0",` goes back to 23f's behaviour. Tests in this build:
+  `"KYTY_PLAYROOM_HISTORY_COPY": "0",` stops copying the upscaled image into the TAA's history
+  (try it if the shadow under Astro flashes), and the console logs four `Frame dump` lists
+  (about 10 s, 30 s, 1 and 2 minutes in), every pass from the TAA to the last pass in order. Keep
+  `KYTY_PLAYROOM_RES_KEEP` out of `u59-preset.json`.
 - **Build 23f (test): real DLSS/FSR upscaling in Astro's Playroom, first step.** (23e did not build on Windows; 23f is the same change with that fixed.) With DLSS or FSR
   upscaling on and a lower render resolution, Playroom renders the 3D scene at that resolution,
   and DLSS/FSR now upscales it to the full output size, as in Astro Bot (before, DLSS only cleaned

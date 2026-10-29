@@ -114,9 +114,12 @@ void ProbeDispatch(uint64_t compute_shader, const PreparedBindings& bindings, ui
 // Astro's Playroom upscale (its TAA output is the render size; KYTY_PLAYROOM_UPSCALE=0: off): at
 // the last pass's draw (CompositePixelShader), after its bindings are prepared. Notes the last
 // pass's target size (UpscaleTaa upscales to it from the next frame on), and points the binding
-// of the game's TAA output at this frame's upscaled image. True: a binding was changed (its image
-// descriptors must be written, not kept from an earlier draw).
-[[nodiscard]] bool RedirectComposite(PreparedBindings& pixel, std::span<const RenderColorInfo> colors);
+// of the game's render-size image at an output-size one: this frame's upscaled image plus what the
+// game drew into its image after the TAA (a compute pass recorded here, outside rendering;
+// KYTY_PLAYROOM_MIX=0: the upscaled image alone). True: a binding was changed (its image
+// descriptors must be written, not kept from an earlier draw, and the draw run state is stale).
+[[nodiscard]] bool RedirectComposite(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
+                                     PreparedBindings& pixel, std::span<const RenderColorInfo> colors);
 
 // GPU thread, every draw after its bindings are prepared (while Enabled()).
 void OnDraw(uint64_t pixel_shader, const PreparedBindings* pixel,

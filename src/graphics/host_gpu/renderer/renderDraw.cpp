@@ -4343,7 +4343,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.ps_input_info.stage.program != nullptr &&
 	    state.ps_input_info.stage.program->shader_hash == FrameGen::CompositePixelShader) {
 		composite_redirected = FrameGen::RedirectComposite(
-		    *bindings.pixel, std::span {state.color_info, state.color_count});
+		    buffer.GetGraphics(), m_context.GetTextureCache(), buffer, *bindings.pixel,
+		    std::span {state.color_info, state.color_count});
+		if (composite_redirected) {
+			// (It may have ended rendering and bound its own compute pipeline and descriptors.)
+			m_run.valid           = false;
+			m_run_active          = false;
+			m_run_targets_kept    = false;
+			m_dynamic_state.valid = false;
+			for (auto& record: m_run_kept) {
+				record.valid = false;
+			}
+		}
 	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
