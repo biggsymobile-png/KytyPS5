@@ -381,9 +381,12 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 		}
 		m_ui->comboBox_decouple_step_limit->addItem(text, n);
 	}
-	m_ui->comboBox_decouple_step_limit->setCurrentIndex(std::max(
-	    m_ui->comboBox_decouple_step_limit->findData(info.decouple_step_limit),
-	    m_ui->comboBox_decouple_step_limit->findData(30)));
+	// The saved step limit, or 1/30 s if it is not in the list (std::max picked 1/30 over 1/20 and 1/25).
+	int step_limit_index = m_ui->comboBox_decouple_step_limit->findData(info.decouple_step_limit);
+	if (step_limit_index < 0) {
+		step_limit_index = m_ui->comboBox_decouple_step_limit->findData(30);
+	}
+	m_ui->comboBox_decouple_step_limit->setCurrentIndex(step_limit_index);
 	m_ui->comboBox_decouple_key->clear();
 	for (int index = 0; index < 8; index++) {
 		m_ui->comboBox_decouple_key->addItem(

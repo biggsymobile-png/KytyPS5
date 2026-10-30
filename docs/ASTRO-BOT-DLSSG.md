@@ -292,6 +292,8 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   - **Decouple step limit**: 1/20, 1/25, 1/30 (default), 1/35 or 1/40 s. If the game crashes on
     your PC, pick a smaller step: it is safer for the physics, but below that frame rate the game
     slows down a little (at 1/40 s and 30 fps it runs at 75% speed).
+    Before 23r the settings window showed 1/20 and 1/25 as 1/30 and saved 1/30 the next time you
+    pressed Save; they now stay selected.
   - **Decouple on/off key** (default F10): switches Decouple off and back on while you play, for
     a place that still crashes. The console says which state it is in.
 
