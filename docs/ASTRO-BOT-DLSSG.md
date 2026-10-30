@@ -93,16 +93,15 @@ steady, fluid picture. In the tester's words, "ultra smooth because of the perfe
    **Frame rate limit**. Lower the render resolution if your PC cannot hold 60 in the busiest
    levels: evenly timed frames feel far smoother than a rate that keeps dipping.
 
-**Below 60** (40 or 45 gives beautifully even frames) Astro Bot keeps its speed with **Decouple
-built in** (since build 23): no patch file or button combination needed, any version of the game
-(US and EU). The console shows `Decouple: built-in one on`. If it says `not applied` instead, a
+**Below 60** (40 or 45 gives beautifully even frames) Astro Bot and Astro's Playroom keep their
+speed with **Decouple built in**: no patch file or button combination needed, any version and
+region. The console shows `Decouple: built-in one on`. If it says `not applied` instead, a
 "Decouple gameplay timers from render FPS" mod in the patch file is used as before; please report
 that line with your game version. The community "[Fix] Bot rescue" mod is skipped: it slowed the
 game down (see Known issues). If you still see slow motion below 60, go back to 60 and please
 report the level.
 
-Without a variable-refresh display keep FIFO. Astro's Playroom: keep the Vblank frequency at 60
-(see below).
+Without a variable-refresh display keep FIFO.
 
 This build is made like Jetsku's U59 releases (profile-guided optimisation trained on Astro Bot,
 the emulator's diagnostics compiled out) and ships Jetsku's tuned **`u59-preset.json`** next to
@@ -199,25 +198,26 @@ resolution" patch in a patch file takes precedence.
 
 ## Astro's Playroom (PPSA01325)
 
-Playroom uses the same kind of TAA pass as Astro Bot, so everything above works in it: **DLSS-G**,
-**FSR frame generation**, **DLSS and FSR upscaling** and the **render resolution** (tested on
-version 01.905). One difference: Playroom's TAA runs at the render resolution and a later pass of
-its own does the upscale, so DLSS and FSR work there as **anti-aliasing at the render resolution
-(DLAA / native AA)**, not as the upscaler. The console's lines are the same as for Astro Bot.
+Everything above works in Playroom too: **DLSS-G**, **FSR frame generation**, **DLSS and FSR
+upscaling**, the **render resolution** and the **built-in Decouple** (tested on version 01.905).
 
-**Work in progress: real upscaling in Playroom.** The plan is to upscale Playroom's scene just before
-its last pass, so that the game's own HUD is drawn sharp over it. The idea of a late upscale in
-Playroom comes from [iska0702/DLSSKytyPS5](https://github.com/iska0702/DLSSKytyPS5). This build only
-adds a probe that changes nothing on screen. In Playroom it prints up to 24 console lines starting
-`Composite probe:`, listing the image and target sizes and formats of the TAA pass and of the last
-pass. `KYTY_COMPOSITE_PROBE=0` turns it off.
+**Upscaling works differently from Astro Bot.** Playroom's TAA runs at the render resolution and a
+later pass of its own stretches it to the output. So the game renders and runs its TAA as usual,
+DLSS or FSR upscales the scene to the full output size beside it, and the last pass reads the
+upscaled image plus what the game drew after its TAA (bloom, particles, motion blur). The idea of a
+late upscale in Playroom comes from [iska0702/DLSSKytyPS5](https://github.com/iska0702/DLSSKytyPS5).
+DLSS and FSR upscale at most 3x per axis: Playroom always outputs 3840x2160, so at 540p they go to
+2880x1620 and the game stretches the rest. The console shows `the last pass reads the ... upscaled
+image plus what the game drew after its TAA`. The HUD is drawn at the render resolution: sharp at
+1080p and above, a little soft at 720p (a full-size HUD is planned).
+`"KYTY_PLAYROOM_UPSCALE": "0",` goes back to DLSS/FSR as anti-aliasing at the render resolution;
+`"KYTY_PLAYROOM_MASK": "1",` (FSR only) adds a reactive mask for particles and transparency.
 
-**Playroom runs at double speed with a Vblank frequency above 60** unless a "Decouple gameplay
-timers from render FPS" patch is applied (its game logic steps once per frame). Keep Playroom's
-**Vblank frequency at 60** (launcher: the game's settings, Graphics & display; frontends:
-`--vblank-frequency 60`). DLSS-G and FSR frame generation on Windows do not need more. With the
-decouple patch (the console shows `Successfully applied cheat: Decouple gameplay timers from render
-FPS`) a higher rate is fine.
+**Vblank frequency above 60:** fine with the built-in Decouple (before build 23b Playroom ran at
+double speed without a decouple patch, as its game logic steps once per frame). If the console says
+`Decouple: ... not applied` for your version, keep the **Vblank frequency at 60** (launcher: the
+game's settings, Graphics & display; frontends: `--vblank-frequency 60`) or use a patch file's
+decouple mod.
 
 ## Shader maths profile (experimental)
 
@@ -261,9 +261,43 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   image as the 3D scene, so FSR generates it along with the scene. With DLSS-G it is steady.
 - **FSR frame generation on Linux and macOS is new and untested**: it needs the Vblank frequency
   at about twice the game's frame rate and a display that refreshes that fast.
-- **Astro's Playroom at double speed:** a Vblank frequency above 60 without the decouple patch.
-  Set it to 60 for Playroom (see Astro's Playroom above).
-- **New in this build: DualSense gyro no longer drifts.** Every gyro reads a small rotation even
+- **Astro's Playroom at double speed** with a Vblank frequency above 60, only if the built-in
+  Decouple says `not applied` for your version and no patch file decouples it: then set the Vblank
+  frequency to 60 (see Astro's Playroom above).
+- **New in this build (23l): built-in Decouple, real upscaling in Playroom, more game versions.**
+  - **Decouple built in** for Astro Bot (any version and region) and Astro's Playroom (01.905 and
+    versions where it matches): game time follows the real frame time, with the community v3 mod's
+    smoothing and its 1/20 s delta-time cap (`"KYTY_ASTRO_DECOUPLE_DT_CAP": "30",` for 1/30 s). It
+    finds the game's frame update by its code, so no patch file or button combination is needed.
+    The patch file's Decouple and the mods that need it (frame-limiter sleep, precise frame caps,
+    delta-time caps) are skipped while it is on; use the launcher's Frame rate limit instead of
+    the precise caps. Playroom is smoother than with its patch file's mod, and no longer runs at
+    double speed above Vblank 60. The console shows `Decouple: built-in one on`, or `not applied`
+    with the patch file's mod as before. `"KYTY_ASTRO_DECOUPLE": "0",` goes back to the patch file.
+  - **No more slow motion at level starts or mid-stage.** The community "[Fix] Bot rescue" mod is
+    skipped: its hooks mark entering and leaving a level, not rescues, so it switched Decouple off
+    for whole stretches of play. Rescues work normally without it. `"KYTY_ASTRO_RESCUE_FIX": "1",`
+    turns on the built-in version with a 6 s safety timer; if a rescue goes wrong without it, please
+    report it with your log.
+  - **Real DLSS/FSR upscaling in Astro's Playroom**: the scene is upscaled to the output size
+    instead of only anti-aliased at the render resolution (see Astro's Playroom above).
+  - **More Astro Bot versions for the render resolution and the command-buffer fix** (the "too many
+    objects/batches in this scene" crash in busy scenes): **01.007.000**, the version on many discs
+    and unpatched copies, thanks to [moooohung](https://github.com/moooohung) (pull request #3);
+    **other versions**, found by what the code does and only changed when exactly one match is
+    found; and the **Asian edition (PPSA21568)** alongside US and EU. The console says where each
+    change was made, e.g. `Game patch: Astro Bot fixed render resolution 1080p (01.007.000, code at
+    game+0x...)` and `draw-thread command buffers x2 (...; table at game+0x...)`. On a version
+    other than 01.018, please report those two lines, or the `not applied` / `not found` line.
+  - **Gyro centred from the start, and a re-centre key.** The learned resting offset is saved per
+    controller in `gyro-calibration.txt` and loaded at the next start (put the pad down for 3 s in
+    the first session). Hold the controller the way you play and press the re-centre key in the
+    game window (launcher: the game's settings, Graphics & display, "Gyro re-centre key"; default
+    F9) to make that its neutral position.
+  - From [moooohung](https://github.com/moooohung) (pull request #2): Korean and Japanese text no
+    longer shows as `?` (every installed CJK font is tried), and FSR frame generation enables the
+    Vulkan extensions it needs without FSR upscaling.
+- **Fixed in build 20: the DualSense gyro no longer drifts.** Every gyro reads a small rotation even
   at rest, and passed straight to the game it made aiming and tilt creep sideways during play (the
   accelerometer correction already fixed tilt, but nothing can correct heading that way). The
   emulator now measures that resting offset whenever the controller is held still for a moment and
@@ -277,140 +311,8 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   combination), in place of the mod (it is skipped, enabled or not), with a safety net: if Decouple
   stays off for 6 s (15 s before build 22), it is switched back on (the console then shows `Game
   patch: bot rescue fix: Decouple was off ...`). Settings: `"KYTY_ASTRO_RESCUE_TIMEOUT_S": "6",`
-  (2 to 600), and `"KYTY_ASTRO_RESCUE_FIX": "0",` to use the patch file's mod as before.
-- **Build 23b (test): Decouple built in for Astro's Playroom too.** Playroom uses the same timing
-  code as Astro Bot, so the built-in Decouple now covers it (01.905.000; other versions: the patch
-  file's mod as before). Its patch file's Decouple passed the raw frame time to the game, which
-  made Playroom less smooth than Astro Bot at the same settings; the built-in one smooths it the
-  same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
-  console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
-  is skipped (its physics and ultrawide mods still apply).
-- **Build 23l (test): Astro Bot 1.007 and the Asian edition.** The built-in **render resolution**
-  and the **command-buffer fix** (it stops the "too many objects/batches in this scene" crash in
-  busy scenes) now work on more copies of Astro Bot:
-  - **Version 01.007.000**, the version on many discs and unpatched copies, thanks to
-    [moooohung](https://github.com/moooohung) (pull request #3). Before, the render resolution was
-    not applied there, and the crash fix covered only the European 01.018.
-  - **Other versions**: both are now found by what the code does, not only at known places, and
-    are only changed when exactly one match is found.
-  - **All three regions**: ASTRO BOT's US (PPSA21564), European (PPSA21567) and Asian (PPSA21568,
-    new) editions. The built-in Decouple covers the Asian edition too.
-
-  The console now says where it made each change, e.g. `Game patch: Astro Bot fixed render
-  resolution 1080p (01.007.000, code at game+0x...)` and `draw-thread command buffers x2 (...;
-  PPSA21564 01.007.000, table at game+0x...)`. If you play a version other than 01.018 or an
-  Asian copy, please report those two lines, or the `not applied` / `not found` line if it appears.
-- **Build 23k (test): Playroom upscaling at 540p.** DLSS and FSR upscale at most 3x per axis.
-  Playroom always outputs 3840x2160, so a 960x540 render resolution (4x) failed with DLSS (`NGX
-  evaluate feature failed`) and showed a broken picture. Now the upscaler goes as far as 3x
-  (2880x1620 from 540p) and the game's last pass stretches that to its output. The console shows
-  `would be over 3x; upscaled to 2880x1620`. 720p and above are unchanged.
-- **Build 23j (test): Playroom's DLSS/FSR upscaling no longer resizes the game's own buffers.**
-  Builds 23e-23i kept one of Playroom's size groups at the full output size while upscaling, to
-  keep the HUD sharp. That also made the game's TAA history full size while the rest rendered at
-  the lower resolution, which turned out to cause the glass refraction glitches, the missing blob
-  shadow under Astro and the breakage with frame generation on. Now the game renders exactly as it
-  does without upscaling (its TAA included), DLSS or FSR upscales the scene to the output size
-  beside it, and the last pass gets the upscaled image plus what the game drew after its TAA
-  (bloom, motion blur). The HUD is now drawn at the render resolution: sharp at higher render
-  resolutions, a little soft at 720p (a full-size HUD on its own is planned). The 23i mask is off
-  by default (`"KYTY_PLAYROOM_MASK": "1",` turns it on, FSR only) and no longer tagged for DLSS,
-  which removes the `Cannot have undefined format` errors. `"KYTY_PLAYROOM_UPSCALE": "0",` goes
-  back to DLSS/FSR as anti-aliasing at the render resolution. For tests,
-  `"KYTY_PLAYROOM_SHOW": "dlss",` shows the upscaler's image alone (without the late effects) and
-  `"game"` the game's own; `"KYTY_PLAYROOM_RES_KEEP": "2",` restores 23i's resize.
-- **Build 23i (test): a reactive mask for Playroom's particles, reflections and transparency.**
-  What the game draws into its scene after the lighting (particles, decals such as the shadow
-  under Astro, glass and water refraction, reflections) has no motion vectors of its own, so the
-  upscaler smeared or dropped it. Now the scene is copied just before those draws (after the sky),
-  and at the TAA the difference becomes a mask telling the upscaler to trust the current frame
-  there: DLSS's bias-current-colour hint, FSR's reactive mask. The cost is one render-size copy
-  and a small compute pass per frame. The console shows `Playroom mask: on` and, every 600
-  frames, how many masks came from a snapshot. `"KYTY_PLAYROOM_MASK": "0",` turns it off (23h
-  behaviour); `"KYTY_PLAYROOM_MASK_SCALE": "2"` (default 1) makes it stronger, `"0.5"` weaker.
-  For tuning, `"KYTY_PLAYROOM_MASK_VIEW": "1",` shows the mask in place of the picture (white:
-  the upscaler leans on the current frame; black: normal); it changes nothing when unset.
-- **Build 23h (test): Playroom keeps the game's own TAA beside DLSS/FSR.** In 23g the upscaler
-  replaced the game's TAA, and shadows, particles and reflections went missing or flickered: the
-  TAA's second (output-size) target is read by the last pass too, and only the game's TAA fills it
-  correctly. Now the game's TAA draws as usual, the upscaler runs beside it from the same inputs,
-  and the last pass gets the upscaled image (plus what the game drew after its TAA) in place of the
-  render-size one. The scene still renders at the lower resolution; the game's TAA pass costs a
-  little extra. The console shows `the game's TAA draws too`. `"KYTY_PLAYROOM_TAA_KEEP": "0",`
-  goes back to 23g's behaviour. Tests in this build: `"KYTY_PLAYROOM_MV_FLIP": "x"` (or `"y"`,
-  `"xy"`) and `"KYTY_PLAYROOM_MV_SCALE": "2"` change the motion vectors given to the upscaler (try
-  them if there is ghosting); the console also logs the TAA pass's images (`Composite probe: TAA
-  pass`) and, after each `Frame dump`, a `Pre-TAA dump` of the passes that draw into the scene
-  before the TAA.
-- **Build 23g (test): Playroom upscaling keeps the effects drawn after the TAA.** In 23f the
-  upscaled image replaced the game's whole picture, so what the game draws after its TAA (bloom,
-  explosion debris, other particles and late effects) disappeared, and in gameplay the image often
-  stayed at 720p. Now the last pass gets the upscaled image plus whatever the game drew after the
-  TAA: the 3D scene is upscaled, and the late effects are drawn over it at the render resolution.
-  The console shows `the last pass reads the ... upscaled image plus what the game drew after its
-  TAA`. `"KYTY_PLAYROOM_MIX": "0",` goes back to 23f's behaviour. Tests in this build:
-  `"KYTY_PLAYROOM_HISTORY_COPY": "0",` stops copying the upscaled image into the TAA's history
-  (try it if the shadow under Astro flashes), and the console logs four `Frame dump` lists
-  (about 10 s, 30 s, 1 and 2 minutes in), every pass from the TAA to the last pass in order. Keep
-  `KYTY_PLAYROOM_RES_KEEP` out of `u59-preset.json`.
-- **Build 23f (test): real DLSS/FSR upscaling in Astro's Playroom, first step.** (23e did not build on Windows; 23f is the same change with that fixed.) With DLSS or FSR
-  upscaling on and a lower render resolution, Playroom renders the 3D scene at that resolution,
-  and DLSS/FSR now upscales it to the full output size, as in Astro Bot (before, DLSS only cleaned
-  up the low-resolution image and the game stretched it). The HUD stays at full size, so it is
-  sharp. In this build that works on the title screen and menus; in gameplay the game runs one
-  more effect pass after its TAA, which the console logs as `Chain probe:` lines so the next build
-  can carry the upscaled image through it. The console shows `the last pass reads the ...
-  upscaled image`. `"KYTY_PLAYROOM_UPSCALE": "0",` turns it off. Remove any
-  `KYTY_PLAYROOM_RES_KEEP` line from `u59-preset.json` for this build.
-- **Build 23d (test): finding Playroom's render size groups, for real upscaling.** The render
-  resolution changes five groups of sizes in Playroom; some size the 3D scene, others probably its
-  TAA outputs and HUD, which should keep their full size so that DLSS/FSR upscales for real and the
-  HUD stays sharp. `"KYTY_PLAYROOM_RES_KEEP": "3",` (in `u59-preset.json`) keeps group 3 at the
-  game's own sizes, and so on for 1 to 5, and logs `Composite probe:` lines. Testers only.
-  Also two fixes from [moooohung](https://github.com/moooohung) (pull request #2): Korean and
-  Japanese text in games no longer shows as `?` (every installed CJK font is tried, not only the
-  first), and FSR frame generation enables the Vulkan extensions FSR needs without FSR upscaling.
-- **Build 23c (test): the built-in Decouple finds the game's frame update by its shape**, so it
-  should work in other versions of both games too (the console says `agrees with the known one`
-  on 01.018.000 and 01.905.000; on another version, `built-in one on` or, if it is not sure,
-  `not applied` and the patch file's Decouple as before). Please report your game version and
-  that line.
-- **New in build 23: Decouple built in, the rescue mod's slow motion gone, gyro re-centre key.**
-  - **Decouple built in.** The emulator now finds Astro Bot's timing code itself, in any version
-    and region, and lets game time follow the real frame time, with the community v3 mod's
-    smoothing and its "delta time capped at 1/20 s" safety (`"KYTY_ASTRO_DECOUPLE_DT_CAP": "30",`
-    for 1/30 s). The patch file's Decouple mod and the mods that need it (frame-limiter sleep,
-    precise frame caps, delta-time caps) are skipped while it is on; use the launcher's Frame
-    rate limit instead of the precise caps. `"KYTY_ASTRO_DECOUPLE": "0",` goes back to the patch
-    file's mod.
-  - **The "Bot rescue" mod is skipped.** Testing showed that its two hooks do not belong to
-    rescues at all: they mark entering and leaving a level (and some areas), and a real rescue
-    calls neither. So the mod switched Decouple off when a level started, and only the end of the
-    level or a safety timer switched it back on: the slow motion at level starts and in the middle
-    of stages. Rescues work normally without it. `"KYTY_ASTRO_RESCUE_FIX": "1",` still turns on the
-    built-in version with its 6 s safety timer; if a rescue goes wrong without it, please report
-    it with your log.
-  - **Gyro re-centre key.** Hold the controller the way you play and press the key in the game
-    window (launcher: the game's settings, Graphics & display, "Gyro re-centre key"; default F9): that becomes its
-    neutral position. Useful if the game started while the controller was held at an angle.
-  - The gyro offset is saved between sessions (from build 22b), so the view is centred from the
-    start; the test logs from builds 22 and 22b are off again.
-- **Build 22b (test): the gyro is centred from the start, and a deeper rescue log.** The gyro
-  calibration only corrected once the pad had rested for a moment, so in the first minutes of a
-  session the view could creep off centre and stay there. The learned offset is now saved per
-  controller in `gyro-calibration.txt` next to the emulator and loaded at the next start (the
-  console shows `Gyro calibration: saved resting offset ... loaded`), and still refined during
-  play. The first session still needs the pad to rest once: put it down for 3 seconds at start-up.
-  The rescue log now also prints each call's chain (`bot rescue log:   chain ...`), to tell a real
-  rescue apart from the level launches and the gameplay moments that use the same hook.
-- **Build 22 (test): shorter slow-down at a level's start, and two logs.** The rescue fix's hook
-  also fires at the start of some levels, not only for rescues, so those levels began with up to
-  15 s of slow motion; the safety net now steps in after 6 s. To find a proper fix, the console
-  shows a `Game patch: bot rescue log:` line for each rescue start and end, with the calling code
-  and the time (`"KYTY_ASTRO_RESCUE_LOG": "0",` hides them). For a built-in Decouple that works in
-  every version of the game without a patch file, the console also shows `Decouple probe:` lines at
-  start-up, saying where it finds the game's timing code (`"KYTY_DECOUPLE_PROBE": "0",` hides
-  them). Neither log changes the game.
+  (2 to 600). Since build 23 the mod is skipped instead and the built-in fix is off by default
+  (see above).
 - **Fixed in build 18: slow motion with frame generation and Smooth frame pacing.** When a
   frame took longer to present than one vblank (DLSS-G pacing its generated frames, more often at
   3x than 2x), the skipped vblank was also lost to the game, which then ran slower, in Astro Bot
