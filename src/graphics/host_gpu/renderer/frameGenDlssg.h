@@ -102,9 +102,16 @@ void OnDevice(vk::PhysicalDevice physical_device);
 
 // KYTY_COMPOSITE_PROBE (default 0; 1 = on): the games' last pass (CompositePixelShader) and their
 // TAA pass, logged once per new combination of their images' and targets' sizes and formats
-// ("Composite probe: ..."), to plan an upscale before the last pass (Astro's Playroom).
+// ("Composite probe: ..."), to plan an upscale before the last pass.
 // GPU thread, every draw after its bindings are prepared.
 constexpr uint64_t CompositePixelShader = 0x67008a703cf06422ull;
+// Astro Bot's last pass (23q, from its chain probe): the same layout (image 0 the scene after its
+// motion blur and bloom, image 1 the HUD layer, a 1x1 view when no HUD is shown; target 0 the
+// 3840x2160 output), a different shader. Playroom's above.
+constexpr uint64_t CompositePixelShaderAstro = 0x2c3545445213721eull;
+constexpr bool IsCompositePixelShader(uint64_t hash) {
+	return hash == CompositePixelShader || hash == CompositePixelShaderAstro;
+}
 void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
                std::span<const RenderColorInfo> colors);
 // The chain probe's compute side (test build): a dispatch's images, bit i of `written_mask` set

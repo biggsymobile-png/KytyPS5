@@ -117,7 +117,7 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FRAMEGEN_BACKEND=fsr` | AMD FSR 3.1 frame generation instead of DLSS-G (launcher: 2x AMD FSR 3.1) |
 | `KYTY_DLSS=1` | DLSS upscaling in place of the game's TAA (launcher: Upscaling) |
 | `KYTY_FSR=1` | FSR 3.1 upscaling in place of the game's TAA (launcher: Upscaling) |
-| `KYTY_ASTRO_UPSCALE=0` | Astro Bot: DLSS/FSR upscale only to the game's 2432x1368 TAA output, as before 23p |
+| `KYTY_ASTRO_UPSCALE=0` | Astro Bot: DLSS/FSR upscale only to the game's 2432x1368 TAA output, as before 23q |
 | `KYTY_FSR_SHARPNESS=0.5` | FSR upscaling's sharpening, 0 to 1 (default off) |
 | `KYTY_ASTRO_RENDER_RES=1080` | Render resolution: 540, 720, 1080, 1368, 1872 or 2160, both games (launcher: Render resolution) |
 | `KYTY_FRAMEGEN_FPS_CAP=40` | With DLSS-G: Reflex limits the rendered frames to 40 fps (launcher: Frame rate limit) |
@@ -169,7 +169,7 @@ whether it works, with those lines.
 
 Astro Bot draws its 3D image at a render resolution and its own TAA pass upscales that. With
 **DLSS** (any RTX card) or **FSR 3.1** (any GPU) upscaling on, DLSS or FSR upscales the scene to
-the **full output size** (your Screen resolution, e.g. 3840x2160) from the render resolution the
+the game's **full output size** (3840x2160, then scaled to your screen as before) from the render resolution the
 launcher's **Render resolution** picks:
 
 | Render resolution | Works like (at 3840x2160) |
@@ -180,9 +180,9 @@ launcher's **Render resolution** picks:
 | 3328x1872 | between Ultra Quality and DLAA |
 | Game's choice / 3840x2160 | DLAA / native AA (best image, a little slower than the game's TAA) |
 
-**New in 23p:** before, DLSS and FSR only upscaled Astro Bot to **2432x1368**: the game's TAA
+**New in 23q:** before, DLSS and FSR only upscaled Astro Bot to **2432x1368**: the game's TAA
 always makes a 2432x1368 image at render resolutions up to 1368p, and the game's last pass then
-stretched that to your screen. Now, as in Playroom, the game's TAA still runs as usual, DLSS or FSR
+stretched that to 3840x2160. Now, as in Playroom, the game's TAA still runs as usual, DLSS or FSR
 upscales the scene to the output size beside it, and the last pass reads that (plus what the game
 drew after its TAA). The HUD is drawn after it, so it stays sharp. At most 3x per axis: at 540p
 DLSS and FSR go to 2880x1620 and the game stretches the rest.
@@ -268,10 +268,11 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 
 ## Known issues
 
-- **Build 23p (test): DLSS and FSR upscale Astro Bot to the full output size** (issue #4). Before,
+- **Build 23q (test): DLSS and FSR upscale Astro Bot to the full output size** (issue #4). Before,
   they stopped at 2432x1368 and the game stretched that to a 4K screen, so 720p, 1080p and 1368p
-  all looked like 1368p. See DLSS and FSR upscaling above. New and tested on Playroom's path only:
-  please report how Astro Bot looks (and any `the last pass reads no ... image` line).
+  all looked like 1368p. See DLSS and FSR upscaling above. (23p did not switch it on: Astro Bot's
+  last pass is a different shader from Playroom's; 23q finds it.) New: please report how Astro Bot
+  looks (and any `the last pass reads no ... image` line).
 
 - **The HUD can smear a little with FSR frame generation.** The game draws its HUD into the same
   image as the 3D scene, so FSR generates it along with the scene. With DLSS-G it is steady.

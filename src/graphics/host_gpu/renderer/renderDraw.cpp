@@ -4377,7 +4377,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	bool composite_redirected = false;
 	if (FrameGen::UpscaleEnabled() && state.ps_active && bindings.pixel &&
 	    state.ps_input_info.stage.program != nullptr &&
-	    state.ps_input_info.stage.program->shader_hash == FrameGen::CompositePixelShader) {
+	    FrameGen::IsCompositePixelShader(state.ps_input_info.stage.program->shader_hash)) {
 		composite_redirected = FrameGen::RedirectComposite(
 		    buffer.GetGraphics(), m_context.GetTextureCache(), buffer, *bindings.pixel,
 		    std::span {state.color_info, state.color_count});

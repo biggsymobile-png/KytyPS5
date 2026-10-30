@@ -379,7 +379,7 @@ void ChainStep(uint64_t hash, bool compute, const PreparedBindings* bindings,
 	for (const auto& color: colors) {
 		writes = writes || tracked(color.desc.info.data.address);
 	}
-	const bool last = !compute && hash == CompositePixelShader;
+	const bool last = !compute && IsCompositePixelShader(hash);
 	const bool dump = g_dump_on && (reads || writes || last);
 	if (!reads && !dump) return;
 	std::string line = dump ? fmt::format("Frame dump {}.{}: {} {:016x}", g_dump_number, ++g_dump_lines,
@@ -1248,7 +1248,7 @@ void OnDevice(vk::PhysicalDevice physical_device) {
 
 void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
                std::span<const RenderColorInfo> colors) {
-	const bool composite = pixel_shader == CompositePixelShader;
+	const bool composite = IsCompositePixelShader(pixel_shader);
 	if (ChainProbeOn()) ChainStep(pixel_shader, false, pixel, colors, 0, IsTaaPixelShader(pixel_shader));
 	if (!composite && !IsTaaPixelShader(pixel_shader)) return;
 	static const bool enabled = [] {
@@ -2852,7 +2852,7 @@ bool SnapScene(GraphicContext& graphics, TextureCache& cache, CommandBuffer& com
 #ifdef KYTY_UPSCALER_CODE
 	const uint64_t scene_address = g_taa_input_address.load(std::memory_order_relaxed);
 	if (!g_scene_armed || scene_address == 0 || IsTaaPixelShader(pixel_shader) ||
-	    pixel_shader == CompositePixelShader) {
+	    IsCompositePixelShader(pixel_shader)) {
 		return false;
 	}
 	const RenderColorInfo* target = nullptr;
