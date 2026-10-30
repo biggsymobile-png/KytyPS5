@@ -798,9 +798,11 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 	// (below) and in its tier size functions ("mov dword [rdi], width; mov dword [rsi], height;
 	// ret" per tier, three copies in 01.018, checked against tier 4's pairs).
 	const int low_height = height < 1080 ? height : 0;
-	static constexpr uint64_t kOffset    = 0xc62a97; // 01.018.000
-	static constexpr uint8_t  kOrigin[6] = {0x8b, 0x83, 0xf0, 0x23, 0x00, 0x00};
-	static constexpr uint8_t  kPatched[2] = {0xb8, 0x90}; // first and last byte of "mov eax, n; nop"
+	static constexpr uint64_t kOffset        = 0xc62a97; // 01.018.000
+	static constexpr uint8_t  kOrigin[6]     = {0x8b, 0x83, 0xf0, 0x23, 0x00, 0x00};
+	static constexpr uint64_t kOffset1007    = 0xc53637; // 01.007.000
+	static constexpr uint8_t  kOrigin1007[6] = {0x8b, 0x83, 0x90, 0x23, 0x00, 0x00};
+	static constexpr uint8_t  kPatched[2]    = {0xb8, 0x90}; // first and last byte of "mov eax, n; nop"
 	uint8_t* code = nullptr;
 	const auto at = [&](uint64_t address) -> uint8_t* {
 		return IsInsideProgram(*main_program, address, sizeof(kOrigin))
@@ -815,6 +817,18 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 			         "not applied)\n",
 			         height);
 			return;
+		}
+	}
+	if (code == nullptr) {
+		if (auto* known = at(main_program->base_vaddr + kOffset1007); known != nullptr) {
+			if (std::memcmp(known, kOrigin1007, sizeof(kOrigin1007)) == 0) {
+				code = known;
+			} else if (known[0] == kPatched[0] && known[5] == kPatched[1] && version == "01.007.000") {
+				::printf("Game patch: render resolution left as set by a game patch (KYTY_ASTRO_RENDER_RES=%d "
+				         "not applied)\n",
+				         height);
+				return;
+			}
 		}
 	}
 	if (code == nullptr) {
@@ -1348,12 +1362,15 @@ void ApplyBuiltin(Program* main_program) {
 	std::string title_id;
 	std::string version;
 	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
-	    !SystemContentParamSfoGetString("APP_VER", &version) || title_id != "PPSA21567" ||
-	    version != "01.018.000") {
+	    !SystemContentParamSfoGetString("APP_VER", &version) ||
+	    (title_id != "PPSA21567" && title_id != "PPSA21564") ||
+	    (version != "01.018.000" && version != "01.007.000")) {
 		return;
 	}
-	static constexpr uint64_t kTable     = 0x8491510;
+	static constexpr uint64_t kTable1018 = 0x8491510; // 01.018.000
+	static constexpr uint64_t kTable1007 = 0x8495950; // 01.007.000
 	static constexpr uint32_t kSizes[5]  = {7, 7, 4, 4, 6};
+	const uint64_t            kTable     = (version == "01.007.000") ? kTable1007 : kTable1018;
 	const auto                address    = main_program->base_vaddr + kTable;
 	if (!IsInsideProgram(*main_program, address, sizeof(kSizes)) ||
 	    std::memcmp(reinterpret_cast<const void*>(address), kSizes, sizeof(kSizes)) != 0) {
