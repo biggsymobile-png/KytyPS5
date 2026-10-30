@@ -833,24 +833,35 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 	}
 	if (code == nullptr) {
 		// Another version: the instruction where it is the only one of its kind in the executable
-		// segments; none or several: left alone.
+		// segments: first with 01.018's exact bytes, then with any field offset 0x23xx ("mov eax,
+		// [rbx+0x23xx]": 01.018 reads 0x23f0, 01.007 0x2390); none or several: left alone.
 		const auto* ehdr  = main_program->elf->GetEhdr();
 		const auto* phdr  = main_program->elf->GetPhdr();
 		uint32_t    found = 0;
-		for (Elf64_Half index = 0; index < ehdr->e_phnum && found < 2; index++) {
-			const auto& segment = phdr[index];
-			if (segment.p_type != PT_LOAD || (segment.p_flags & PF_X) == 0 ||
-			    segment.p_filesz < sizeof(kOrigin)) {
-				continue;
+		for (const bool any_field: {false, true}) {
+			found = 0;
+			code  = nullptr;
+			for (Elf64_Half index = 0; index < ehdr->e_phnum && found < 2; index++) {
+				const auto& segment = phdr[index];
+				if (segment.p_type != PT_LOAD || (segment.p_flags & PF_X) == 0 ||
+				    segment.p_filesz < sizeof(kOrigin)) {
+					continue;
+				}
+				auto*       begin = reinterpret_cast<uint8_t*>(main_program->base_vaddr + segment.p_vaddr);
+				auto* const end   = begin + segment.p_filesz - sizeof(kOrigin) + 1;
+				for (auto* hit = begin; hit < end && found < 2; ++hit) {
+					bool same = true;
+					for (size_t k = 0; same && k < sizeof(kOrigin); k++) {
+						same = (any_field && k == 2) || hit[k] == kOrigin[k];
+					}
+					if (same) {
+						code = hit;
+						found++;
+					}
+				}
 			}
-			auto*       begin = reinterpret_cast<uint8_t*>(main_program->base_vaddr + segment.p_vaddr);
-			auto* const end   = begin + segment.p_filesz;
-			for (auto* current = begin; found < 2;) {
-				auto* hit = std::search(current, end, std::begin(kOrigin), std::end(kOrigin));
-				if (hit == end) break;
-				code = hit;
-				found++;
-				current = hit + 1;
+			if (found != 0) {
+				break; // exact bytes found (once or more): the looser search is not needed
 			}
 		}
 		if (found != 1) {
@@ -947,8 +958,8 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 	const uint8_t patched[6] = {kPatched[0], static_cast<uint8_t>(tier), 0x00, 0x00, 0x00, kPatched[1]};
 	std::memcpy(code, patched, sizeof(patched));
 	(void)Common::VirtualMemory::FlushInstructionCache(address, sizeof(patched));
-	::printf("Game patch: Astro Bot fixed render resolution %dp (%s, KYTY_ASTRO_RENDER_RES)\n", height,
-	         version.c_str());
+	::printf("Game patch: Astro Bot fixed render resolution %dp (%s, code at game+0x%llx; KYTY_ASTRO_RENDER_RES)\n",
+	         height, version.c_str(), static_cast<unsigned long long>(address - main_program->base_vaddr));
 }
 
 // The built-in Decouple (KYTY_ASTRO_DECOUPLE, default 1; 0 = the patch file's mod as before):
@@ -1344,8 +1355,8 @@ void ApplyBuiltin(Program* main_program) {
 			ApplyAstroRenderResolution(main_program, title_id, version);
 		}
 	}
-	// KYTY_ASTRO_CB_SCALE=<1-4> (default 2; 1 = off): Astro Bot (PPSA21567 01.018.000) sizes its
-	// five draw threads' command buffers {7, 7, 4, 4, 6} MiB (table at 0x8491510, read by
+	// KYTY_ASTRO_CB_SCALE=<1-4> (default 2; 1 = off): Astro Bot (PPSA21564 / PPSA21567, any version) sizes its
+	// five draw threads' command buffers {7, 7, 4, 4, 6} MiB (table at 0x8491510 in 01.018, read by
 	// sub_4A38C0); running out is its "too many objects/batches in this scene" assert (Bug C). In
 	// speedrun_inflator the Draw Geometry thread's frame is mostly mesh-deformer dispatches with
 	// inline bone palettes (22-48 KiB each, ~5.7 MiB per frame). When that thread falls a frame
@@ -1363,28 +1374,60 @@ void ApplyBuiltin(Program* main_program) {
 	std::string version;
 	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
 	    !SystemContentParamSfoGetString("APP_VER", &version) ||
-	    (title_id != "PPSA21567" && title_id != "PPSA21564") ||
-	    (version != "01.018.000" && version != "01.007.000")) {
+	    (title_id != "PPSA21567" && title_id != "PPSA21564")) {
 		return;
 	}
-	static constexpr uint64_t kTable1018 = 0x8491510; // 01.018.000
-	static constexpr uint64_t kTable1007 = 0x8495950; // 01.007.000
-	static constexpr uint32_t kSizes[5]  = {7, 7, 4, 4, 6};
-	const uint64_t            kTable     = (version == "01.007.000") ? kTable1007 : kTable1018;
-	const auto                address    = main_program->base_vaddr + kTable;
-	if (!IsInsideProgram(*main_program, address, sizeof(kSizes)) ||
-	    std::memcmp(reinterpret_cast<const void*>(address), kSizes, sizeof(kSizes)) != 0) {
-		::printf("Game patch: Astro Bot command buffer table not found (KYTY_ASTRO_CB_SCALE)\n");
-		return;
+	// The table: at its known place in 01.018.000 / 01.007.000, else the only copy of its values in
+	// the game's data segments (none or several: left alone). Changed only when it holds them.
+	static constexpr uint32_t kSizes[5] = {7, 7, 4, 4, 6};
+	const auto holds_sizes = [&](uint64_t at) {
+		return IsInsideProgram(*main_program, at, sizeof(kSizes)) &&
+		       std::memcmp(reinterpret_cast<const void*>(at), kSizes, sizeof(kSizes)) == 0;
+	};
+	uint64_t address = 0;
+	for (const uint64_t known: {uint64_t {0x8491510} /* 01.018.000 */, uint64_t {0x8495950} /* 01.007.000 */}) {
+		if (holds_sizes(main_program->base_vaddr + known)) {
+			address = main_program->base_vaddr + known;
+			break;
+		}
+	}
+	if (address == 0) {
+		const auto* ehdr  = main_program->elf->GetEhdr();
+		const auto* phdr  = main_program->elf->GetPhdr();
+		uint32_t    found = 0;
+		const auto* bytes = reinterpret_cast<const uint8_t*>(kSizes);
+		for (Elf64_Half index = 0; index < ehdr->e_phnum && found < 2; index++) {
+			const auto& segment = phdr[index];
+			if (segment.p_type != PT_LOAD || (segment.p_flags & PF_X) != 0 || segment.p_filesz < sizeof(kSizes)) {
+				continue;
+			}
+			auto*       begin = reinterpret_cast<uint8_t*>(main_program->base_vaddr + segment.p_vaddr);
+			auto* const end   = begin + segment.p_filesz;
+			for (auto* current = begin; found < 2;) {
+				auto* hit = std::search(current, end, bytes, bytes + sizeof(kSizes));
+				if (hit == end) break;
+				if ((reinterpret_cast<uint64_t>(hit) & 3) == 0) {
+					address = reinterpret_cast<uint64_t>(hit);
+					found++;
+				}
+				current = hit + 1;
+			}
+		}
+		if (found != 1) {
+			::printf("Game patch: Astro Bot command buffer table not found (%s %s: %s; KYTY_ASTRO_CB_SCALE)\n",
+			         title_id.c_str(), version.c_str(), found == 0 ? "no copy" : "several copies");
+			return;
+		}
 	}
 	uint32_t scaled[5] {};
 	for (int i = 0; i < 5; i++) {
 		scaled[i] = kSizes[i] * static_cast<uint32_t>(scale);
 	}
 	std::memcpy(reinterpret_cast<void*>(address), scaled, sizeof(scaled));
-	::printf("Game patch: Astro Bot draw-thread command buffers x%d (%u, %u, %u, %u, %u MiB; "
-	         "KYTY_ASTRO_CB_SCALE)\n",
-	         scale, scaled[0], scaled[1], scaled[2], scaled[3], scaled[4]);
+	::printf("Game patch: Astro Bot draw-thread command buffers x%d (%u, %u, %u, %u, %u MiB; %s %s, table at "
+	         "game+0x%llx; KYTY_ASTRO_CB_SCALE)\n",
+	         scale, scaled[0], scaled[1], scaled[2], scaled[3], scaled[4], title_id.c_str(), version.c_str(),
+	         static_cast<unsigned long long>(address - main_program->base_vaddr));
 }
 
 // KYTY_ASTRO_RESCUE_LOG (default 0; 1 = on): one console line per call of the rescue-start and
