@@ -2005,12 +2005,17 @@ PFN_vkVoidFunction VKAPI_CALL FsrGetDeviceProcAddr(VkDevice device, const char* 
 	return nullptr;
 }
 
+static bool g_fsr_mv_jittered = false; // the FSR context's motion-vector jitter setting
+
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-// The FSR context for this render and output size (made again when either changes).
+// The FSR context for this render and output size (made again when either, or the motion
+// vectors' jitter setting, changes).
 bool EnsureFsrContext(GraphicContext& graphics, vk::Extent2D in, vk::Extent2D out, bool mv_jittered) {
-	if (g_fsr_api.context != nullptr && g_fsr_api.in == in && g_fsr_api.out == out) {
+	if (g_fsr_api.context != nullptr && g_fsr_api.in == in && g_fsr_api.out == out &&
+	    g_fsr_mv_jittered == mv_jittered) {
 		return true;
 	}
+	g_fsr_mv_jittered = mv_jittered; // (a change makes a new context: FSR takes it at creation)
 	if (g_fsr_api.context != nullptr) {
 		g_fsr_api.retired.emplace_back(g_fsr_api.context, g_fsr_api.dispatches);
 		g_fsr_api.context = nullptr;
@@ -2188,7 +2193,8 @@ void DestroyFsrNative() {
 bool EnsureFsrContext(GraphicContext& graphics, vk::Extent2D in, vk::Extent2D out, bool mv_jittered) {
 	auto& f = g_fsr_native;
 	if (f.failed) return false;
-	if (f.created && f.in == in && f.out == out) return true;
+	if (f.created && f.in == in && f.out == out && g_fsr_mv_jittered == mv_jittered) return true;
+	g_fsr_mv_jittered = mv_jittered; // (a change makes a new context: FSR takes it at creation)
 	DestroyFsrNative();
 	f.graphics = &graphics;
 	g_fsr_instance = static_cast<VkInstance>(graphics.instance);
@@ -2491,10 +2497,20 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	const float jitter_y =
 	    from_projection ? projection_sign * projection_y : -taa_jitter_y * static_cast<float>(in.height);
 	constants.jitterOffset = sl::float2(jitter_x * sign_x, jitter_y * sign_y);
-	static const bool mv_jittered = [] {
+	// KYTY_DLSS_MV_JITTERED: "1" / "0" force it; unset, it is on for Astro's Playroom (its jitter
+	// from the projection): its motion vectors include the jitter, and taken as unjittered they made
+	// the picture wobble while standing still at lower render resolutions (23l; on, it is steady at
+	// every render resolution).
+	static const int mv_jittered_setting = [] {
 		const char* value = std::getenv("KYTY_DLSS_MV_JITTERED");
-		return value != nullptr && value[0] == '1';
+		if (value == nullptr || value[0] == '\0') return -1;
+		return value[0] == '1' ? 1 : 0;
 	}();
+	// (Latched: a frame whose jitter happens to be near zero must not switch it off again, which
+	// would also make FSR a new context.)
+	static bool projection_jitter_seen = false;
+	projection_jitter_seen = projection_jitter_seen || (from_projection && !use_projection);
+	const bool mv_jittered = mv_jittered_setting >= 0 ? mv_jittered_setting == 1 : projection_jitter_seen;
 	constants.motionVectorsJittered = mv_jittered ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	constants.reset                 = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	const MvAdjust mv_adjust = redirect ? PlayroomMvAdjust() : MvAdjust {};

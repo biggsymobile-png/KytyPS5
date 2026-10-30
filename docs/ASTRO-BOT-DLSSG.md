@@ -264,6 +264,16 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 - **Astro's Playroom at double speed** with a Vblank frequency above 60, only if the built-in
   Decouple says `not applied` for your version and no patch file decouples it: then set the Vblank
   frequency to 60 (see Astro's Playroom above).
+- **Build 23m (test): Playroom no longer wobbles while standing still with DLSS or FSR.** Playroom
+  gives its camera jitter with the opposite sign to Astro Bot, and its motion vectors include the
+  jitter, so DLSS and FSR added the jitter instead of removing it: the whole picture, trees and
+  animations included, shook slightly whenever Astro stood still (in motion it was hidden). Both are
+  now handled for Playroom automatically, at every render resolution. Remove any
+  `KYTY_DLSS_JITTER_X`, `KYTY_DLSS_JITTER_Y` or `KYTY_DLSS_MV_JITTERED` lines you added for this from
+  `u59-preset.json` (`"KYTY_DLSS_MV_JITTERED": "0",` still turns the second part off).
+- **Astro's Playroom with the game's own TAA at a lower render resolution:** a slight wobble while
+  standing still remains (it is in the game's TAA, which the built-in render resolution does not
+  correct yet). Use DLSS or FSR at a lower render resolution, or the game's choice with its TAA.
 - **New in this build (23l): built-in Decouple, real upscaling in Playroom, more game versions.**
   - **Decouple built in** for Astro Bot (any version and region) and Astro's Playroom (01.905 and
     versions where it matches): game time follows the real frame time, with the community v3 mod's
