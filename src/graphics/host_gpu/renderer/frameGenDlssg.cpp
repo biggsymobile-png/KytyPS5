@@ -2481,8 +2481,15 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	const bool  from_projection =
 	    use_projection || (taa_px_x < 1e-3f && taa_px_y < 1e-3f &&
 	                       (std::fabs(projection_x) >= 1e-3f || std::fabs(projection_y) >= 1e-3f));
-	const float jitter_x = from_projection ? projection_x : -taa_jitter_x * static_cast<float>(in.width);
-	const float jitter_y = from_projection ? projection_y : -taa_jitter_y * static_cast<float>(in.height);
+	// (Playroom's projection holds its jitter with the opposite sign on both axes: taken as it is,
+	// DLSS and FSR added the jitter instead of removing it, and the picture wobbled while standing
+	// still (23l; flipping both by hand steadied it). Only that automatic case is flipped:
+	// KYTY_DLSS_JITTER=projection in Astro Bot agrees with its TAA constants as it is.)
+	const float projection_sign = (from_projection && !use_projection) ? -1.0f : 1.0f;
+	const float jitter_x =
+	    from_projection ? projection_sign * projection_x : -taa_jitter_x * static_cast<float>(in.width);
+	const float jitter_y =
+	    from_projection ? projection_sign * projection_y : -taa_jitter_y * static_cast<float>(in.height);
 	constants.jitterOffset = sl::float2(jitter_x * sign_x, jitter_y * sign_y);
 	static const bool mv_jittered = [] {
 		const char* value = std::getenv("KYTY_DLSS_MV_JITTERED");
