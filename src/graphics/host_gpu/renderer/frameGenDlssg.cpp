@@ -1492,7 +1492,7 @@ struct Mix {
 };
 Mix g_mix;
 
-// Astro's Playroom reactive mask (KYTY_PLAYROOM_MASK, default on; test build 23i): what the game
+// Astro's Playroom reactive mask (KYTY_PLAYROOM_MASK=1, default off since 23j; test build 23i): what the game
 // drew into its scene after the lighting passes (particles, decals, refraction, reflections) has no
 // motion vectors of its own, so the upscaler is told to lean on the current frame there. The scene
 // is copied at the first draw into it after the last dispatch that wrote it (the sky's excepted:
@@ -1519,8 +1519,9 @@ constexpr uint32_t SkyPixelShaderPrefix = 0x113acd3eu;
 
 bool MaskAllowed() {
 	static const bool allowed = [] {
+		// (Off by default since 23j: DLSS ignored its hint and the tag drew Streamline errors.)
 		const char* value = std::getenv("KYTY_PLAYROOM_MASK");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	return allowed;
 }
@@ -1535,6 +1536,19 @@ float MaskScale() {
 }
 
 // KYTY_PLAYROOM_MASK_VIEW=1 (tuning): the last pass shows the mask, greyscale, in place of the picture.
+// KYTY_PLAYROOM_SHOW (diagnostic, 23j): "dlss" (the last pass reads the upscaler's image alone, no
+// composite) or "game" (the game's own image, no redirect). 0: off, 1: dlss, 2: game.
+int PlayroomShow() {
+	static const int show = [] {
+		const char* value = std::getenv("KYTY_PLAYROOM_SHOW");
+		if (value == nullptr) return 0;
+		if (std::strcmp(value, "dlss") == 0 || std::strcmp(value, "fsr") == 0) return 1;
+		if (std::strcmp(value, "game") == 0) return 2;
+		return 0;
+	}();
+	return show;
+}
+
 bool MaskViewOn() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_PLAYROOM_MASK_VIEW");
@@ -2573,12 +2587,11 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		                                 sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent);
 		const sl::ResourceTag output_tag(&output_resource, sl::kBufferTypeScalingOutputColor,
 		                                 sl::ResourceLifecycle::eValidUntilEvaluate, &out_extent);
-		sl::Resource          mask_resource = resource(g_mask.mask, g_mask.mask_view, vk::ImageLayout::eShaderReadOnlyOptimal);
-		const sl::ResourceTag mask_tag(&mask_resource, sl::kBufferTypeBiasCurrentColorHint,
-		                               sl::ResourceLifecycle::eValidUntilEvaluate, &in_extent);
-		const sl::BaseStructure* inputs[] {&viewport, &color_tag, &depth_tag, &motion_tag, &output_tag, &mask_tag};
+		// (The Playroom mask is not tagged for DLSS: it ignored kBufferTypeBiasCurrentColorHint, and
+		// the tag drew "Cannot have undefined format" errors, 23i.)
+		const sl::BaseStructure* inputs[] {&viewport, &color_tag, &depth_tag, &motion_tag, &output_tag};
 		const auto result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, inputs,
-		                                           static_cast<uint32_t>(std::size(inputs)) - (masked ? 0u : 1u),
+		                                           static_cast<uint32_t>(std::size(inputs)),
 		                                           static_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(vk_command)));
 		ok = result == sl::Result::eOk;
 		if (!ok) failure = std::string("slEvaluateFeature ") + sl::getResultAsStr(result);
@@ -2870,6 +2883,19 @@ bool RedirectComposite(GraphicContext& graphics, TextureCache& cache, CommandBuf
 		}
 	}
 	if (target == nullptr) return false;
+	if (PlayroomShow() == 2) return false; // (diagnostic: the game's own image)
+	if (PlayroomShow() == 1) {
+		// (In gameplay that leaves out what the game drew after its TAA: bloom, motion blur.)
+		target->image_view      = r.view;
+		target->external_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			std::printf("Playroom: the last pass shows the upscaler's image alone (KYTY_PLAYROOM_SHOW)\n");
+			std::fflush(stdout);
+		}
+		return true;
+	}
 	if (MaskViewOn() && MaskAllowed() && g_mask.ready && g_mask.grey_view != nullptr) {
 		// (Tuning: the mask in place of the picture; white leans on the current frame.)
 		target->image_view      = g_mask.grey_view;

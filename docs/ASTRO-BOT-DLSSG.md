@@ -285,6 +285,20 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
   console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
   is skipped (its physics and ultrawide mods still apply).
+- **Build 23j (test): Playroom's DLSS/FSR upscaling no longer resizes the game's own buffers.**
+  Builds 23e-23i kept one of Playroom's size groups at the full output size while upscaling, to
+  keep the HUD sharp. That also made the game's TAA history full size while the rest rendered at
+  the lower resolution, which turned out to cause the glass refraction glitches, the missing blob
+  shadow under Astro and the breakage with frame generation on. Now the game renders exactly as it
+  does without upscaling (its TAA included), DLSS or FSR upscales the scene to the output size
+  beside it, and the last pass gets the upscaled image plus what the game drew after its TAA
+  (bloom, motion blur). The HUD is now drawn at the render resolution: sharp at higher render
+  resolutions, a little soft at 720p (a full-size HUD on its own is planned). The 23i mask is off
+  by default (`"KYTY_PLAYROOM_MASK": "1",` turns it on, FSR only) and no longer tagged for DLSS,
+  which removes the `Cannot have undefined format` errors. `"KYTY_PLAYROOM_UPSCALE": "0",` goes
+  back to DLSS/FSR as anti-aliasing at the render resolution. For tests,
+  `"KYTY_PLAYROOM_SHOW": "dlss",` shows the upscaler's image alone (without the late effects) and
+  `"game"` the game's own; `"KYTY_PLAYROOM_RES_KEEP": "2",` restores 23i's resize.
 - **Build 23i (test): a reactive mask for Playroom's particles, reflections and transparency.**
   What the game draws into its scene after the lighting (particles, decals such as the shadow
   under Astro, glass and water refraction, reflections) has no motion vectors of its own, so the
