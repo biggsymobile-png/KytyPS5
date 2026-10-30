@@ -1015,12 +1015,13 @@ uint64_t DecoupleNowUs() {
 // Called by the game's frame update (through the cave's stub) in place of its fixed-step getter.
 KYTY_SYSV_ABI double DecoupleUpdate() {
 	auto&      d     = g_decouple;
-	auto*      gate  = reinterpret_cast<volatile uint8_t*>(d.gate);
+	// [gate]: the rescue fix's switch; [gate + 1]: the on/off key's (ToggleDecouple). Either one off.
+	auto*      gate  = reinterpret_cast<volatile uint16_t*>(d.gate);
 	auto*      last  = reinterpret_cast<volatile uint64_t*>(d.last_us);
 	auto*      dt_d  = reinterpret_cast<volatile double*>(d.dt);
 	auto*      dt_f  = reinterpret_cast<volatile float*>(d.dt + 8);
 	auto*      dt_us = reinterpret_cast<volatile int64_t*>(d.dt + 16);
-	if (*gate != 0) { // switched off (KYTY_ASTRO_RESCUE_FIX): the game's own step
+	if (*gate != 0) { // switched off (KYTY_ASTRO_RESCUE_FIX or the key): the game's own step
 		*last = 0;
 		return *reinterpret_cast<const double*>(d.numer) / *reinterpret_cast<const double*>(d.denom);
 	}
@@ -1218,18 +1219,19 @@ void SetUpDecouple(Program* main_program) {
 	// 1/30 s by default: with 1/20 s, the long steps after a stutter (a level loading on a slower
 	// PC) blew up physics in both games (Playroom's PhysicsRigidBody.cpp:95 !pos.IsNan() assert in
 	// mariaclock; Astro Bot picking up the bow from a chest); 1/30 s stopped both.
-	const char* cap_text = "1/30 s";
-	double      cap      = 1.0 / 30.0;
-	if (const char* value = std::getenv("KYTY_ASTRO_DECOUPLE_DT_CAP"); value != nullptr) {
+	// KYTY_ASTRO_DECOUPLE_DT_CAP=N: steps of at most 1/N s, N from 10 to 60 (the launcher offers 20, 25,
+	// 30, 35 and 40); 0 = 1/10 s; anything else keeps the default.
+	int cap_n = 30;
+	if (const char* value = std::getenv("KYTY_ASTRO_DECOUPLE_DT_CAP"); value != nullptr && value[0] != '\0') {
 		const int n = std::atoi(value);
-		if (n == 20) {
-			cap      = 1.0 / 20.0;
-			cap_text = "1/20 s";
-		} else if (n == 0) {
-			cap      = 0.1;
-			cap_text = "1/10 s";
+		if (n == 0 && value[0] == '0') {
+			cap_n = 10;
+		} else if (n >= 10 && n <= 60) {
+			cap_n = n;
 		}
 	}
+	const double      cap      = 1.0 / cap_n;
+	const std::string cap_text = fmt::format("1/{} s", cap_n);
 	// A code-cave page within reach of the game's code and data.
 	uint64_t cave = 0;
 	for (uint64_t offset = 0x12100000; offset < 0x12100000 + 64 * kPageSize; offset += kPageSize) {
@@ -1270,7 +1272,7 @@ void SetUpDecouple(Program* main_program) {
 	out.resize(0x200, 0xcc);
 	// double getter
 	const uint64_t get_double = cave + out.size();
-	out.insert(out.end(), {0x80, 0x3d});
+	out.insert(out.end(), {0x66, 0x83, 0x3d}); // cmp word [gate], 0
 	emit_rel(gate, 1);
 	out.push_back(0x00);
 	out.insert(out.end(), {0x75, 0x09, 0xc5, 0xfb, 0x10, 0x05});
@@ -1283,7 +1285,7 @@ void SetUpDecouple(Program* main_program) {
 	out.push_back(0xc3);
 	// microseconds getter
 	const uint64_t get_ticks = cave + out.size();
-	out.insert(out.end(), {0x80, 0x3d});
+	out.insert(out.end(), {0x66, 0x83, 0x3d}); // cmp word [gate], 0
 	emit_rel(gate, 1);
 	out.push_back(0x00);
 	out.insert(out.end(), {0x75, 0x08, 0x48, 0x8b, 0x05});
@@ -1294,7 +1296,7 @@ void SetUpDecouple(Program* main_program) {
 	out.push_back(0xc3);
 	// float getter
 	const uint64_t get_single = cave + out.size();
-	out.insert(out.end(), {0x80, 0x3d});
+	out.insert(out.end(), {0x66, 0x83, 0x3d}); // cmp word [gate], 0
 	emit_rel(gate, 1);
 	out.push_back(0x00);
 	out.insert(out.end(), {0x75, 0x09, 0xc5, 0xfa, 0x10, 0x05});
@@ -1313,6 +1315,7 @@ void SetUpDecouple(Program* main_program) {
 	*reinterpret_cast<int64_t*>(data + 16)  = static_cast<int64_t>(start * 1000000.0 + 0.5);
 	*reinterpret_cast<uint64_t*>(data + 24) = 0;
 	*reinterpret_cast<uint8_t*>(gate)       = 0;
+	*reinterpret_cast<uint8_t*>(gate + 1)   = 0; // the on/off key's switch
 	*reinterpret_cast<uint64_t*>(fn_ptr)    = reinterpret_cast<uint64_t>(&DecoupleUpdate);
 	// the game's code: the getters jump to the cave's, the frame update calls the stub
 	for (const auto& [from, to]: {std::pair {getter, get_double}, std::pair {ticks, get_ticks},
@@ -1344,8 +1347,25 @@ void SetUpDecouple(Program* main_program) {
 	::printf("Decouple: built-in one on (%s %s %s): game time follows the real frame time, "
 	         "steps capped at %s; getters at game+0x%llx, frame update's call at game+0x%llx "
 	         "(KYTY_ASTRO_DECOUPLE)\n",
-	         game, title_id.c_str(), version.c_str(), cap_text, off(getter), off(call));
+	         game, title_id.c_str(), version.c_str(), cap_text.c_str(), off(getter), off(call));
 	std::fflush(stdout);
+}
+
+bool ToggleDecouple() {
+	if (!g_decouple.active) {
+		Log::WriteToConsoleAndLog(
+		    "Decouple: the on/off key does nothing here: the built-in Decouple is not on for this game "
+		    "(KYTY_ASTRO_DECOUPLE_KEY)\n");
+		return false;
+	}
+	auto*      off_switch = reinterpret_cast<volatile uint8_t*>(g_decouple.gate + 1);
+	const bool now_off    = *off_switch == 0;
+	*off_switch           = now_off ? 1 : 0;
+	Log::WriteToConsoleAndLog(
+	    now_off ? "Decouple: off (the game's own fixed 60 fps timing: steady physics, slow motion below 60 fps); "
+	              "press the key again to turn it back on (KYTY_ASTRO_DECOUPLE_KEY)\n"
+	            : "Decouple: on again (game time follows the real frame time) (KYTY_ASTRO_DECOUPLE_KEY)\n");
+	return !now_off;
 }
 
 void ApplyBuiltin(Program* main_program) {

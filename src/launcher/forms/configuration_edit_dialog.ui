@@ -385,6 +385,39 @@
               <property name="toolTip"><string>Hold the controller the way you normally play and press this key in the game window: its motion controls (gyro) take that as their neutral position. Useful if the game started while the controller was held at an angle (KYTY_GYRO_RECENTER_KEY).</string></property>
              </widget>
             </item>
+            <item row="17" column="1">
+             <widget class="QCheckBox" name="checkBox_decouple">
+              <property name="toolTip"><string>Astro Bot and Astro's Playroom: game time follows the real frame rate, so the game keeps its normal speed below 60 fps (without it, it plays in slow motion). Off: the game's own fixed 60 fps timing, or the patch file's Decouple mod if you enabled it (KYTY_ASTRO_DECOUPLE).</string></property>
+              <property name="text"><string>Built-in Decouple (normal game speed below 60 fps)</string></property>
+              <property name="checked"><bool>true</bool></property>
+             </widget>
+            </item>
+            <item row="18" column="0">
+             <widget class="QLabel" name="label_decouple_step_limit">
+              <property name="text"><string>Decouple step limit:</string></property>
+             </widget>
+            </item>
+            <item row="18" column="1">
+             <widget class="QComboBox" name="comboBox_decouple_step_limit">
+              <property name="toolTip"><string>The longest time one game step may cover, e.g. after a stutter. Long steps can make the game's physics fail and crash, mostly on slower PCs. A smaller step (1/35, 1/40) is safer, but below that frame rate the game slows down a little: at 1/40 s and 30 fps it runs at 75% speed (KYTY_ASTRO_DECOUPLE_DT_CAP).</string></property>
+             </widget>
+            </item>
+            <item row="19" column="0">
+             <widget class="QLabel" name="label_decouple_key">
+              <property name="text"><string>Decouple on/off key:</string></property>
+             </widget>
+            </item>
+            <item row="19" column="1">
+             <widget class="QComboBox" name="comboBox_decouple_key">
+              <property name="toolTip"><string>Press this key in the game window to switch Decouple off (the game's own steady 60 fps timing) and on again. Use it if one place still crashes: switch Decouple off there, and back on afterwards. The console says which state it is in (KYTY_ASTRO_DECOUPLE_KEY).</string></property>
+             </widget>
+            </item>
+            <item row="20" column="0" colspan="2">
+             <widget class="QLabel" name="label_decouple_help">
+              <property name="text"><string>Decouple step limit: if Astro Bot or Astro's Playroom crashes on your PC, try a smaller step (1/35 or 1/40). If one place still crashes, switch Decouple off there with the on/off key.</string></property>
+              <property name="wordWrap"><bool>true</bool></property>
+             </widget>
+            </item>
             <item row="12" column="1">
              <widget class="QComboBox" name="comboBox_render_resolution">
               <property name="toolTip"><string>Astro Bot (01.018) and Astro's Playroom (01.905): the resolution the game draws its 3D image at, before its TAA, DLSS or FSR upscales it. Lower is faster; 960x540 is the fastest. No patch file needed (a "Fixed render resolution" patch, if enabled, wins).</string></property>

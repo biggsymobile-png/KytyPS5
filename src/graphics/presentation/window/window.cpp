@@ -22,6 +22,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
+#include "loader/gamePatch.h"
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
@@ -524,6 +525,23 @@ static SDL_Keycode GyroRecenterKey() {
 	return key;
 }
 
+// KYTY_ASTRO_DECOUPLE_KEY=<key name> (the launcher's "Decouple on/off key"; default F10; "off" or
+// empty: none): switches the built-in Decouple off and back on while playing
+// (Loader::GamePatch::ToggleDecouple). Ignored when it is the gyro re-centre key.
+static SDL_Keycode DecoupleToggleKey() {
+	static const SDL_Keycode key = [] {
+		const char* value = std::getenv("KYTY_ASTRO_DECOUPLE_KEY");
+		if (value == nullptr) {
+			return SDLK_F10;
+		}
+		if (value[0] == '\0' || std::strcmp(value, "off") == 0 || std::strcmp(value, "0") == 0) {
+			return SDLK_UNKNOWN;
+		}
+		return SDL_GetKeyFromName(value);
+	}();
+	return key;
+}
+
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
@@ -532,6 +550,12 @@ void WindowContext::ProcessEvent(double time_s) {
 		if (const auto recenter = GyroRecenterKey(); recenter != SDLK_UNKNOWN && event->key.key == recenter) {
 			if (pressed) {
 				Controller::RecenterGyro();
+			}
+			return;
+		}
+		if (const auto decouple = DecoupleToggleKey(); decouple != SDLK_UNKNOWN && event->key.key == decouple) {
+			if (pressed) {
+				(void)Loader::GamePatch::ToggleDecouple();
 			}
 			return;
 		}

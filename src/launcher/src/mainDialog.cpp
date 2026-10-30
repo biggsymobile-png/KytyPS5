@@ -561,6 +561,16 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 		}
 		environment.insert(QStringLiteral("KYTY_GYRO_RECENTER_KEY"),
 		                   QString::fromLatin1(Configuration::GyroRecenterKeyName(info.gyro_recenter_key)));
+		// The built-in Decouple (Astro Bot, Astro's Playroom): on/off, step limit, on/off key. The
+		// launcher's choice wins over the same lines in u59-preset.json.
+		if (info.decouple_enabled) {
+			environment.remove(QStringLiteral("KYTY_ASTRO_DECOUPLE"));
+		} else {
+			environment.insert(QStringLiteral("KYTY_ASTRO_DECOUPLE"), QStringLiteral("0"));
+		}
+		environment.insert(QStringLiteral("KYTY_ASTRO_DECOUPLE_DT_CAP"), QString::number(info.decouple_step_limit));
+		environment.insert(QStringLiteral("KYTY_ASTRO_DECOUPLE_KEY"),
+		                   QString::fromLatin1(Configuration::GyroRecenterKeyName(info.decouple_key)));
 		process->setProcessEnvironment(environment);
 	}
 #if defined(_WIN32)

@@ -204,6 +204,14 @@ public:
 		static const char* const kKeys[] = {"off", "F3", "F4", "F5", "F6", "F9", "F10", "F12"};
 		return kKeys[index >= 0 && index < 8 ? index : 0];
 	}
+	// Astro Bot and Astro's Playroom's built-in Decouple (game time follows the real frame time):
+	// KYTY_ASTRO_DECOUPLE (off: "0"), its step limit KYTY_ASTRO_DECOUPLE_DT_CAP (1/N s: 20, 25, 30,
+	// 35 or 40) and its on/off key KYTY_ASTRO_DECOUPLE_KEY (an index into GyroRecenterKeyName's keys;
+	// 0 off, 6 F10).
+	bool                   decouple_enabled            = true;
+	int                    decouple_step_limit         = 30;
+	int                    decouple_key                = 6;
+	static bool            IsDecoupleStepLimit(int n) { return n == 20 || n == 25 || n == 30 || n == 35 || n == 40; }
 	// KYTY_PRESENT_ABS_VBLANK: the virtual vblank on an absolute timeline (a late frame skips a
 	// vblank instead of bunching the next flips together).
 	bool                   smooth_frame_pacing         = false;
@@ -256,6 +264,9 @@ public:
 		upscaler                    = other.upscaler;
 		render_resolution           = other.render_resolution;
 		gyro_recenter_key           = other.gyro_recenter_key;
+		decouple_enabled            = other.decouple_enabled;
+		decouple_step_limit         = other.decouple_step_limit;
+		decouple_key                = other.decouple_key;
 		smooth_frame_pacing         = other.smooth_frame_pacing;
 		relaxed_shader_maths        = other.relaxed_shader_maths;
 		frame_rate_limit            = other.frame_rate_limit;

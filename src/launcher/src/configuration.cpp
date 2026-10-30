@@ -26,6 +26,9 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(upscaler);
 	KYTY_CFG_SET(render_resolution);
 	KYTY_CFG_SET(gyro_recenter_key);
+	KYTY_CFG_SET(decouple_enabled);
+	KYTY_CFG_SET(decouple_step_limit);
+	KYTY_CFG_SET(decouple_key);
 	KYTY_CFG_SET(smooth_frame_pacing);
 	KYTY_CFG_SET(relaxed_shader_maths);
 	KYTY_CFG_SET(frame_rate_limit);
@@ -83,6 +86,19 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	upscaler         = s.value("upscaler", upscaler).toInt();
 	render_resolution = s.value("render_resolution", render_resolution).toInt();
 	gyro_recenter_key = s.value("gyro_recenter_key", gyro_recenter_key).toInt();
+	decouple_enabled    = s.value("decouple_enabled", decouple_enabled).toBool();
+	decouple_step_limit = s.value("decouple_step_limit", decouple_step_limit).toInt();
+	decouple_key        = s.value("decouple_key", decouple_key).toInt();
+	if (!IsDecoupleStepLimit(decouple_step_limit)) {
+		decouple_step_limit = 30;
+	}
+	if (decouple_key < 0 || decouple_key > 7) {
+		decouple_key = 6;
+	}
+	// Settings saved before the Decouple key existed: F10 is free unless the gyro key took it.
+	if (decouple_key != 0 && decouple_key == gyro_recenter_key) {
+		decouple_key = gyro_recenter_key == 7 ? 6 : 7;
+	}
 	smooth_frame_pacing = s.value("smooth_frame_pacing", smooth_frame_pacing).toBool();
 	relaxed_shader_maths = s.value("relaxed_shader_maths", relaxed_shader_maths).toBool();
 	frame_rate_limit    = s.value("frame_rate_limit", frame_rate_limit).toInt();
@@ -193,6 +209,15 @@ bool Configuration::SetGameSettings(const QJsonObject& imported_settings, QStrin
 	}
 	if (gyro_recenter_key < 0 || gyro_recenter_key > 7) {
 		return fail(tr("Gyro re-centre key must be between 0 (off) and 7 (F12)."));
+	}
+	if (!IsDecoupleStepLimit(decouple_step_limit)) {
+		return fail(tr("Decouple step limit must be 20, 25, 30, 35 or 40 (1/20 s to 1/40 s)."));
+	}
+	if (decouple_key < 0 || decouple_key > 7) {
+		return fail(tr("Decouple on/off key must be between 0 (off) and 7 (F12)."));
+	}
+	if (decouple_key != 0 && decouple_key == gyro_recenter_key) {
+		return fail(tr("The Decouple on/off key and the gyro re-centre key must be different keys."));
 	}
 	if (trophy_duration_seconds < 5 || trophy_duration_seconds > 10) {
 		return fail(tr("Trophy notification duration must be between 5 and 10 seconds."));

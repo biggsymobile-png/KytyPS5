@@ -19,6 +19,9 @@ bool ApplyPending(Program* program);
 void ApplyBuiltin(Program* main_program);
 // Before any patch: Astro Bot's built-in Decouple (KYTY_ASTRO_DECOUPLE), when its code is found.
 void SetUpDecouple(Program* main_program);
+// The on/off key (KYTY_ASTRO_DECOUPLE_KEY): switches the built-in Decouple off (the game's own fixed
+// step) or back on while the game runs, and says so on the console. Returns whether it is now on.
+bool ToggleDecouple();
 // Once per guest flip (VideoOut): the built-in bot rescue fix's watchdog (KYTY_ASTRO_RESCUE_FIX).
 void OnGuestFlip();
 void Clear();

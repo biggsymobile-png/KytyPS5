@@ -368,6 +368,37 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	}
 	m_ui->comboBox_gyro_recenter_key->setCurrentIndex(std::max(
 	    m_ui->comboBox_gyro_recenter_key->findData(std::clamp(info.gyro_recenter_key, 0, 7)), 0));
+	m_ui->checkBox_decouple->setChecked(info.decouple_enabled);
+	m_ui->comboBox_decouple_step_limit->clear();
+	for (const int n: {20, 25, 30, 35, 40}) {
+		QString text = tr("1/%1 s").arg(n);
+		if (n == 20) {
+			text += tr(" (least slowdown)");
+		} else if (n == 30) {
+			text += tr(" (default)");
+		} else if (n == 40) {
+			text += tr(" (safest on slower PCs)");
+		}
+		m_ui->comboBox_decouple_step_limit->addItem(text, n);
+	}
+	m_ui->comboBox_decouple_step_limit->setCurrentIndex(std::max(
+	    m_ui->comboBox_decouple_step_limit->findData(info.decouple_step_limit),
+	    m_ui->comboBox_decouple_step_limit->findData(30)));
+	m_ui->comboBox_decouple_key->clear();
+	for (int index = 0; index < 8; index++) {
+		m_ui->comboBox_decouple_key->addItem(
+		    index == 0 ? tr("Off") : QString::fromLatin1(Configuration::GyroRecenterKeyName(index)), index);
+	}
+	m_ui->comboBox_decouple_key->setCurrentIndex(std::max(
+	    m_ui->comboBox_decouple_key->findData(std::clamp(info.decouple_key, 0, 7)), 0));
+	// The step limit and the key only matter with Decouple on.
+	const auto decouple_on = [this](bool on) {
+		m_ui->comboBox_decouple_step_limit->setEnabled(on);
+		m_ui->comboBox_decouple_key->setEnabled(on);
+	};
+	decouple_on(info.decouple_enabled);
+	disconnect(m_ui->checkBox_decouple, &QCheckBox::toggled, this, nullptr); // Init can run again
+	connect(m_ui->checkBox_decouple, &QCheckBox::toggled, this, decouple_on);
 	m_ui->comboBox_render_resolution->clear();
 	// Shown smallest to largest; each item carries the saved value (render_resolution), whose
 	// numbering stays as it was (5 = 720p and 6 = 540p were added later), so saved choices keep.
@@ -606,6 +637,12 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.upscaler                  = std::max(ui.comboBox_upscaler->currentIndex(), 0);
 	info.render_resolution         = std::clamp(ui.comboBox_render_resolution->currentData().toInt(), 0, 6);
 	info.gyro_recenter_key         = std::clamp(ui.comboBox_gyro_recenter_key->currentData().toInt(), 0, 7);
+	info.decouple_enabled          = ui.checkBox_decouple->isChecked();
+	info.decouple_step_limit       = ui.comboBox_decouple_step_limit->currentData().toInt();
+	if (!Configuration::IsDecoupleStepLimit(info.decouple_step_limit)) {
+		info.decouple_step_limit = 30;
+	}
+	info.decouple_key              = std::clamp(ui.comboBox_decouple_key->currentData().toInt(), 0, 7);
 	info.smooth_frame_pacing       = ui.checkBox_smooth_frame_pacing->isChecked();
 	info.relaxed_shader_maths      = ui.checkBox_relaxed_shader_maths->isChecked();
 	info.frame_rate_limit =
@@ -658,6 +695,14 @@ void ConfigurationEditDialog::save() {
 	if (!Config::IsConfiguredUserIdValid(m_ui->spinBox_user_id->value())) {
 		QMessageBox::critical(this, tr("Save failed"),
 		                      tr("User ID cannot be 254 (everyone) or 255 (system)"));
+		return;
+	}
+
+	if (const int key = m_ui->comboBox_decouple_key->currentData().toInt();
+	    key != 0 && key == m_ui->comboBox_gyro_recenter_key->currentData().toInt()) {
+		QMessageBox::critical(this, tr("Save failed"),
+		                      tr("The Decouple on/off key and the gyro re-centre key must be different keys"));
+		m_ui->comboBox_decouple_key->setFocus();
 		return;
 	}
 

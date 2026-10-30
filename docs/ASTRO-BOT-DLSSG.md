@@ -264,13 +264,23 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 - **Astro's Playroom at double speed** with a Vblank frequency above 60, only if the built-in
   Decouple says `not applied` for your version and no patch file decouples it: then set the Vblank
   frequency to 60 (see Astro's Playroom above).
-- **Build 23n (test): no more physics crashes with the built-in Decouple.** After a stutter (for
-  example a level loading on a slower PC), Decouple let one game step last up to 1/20 s, and some
-  physics blew up: Playroom stopped with `Assertion failed: !pos.IsNan()` (`PhysicsRigidBody.cpp`,
-  seen in the clock level), and Astro Bot crashed picking up the bow from a chest. A step now lasts
-  at most 1/30 s, which stopped both; below 30 fps the game slows down slightly instead.
-  `"KYTY_ASTRO_DECOUPLE_DT_CAP": "20",` goes back to 1/20 s. If you added
-  `"KYTY_ASTRO_DECOUPLE_DT_CAP": "30",` for this, you can remove it.
+- **Build 23o (test): fewer physics crashes with the built-in Decouple, and launcher options for
+  it.** After a stutter (for example a level loading on a slower PC), Decouple let one game step
+  last up to 1/20 s, and some physics failed: Playroom stopped with `Assertion failed:
+  !pos.IsNan()` (`PhysicsRigidBody.cpp`, seen in the clock level), and Astro Bot crashed picking up
+  the bow from a chest. A step now lasts at most 1/30 s by default. The game's settings in the
+  launcher (Graphics) have three new options, for Astro Bot and Astro's Playroom:
+  - **Built-in Decouple**: on by default. Off gives the game's own fixed 60 fps timing (slow
+    motion below 60 fps), or the patch file's Decouple mod if you enabled it.
+  - **Decouple step limit**: 1/20, 1/25, 1/30 (default), 1/35 or 1/40 s. If the game crashes on
+    your PC, pick a smaller step: it is safer for the physics, but below that frame rate the game
+    slows down a little (at 1/40 s and 30 fps it runs at 75% speed).
+  - **Decouple on/off key** (default F10): switches Decouple off and back on while you play, for
+    a place that still crashes. The console says which state it is in.
+
+  The launcher's choices win over the same lines in `u59-preset.json`
+  (`KYTY_ASTRO_DECOUPLE`, `KYTY_ASTRO_DECOUPLE_DT_CAP`, `KYTY_ASTRO_DECOUPLE_KEY`), so you can
+  remove any you added.
 - **Build 23m (test): Playroom no longer wobbles while standing still with DLSS or FSR.** Playroom
   gives its camera jitter with the opposite sign to Astro Bot, and its motion vectors include the
   jitter, so DLSS and FSR added the jitter instead of removing it: the whole picture, trees and
@@ -284,7 +294,7 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 - **New in this build (23l): built-in Decouple, real upscaling in Playroom, more game versions.**
   - **Decouple built in** for Astro Bot (any version and region) and Astro's Playroom (01.905 and
     versions where it matches): game time follows the real frame time, with the community v3 mod's
-    smoothing and a 1/30 s delta-time cap since 23n (`"KYTY_ASTRO_DECOUPLE_DT_CAP": "20",` for 1/20 s). It
+    smoothing and a 1/30 s delta-time cap since 23o (the launcher's Decouple step limit changes it). It
     finds the game's frame update by its code, so no patch file or button combination is needed.
     The patch file's Decouple and the mods that need it (frame-limiter sleep, precise frame caps,
     delta-time caps) are skipped while it is on; use the launcher's Frame rate limit instead of
