@@ -285,6 +285,11 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
   console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
   is skipped (its physics and ultrawide mods still apply).
+- **Build 23k (test): Playroom upscaling at 540p.** DLSS and FSR upscale at most 3x per axis.
+  Playroom always outputs 3840x2160, so a 960x540 render resolution (4x) failed with DLSS (`NGX
+  evaluate feature failed`) and showed a broken picture. Now the upscaler goes as far as 3x
+  (2880x1620 from 540p) and the game's last pass stretches that to its output. The console shows
+  `would be over 3x; upscaled to 2880x1620`. 720p and above are unchanged.
 - **Build 23j (test): Playroom's DLSS/FSR upscaling no longer resizes the game's own buffers.**
   Builds 23e-23i kept one of Playroom's size groups at the full output size while upscaling, to
   keep the HUD sharp. That also made the game's TAA history full size while the rest rendered at

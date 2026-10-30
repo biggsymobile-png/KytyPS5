@@ -2424,8 +2424,23 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		return false;
 	}
 	const vk::Extent2D in {color.backing.extent.width, color.backing.extent.height};
-	const vk::Extent2D out = redirect ? composite
+	// (Playroom: at most 3x the render size per axis, DLSS's and FSR's limit (Ultra Performance);
+	// 960x540 to 3840x2160 is 4x and DLSS failed every frame, 23j. The last pass samples the image
+	// by position, so it stretches a capped one the rest of the way.)
+	constexpr uint32_t MaxUpscale = 3;
+	const vk::Extent2D out = redirect ? vk::Extent2D {std::min(composite.width, in.width * MaxUpscale),
+	                                                  std::min(composite.height, in.height * MaxUpscale)}
 	                                  : vk::Extent2D {out0.backing.extent.width, out0.backing.extent.height};
+	if (redirect && (out.width != composite.width || out.height != composite.height)) {
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			std::printf("%s: %ux%u to %ux%u would be over 3x; upscaled to %ux%u, the last pass stretches the rest\n",
+			            g_fsr ? "FSR upscaling" : "DLSS upscaling", in.width, in.height, composite.width,
+			            composite.height, out.width, out.height);
+			std::fflush(stdout);
+		}
+	}
 	if (!ConfigureOutput(graphics, out, out0.backing.format)) {
 		g_sr.disabled = true;
 		return false;
