@@ -340,7 +340,8 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 		}
 	}
 
-	const bool astro          = plan->title_id == "PPSA21564" || plan->title_id == "PPSA21567";
+	const bool astro          = plan->title_id == "PPSA21564" || plan->title_id == "PPSA21567" ||
+	                            plan->title_id == "PPSA21568";
 	const bool rescue_builtin = plan->title_id == "PPSA21564" && plan->version == "01.018.000" &&
 	                            RescueFixEnabled();
 	// With the built-in Decouple on (SetUpDecouple): a mod that writes to the code it changed
@@ -760,7 +761,7 @@ void ApplyPlayroomRenderResolution(Program* main_program, const std::string& ver
 }
 
 // KYTY_ASTRO_RENDER_RES=540|720|1080|1368|1872|2160 (the launcher's "Render resolution"; unset or
-// anything else: the game's own choice): Astro Bot (PPSA21564 / PPSA21567 01.018.000) renders at
+// anything else: the game's own choice): Astro Bot (PPSA21564 / PPSA21567 / PPSA21568, any version found) renders at
 // that fixed resolution tier, as the community "Fixed render resolution" patches do (the same
 // write: "mov eax, [rbx+0x23f0]" -> "mov eax, <tier>; nop", at 0xc62a97 in 01.018, elsewhere where
 // the instruction is the only one of its kind), without a patch file. The
@@ -787,8 +788,8 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 		ApplyPlayroomRenderResolution(main_program, version, height);
 		return;
 	}
-	// Astro Bot's title IDs (US, EU).
-	if (title_id != "PPSA21564" && title_id != "PPSA21567") {
+	// Astro Bot's title IDs (US, EU, Asia).
+	if (title_id != "PPSA21564" && title_id != "PPSA21567" && title_id != "PPSA21568") {
 		::printf("Game patch: render resolution %dp is for Astro Bot and Astro's Playroom only "
 		         "(KYTY_ASTRO_RENDER_RES)\n",
 		         height);
@@ -963,7 +964,7 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 }
 
 // The built-in Decouple (KYTY_ASTRO_DECOUPLE, default 1; 0 = the patch file's mod as before):
-// Astro Bot (PPSA21564 / PPSA21567) and Astro's Playroom (PPSA01325, same engine: getters at
+// Astro Bot (PPSA21564 / PPSA21567 / PPSA21568) and Astro's Playroom (PPSA01325, same engine: getters at
 // 0x1b4b920-0x1b4b950 and the frame update's call at 0xafa4 in 01.905.000), any version. The game advances by a fixed 1/60 s per frame
 // (three small getters return it as a double, a float and microseconds: 1.0 / target fps, at
 // 0x3530, 0x3550 and 0x3520 in 01.018.000), so below 60 fps it runs slow. As the community
@@ -1075,7 +1076,8 @@ void SetUpDecouple(Program* main_program) {
 	std::string version;
 	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
 	    !SystemContentParamSfoGetString("APP_VER", &version) ||
-	    (title_id != "PPSA21564" && title_id != "PPSA21567" && title_id != "PPSA01325")) {
+	    (title_id != "PPSA21564" && title_id != "PPSA21567" && title_id != "PPSA21568" &&
+	     title_id != "PPSA01325")) {
 		return;
 	}
 	const bool        playroom = title_id == "PPSA01325";
@@ -1355,7 +1357,7 @@ void ApplyBuiltin(Program* main_program) {
 			ApplyAstroRenderResolution(main_program, title_id, version);
 		}
 	}
-	// KYTY_ASTRO_CB_SCALE=<1-4> (default 2; 1 = off): Astro Bot (PPSA21564 / PPSA21567, any version) sizes its
+	// KYTY_ASTRO_CB_SCALE=<1-4> (default 2; 1 = off): Astro Bot (PPSA21564 / PPSA21567 / PPSA21568, any version) sizes its
 	// five draw threads' command buffers {7, 7, 4, 4, 6} MiB (table at 0x8491510 in 01.018, read by
 	// sub_4A38C0); running out is its "too many objects/batches in this scene" assert (Bug C). In
 	// speedrun_inflator the Draw Geometry thread's frame is mostly mesh-deformer dispatches with
@@ -1374,7 +1376,7 @@ void ApplyBuiltin(Program* main_program) {
 	std::string version;
 	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
 	    !SystemContentParamSfoGetString("APP_VER", &version) ||
-	    (title_id != "PPSA21567" && title_id != "PPSA21564")) {
+	    (title_id != "PPSA21567" && title_id != "PPSA21564" && title_id != "PPSA21568")) {
 		return;
 	}
 	// The table: at its known place in 01.018.000 / 01.007.000, else the only copy of its values in
