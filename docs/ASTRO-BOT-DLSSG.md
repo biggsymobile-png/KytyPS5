@@ -1,7 +1,7 @@
 # KytyPS5 (Jetsku U59) with DLSS and FSR for Astro Bot and Astro's Playroom
 
 An **experimental, unofficial** test build of [Jetsku/KytyPS5](https://github.com/Jetsku/KytyPS5)
-that adds frame generation and modern upscaling to **ASTRO BOT (PPSA21564)** and
+that adds frame generation and modern upscaling to **ASTRO BOT (PPSA21564 / PPSA21567 / PPSA21568)** and
 **Astro's Playroom (PPSA01325)**:
 
 | | What it does | GPU | Platforms |
@@ -192,8 +192,8 @@ If the image shimmers or looks soft and wobbly, the camera jitter's direction ma
 ## Built-in render resolution
 
 The launcher's **Render resolution** (`KYTY_ASTRO_RENDER_RES`) needs no patch file: the emulator
-finds the game's resolution code itself, in **Astro Bot** (01.018 and other versions where it
-matches) and **Astro's Playroom** (found by its instructions, so other versions should match too).
+finds the game's resolution code itself, in **Astro Bot** (01.018, 01.007 and other versions where it
+matches; US, European and Asian editions) and **Astro's Playroom** (found by its instructions, so other versions should match too).
 The console says whether it was applied, and why not if it was not. An enabled "Fixed render
 resolution" patch in a patch file takes precedence.
 
@@ -285,6 +285,21 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   same way, and Playroom no longer needs the patch file for a Vblank frequency above 60. The
   console shows `Decouple: built-in one on (Astro's Playroom ...)`; the patch file's Decouple mod
   is skipped (its physics and ultrawide mods still apply).
+- **Build 23l (test): Astro Bot 1.007 and the Asian edition.** The built-in **render resolution**
+  and the **command-buffer fix** (it stops the "too many objects/batches in this scene" crash in
+  busy scenes) now work on more copies of Astro Bot:
+  - **Version 01.007.000**, the version on many discs and unpatched copies, thanks to
+    [moooohung](https://github.com/moooohung) (pull request #3). Before, the render resolution was
+    not applied there, and the crash fix covered only the European 01.018.
+  - **Other versions**: both are now found by what the code does, not only at known places, and
+    are only changed when exactly one match is found.
+  - **All three regions**: ASTRO BOT's US (PPSA21564), European (PPSA21567) and Asian (PPSA21568,
+    new) editions. The built-in Decouple covers the Asian edition too.
+
+  The console now says where it made each change, e.g. `Game patch: Astro Bot fixed render
+  resolution 1080p (01.007.000, code at game+0x...)` and `draw-thread command buffers x2 (...;
+  PPSA21564 01.007.000, table at game+0x...)`. If you play a version other than 01.018 or an
+  Asian copy, please report those two lines, or the `not applied` / `not found` line if it appears.
 - **Build 23k (test): Playroom upscaling at 540p.** DLSS and FSR upscale at most 3x per axis.
   Playroom always outputs 3840x2160, so a 960x540 render resolution (4x) failed with DLSS (`NGX
   evaluate feature failed`) and showed a broken picture. Now the upscaler goes as far as 3x
