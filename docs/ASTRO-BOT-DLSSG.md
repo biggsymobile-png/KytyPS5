@@ -264,6 +264,13 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 - **Astro's Playroom at double speed** with a Vblank frequency above 60, only if the built-in
   Decouple says `not applied` for your version and no patch file decouples it: then set the Vblank
   frequency to 60 (see Astro's Playroom above).
+- **Build 23n (test): no more physics crashes with the built-in Decouple.** After a stutter (for
+  example a level loading on a slower PC), Decouple let one game step last up to 1/20 s, and some
+  physics blew up: Playroom stopped with `Assertion failed: !pos.IsNan()` (`PhysicsRigidBody.cpp`,
+  seen in the clock level), and Astro Bot crashed picking up the bow from a chest. A step now lasts
+  at most 1/30 s, which stopped both; below 30 fps the game slows down slightly instead.
+  `"KYTY_ASTRO_DECOUPLE_DT_CAP": "20",` goes back to 1/20 s. If you added
+  `"KYTY_ASTRO_DECOUPLE_DT_CAP": "30",` for this, you can remove it.
 - **Build 23m (test): Playroom no longer wobbles while standing still with DLSS or FSR.** Playroom
   gives its camera jitter with the opposite sign to Astro Bot, and its motion vectors include the
   jitter, so DLSS and FSR added the jitter instead of removing it: the whole picture, trees and
@@ -277,7 +284,7 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 - **New in this build (23l): built-in Decouple, real upscaling in Playroom, more game versions.**
   - **Decouple built in** for Astro Bot (any version and region) and Astro's Playroom (01.905 and
     versions where it matches): game time follows the real frame time, with the community v3 mod's
-    smoothing and its 1/20 s delta-time cap (`"KYTY_ASTRO_DECOUPLE_DT_CAP": "30",` for 1/30 s). It
+    smoothing and a 1/30 s delta-time cap since 23n (`"KYTY_ASTRO_DECOUPLE_DT_CAP": "20",` for 1/20 s). It
     finds the game's frame update by its code, so no patch file or button combination is needed.
     The patch file's Decouple and the mods that need it (frame-limiter sleep, precise frame caps,
     delta-time caps) are skipped while it is on; use the launcher's Frame rate limit instead of

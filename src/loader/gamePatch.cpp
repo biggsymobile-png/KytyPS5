@@ -971,7 +971,7 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 // "Decouple gameplay timers from render FPS" mod (v3) does, the frame update's call of the double
 // getter (01.018: 0x2a4a2b) then measures the real frame time, smooths it (v3's rules: follows a
 // lasting change after two frames, else eases 10% per frame, steps at most 1.5x the current one)
-// and caps it (KYTY_ASTRO_DECOUPLE_DT_CAP: 20 = 1/20 s, the default; 30 = 1/30 s; 0 = 1/10 s), and
+// and caps it (KYTY_ASTRO_DECOUPLE_DT_CAP: 30 = 1/30 s, the default; 20 = 1/20 s; 0 = 1/10 s), and
 // the three getters return that. The code is found by its shape, not its address: the getters by
 // their instructions and shared global, the frame update's call among the double getter's callers
 // by the instructions that use its result (exactly one; 01.018 / 01.905: pinned to the known call,
@@ -1215,13 +1215,16 @@ void SetUpDecouple(Program* main_program) {
 		                           : "several calls could be the frame update's");
 		return;
 	}
-	const char* cap_text = "1/20 s";
-	double      cap      = 1.0 / 20.0;
+	// 1/30 s by default: with 1/20 s, the long steps after a stutter (a level loading on a slower
+	// PC) blew up physics in both games (Playroom's PhysicsRigidBody.cpp:95 !pos.IsNan() assert in
+	// mariaclock; Astro Bot picking up the bow from a chest); 1/30 s stopped both.
+	const char* cap_text = "1/30 s";
+	double      cap      = 1.0 / 30.0;
 	if (const char* value = std::getenv("KYTY_ASTRO_DECOUPLE_DT_CAP"); value != nullptr) {
 		const int n = std::atoi(value);
-		if (n == 30) {
-			cap      = 1.0 / 30.0;
-			cap_text = "1/30 s";
+		if (n == 20) {
+			cap      = 1.0 / 20.0;
+			cap_text = "1/20 s";
 		} else if (n == 0) {
 			cap      = 0.1;
 			cap_text = "1/10 s";
