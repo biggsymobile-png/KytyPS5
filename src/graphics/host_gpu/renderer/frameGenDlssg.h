@@ -111,10 +111,12 @@ void ProbeDraw(uint64_t pixel_shader, const PreparedBindings* pixel,
 // for an image it writes. GPU thread, every dispatch after its images are rebound.
 void ProbeDispatch(uint64_t compute_shader, const PreparedBindings& bindings, uint32_t written_mask);
 
-// Astro's Playroom upscale (its TAA output is the render size; KYTY_PLAYROOM_UPSCALE=0: off): at
-// the last pass's draw (CompositePixelShader), after its bindings are prepared. Notes the last
-// pass's target size (UpscaleTaa upscales to it from the next frame on), and points the binding
-// of the game's render-size image at an output-size one: this frame's upscaled image plus what the
+// Upscale to the output size (Astro's Playroom: its TAA output is the render size,
+// KYTY_PLAYROOM_UPSCALE=0: off; Astro Bot: its TAA output is 2432x1368 up to that render size, its
+// last pass stretches it to the output, KYTY_ASTRO_UPSCALE=0: off): at the last pass's draw
+// (CompositePixelShader), after its bindings are prepared. Notes the last pass's target size
+// (UpscaleTaa upscales to it from the next frame on), and points the binding of the game's
+// TAA-output-size image at an output-size one: this frame's upscaled image plus what the
 // game drew into its image after the TAA (a compute pass recorded here, outside rendering;
 // KYTY_PLAYROOM_MIX=0: the upscaled image alone). True: a binding was changed (its image
 // descriptors must be written, not kept from an earlier draw, and the draw run state is stale).
@@ -155,10 +157,11 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 // anything of the draw is recorded: DLSS-SR writes the TAA's two outputs (the frame and the next
 // frame's history) from its colour, depth and motion vectors. True: done, the draw is skipped;
 // false: the game's TAA draws (DLSS-SR off or unavailable, unexpected images, a failure).
-// `user_data`: the pixel shader's user data (its T#s).
+// `user_data`: the pixel shader's user data (its T#s); `taa_shader`: the TAA's pixel shader (which
+// game).
 [[nodiscard]] bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                               const PreparedBindings& pixel, std::span<const uint32_t> user_data,
-                              std::span<const RenderColorInfo> colors);
+                              std::span<const RenderColorInfo> colors, uint64_t taa_shader);
 
 // Present thread, around vkQueuePresentKHR (null `inputs`: a frame without them, a menu).
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D backbuffer, vk::Format format,

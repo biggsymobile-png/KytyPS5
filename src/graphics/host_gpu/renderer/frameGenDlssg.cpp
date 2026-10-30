@@ -183,6 +183,18 @@ bool PlayroomUpscaleAllowed() {
 	return allowed;
 }
 
+// KYTY_ASTRO_UPSCALE (default on; 0: before 23p): Astro Bot's TAA output is 2432x1368 for render
+// resolutions up to 1368p, and its last pass stretches that to the output (3840x2160 on a 4K
+// screen), so DLSS/FSR in place of its TAA only upscaled to 1368p (issue #4). As in Playroom, the
+// upscaler then writes an output-size image beside the game's own TAA, which the last pass reads.
+bool AstroUpscaleAllowed() {
+	static const bool allowed = [] {
+		const char* value = std::getenv("KYTY_ASTRO_UPSCALE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return allowed;
+}
+
 // KYTY_PLAYROOM_TAA_KEEP (default on; 0: build 23g's behaviour): the game's own TAA draws as
 // usual, so both of its targets hold what the game expects (its second, output-size target is
 // read by the last pass too); the upscaler runs on the same inputs beside it, and only the last
@@ -2345,8 +2357,9 @@ uint64_t DescriptorAddress(std::span<const uint32_t> user_data, size_t dword) {
 
 bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                 const PreparedBindings& pixel, std::span<const uint32_t> user_data,
-                std::span<const RenderColorInfo> colors) {
+                std::span<const RenderColorInfo> colors, uint64_t taa_shader) {
 #ifdef KYTY_UPSCALER_CODE
+	const bool playroom = taa_shader == TaaPixelShaderPlayroom;
 	if (!g_sr_ready.load(std::memory_order_relaxed) || g_sr.disabled) return false;
 	// Astro Bot's TAA pass (docs/RE-ASTRO-BOT-FG.md): the current colour's T# at user data 0, the
 	// history's at 8, the motion vectors' at 16, its constants buffer (80 bytes: the jitter in UV
@@ -2396,15 +2409,16 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		return a.backing.extent.width == b.backing.extent.width &&
 		       a.backing.extent.height == b.backing.extent.height;
 	};
-	// Astro's Playroom: its TAA output is the render size and its last pass draws at the output
-	// size (noted at last frame's last pass): the upscaler writes an image of that size, which the
-	// last pass reads in place of the TAA output (RedirectComposite); the game's two TAA outputs
-	// get scaled copies.
+	// The last pass draws larger than the TAA output (noted at last frame's last pass): Astro's
+	// Playroom (its TAA output is the render size) and Astro Bot (its TAA output is 2432x1368 up to
+	// that render size, 23p). The upscaler writes an image of the last pass's size, which the last
+	// pass reads in place of the TAA output (RedirectComposite); the game's TAA draws as usual.
 	const uint64_t composite_packed = g_composite_extent.load(std::memory_order_relaxed);
 	const vk::Extent2D composite {static_cast<uint32_t>(composite_packed >> 32),
 	                              static_cast<uint32_t>(composite_packed & 0xffffffffu)};
-	const bool redirect = PlayroomUpscaleAllowed() && out0.backing.image != nullptr &&
-	                      color.backing.image != nullptr && same_extent(color, out0) &&
+	const bool redirect = (playroom ? PlayroomUpscaleAllowed() : AstroUpscaleAllowed()) &&
+	                      out0.backing.image != nullptr && color.backing.image != nullptr &&
+	                      (playroom ? same_extent(color, out0) : same_extent(out0, out1)) &&
 	                      composite.width > out0.backing.extent.width &&
 	                      composite.height > out0.backing.extent.height;
 	if (color.backing.image == nullptr || motion.backing.image == nullptr ||
@@ -2513,13 +2527,13 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	const bool mv_jittered = mv_jittered_setting >= 0 ? mv_jittered_setting == 1 : projection_jitter_seen;
 	constants.motionVectorsJittered = mv_jittered ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	constants.reset                 = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-	const MvAdjust mv_adjust = redirect ? PlayroomMvAdjust() : MvAdjust {};
+	const MvAdjust mv_adjust = redirect && playroom ? PlayroomMvAdjust() : MvAdjust {};
 	constants.mvecScale.x *= mv_adjust.x;
 	constants.mvecScale.y *= mv_adjust.y;
 	// Astro's Playroom, its TAA kept (23h): the game's TAA draws after the upscaler, from the same
 	// inputs, and its targets are left to it.
 	const bool keep_taa = redirect && TaaKeepAllowed();
-	if (redirect) g_taa_input_address.store(color_address, std::memory_order_relaxed);
+	if (redirect && playroom) g_taa_input_address.store(color_address, std::memory_order_relaxed);
 
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	std::unique_lock sl_lock(g_sl_mutex, std::defer_lock);
@@ -2576,7 +2590,7 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	CopyInto(vk_command, depth, g_sr.depth);
 	CopyInto(vk_command, motion, g_sr.motion);
 	// Astro's Playroom: the reactive mask (what was drawn after the lighting).
-	const bool masked = redirect && MaskAtTaa(graphics, command, vk_command, in, fsr);
+	const bool masked = redirect && playroom && MaskAtTaa(graphics, command, vk_command, in, fsr);
 	Transition(vk_command, g_sr.output, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
 	           vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite,
 	           vk::PipelineStageFlagBits2::eComputeShader);
@@ -2752,8 +2766,8 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 		if (!reported) {
 			reported = true;
 			std::printf("%s: the game's TAA draws too (its two targets are its own; the last pass reads the "
-			            "upscaled image in place of the render-size one; KYTY_PLAYROOM_TAA_KEEP)\n",
-			            name);
+			            "upscaled image in place of the game's %ux%u one; KYTY_PLAYROOM_TAA_KEEP)\n",
+			            name, out0.backing.extent.width, out0.backing.extent.height);
 			std::fflush(stdout);
 		}
 		return false;
@@ -2766,6 +2780,7 @@ bool UpscaleTaa(GraphicContext& graphics, TextureCache& cache, CommandBuffer& co
 	(void)pixel;
 	(void)user_data;
 	(void)colors;
+	(void)taa_shader;
 	return false;
 #endif
 }
@@ -2883,7 +2898,8 @@ bool SnapScene(GraphicContext& graphics, TextureCache& cache, CommandBuffer& com
 bool RedirectComposite(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                        PreparedBindings& pixel, std::span<const RenderColorInfo> colors) {
 #ifdef KYTY_UPSCALER_CODE
-	if (!g_sr_ready.load(std::memory_order_relaxed) || g_sr.disabled || !PlayroomUpscaleAllowed()) {
+	if (!g_sr_ready.load(std::memory_order_relaxed) || g_sr.disabled ||
+	    (!PlayroomUpscaleAllowed() && !AstroUpscaleAllowed())) {
 		return false;
 	}
 	if (!colors.empty() && colors[0].image_id) {
@@ -2920,7 +2936,20 @@ bool RedirectComposite(GraphicContext& graphics, TextureCache& cache, CommandBuf
 			}
 		}
 	}
-	if (target == nullptr) return false;
+	if (target == nullptr) {
+		// (Once: what the last pass read instead, for a game whose chain differs, 23p.)
+		static bool reported = false;
+		if (!reported && !pixel.images.empty()) {
+			reported         = true;
+			const auto& info = pixel.images[0].desc.info;
+			std::printf("Upscale to the output size: the last pass reads no %ux%u image (its image 0 is %ux%u at "
+			            "0x%" PRIx64 ", the TAA output at 0x%" PRIx64 "); the game's image is used\n",
+			            r.small_extent.width, r.small_extent.height, info.extent.width, info.extent.height,
+			            static_cast<uint64_t>(info.data.address), r.address);
+			std::fflush(stdout);
+		}
+		return false;
+	}
 	if (PlayroomShow() == 2) return false; // (diagnostic: the game's own image)
 	if (PlayroomShow() == 1) {
 		// (In gameplay that leaves out what the game drew after its TAA: bloom, motion blur.)
@@ -3004,7 +3033,7 @@ bool RedirectComposite(GraphicContext& graphics, TextureCache& cache, CommandBuf
 	target->external_layout = vk::ImageLayout::eShaderReadOnlyOptimal;
 	if (!g_redirect_used.exchange(true, std::memory_order_relaxed) && !mixed) {
 		std::printf("%s: the last pass reads the %ux%u upscaled image in place of the game's %ux%u "
-		            "TAA output (KYTY_PLAYROOM_UPSCALE)\n",
+		            "TAA output (KYTY_PLAYROOM_UPSCALE, KYTY_ASTRO_UPSCALE)\n",
 		            name, r.big.width, r.big.height, r.small_extent.width, r.small_extent.height);
 		std::fflush(stdout);
 	}

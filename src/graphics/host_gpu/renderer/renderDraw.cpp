@@ -4348,7 +4348,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		const auto& user_data = state.ps_input_info.stage.resources->user_data;
 		if (FrameGen::UpscaleTaa(buffer.GetGraphics(), m_context.GetTextureCache(), buffer,
 		                         *bindings.pixel, std::span {user_data.data(), user_data.size()},
-		                         std::span {state.color_info, state.color_count})) {
+		                         std::span {state.color_info, state.color_count},
+		                         state.ps_input_info.stage.program->shader_hash)) {
 			// The draw is not recorded; DLSS bound its own pipelines and descriptors.
 			m_run.valid           = false;
 			m_run_active          = false;
@@ -4371,7 +4372,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
-	// Astro's Playroom upscale: its last pass reads the upscaled TAA output (its descriptors written).
+	// Upscale to the output size (Astro's Playroom, Astro Bot): the last pass reads the upscaled TAA
+	// output (its descriptors written).
 	bool composite_redirected = false;
 	if (FrameGen::UpscaleEnabled() && state.ps_active && bindings.pixel &&
 	    state.ps_input_info.stage.program != nullptr &&
