@@ -222,6 +222,69 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 
 std::atomic<uint64_t> g_content_serial {0};
 
+// KYTY_ASTRO_RES_PROBE=1 (or a line count; diagnostic for issue #5, 23t): logs the 2D images the
+// game creates, at least 64x32, with their guest address, size, format, tiling and row pitch, up
+// to 800 lines (or the count given). An image at an address that already held one of a different
+// size is marked "SIZE CHANGE", with the earlier one: the same memory drawn at one size and read
+// at another. Off unless set.
+int ResProbeLimit() {
+	static const int limit = [] {
+		const char* value = std::getenv("KYTY_ASTRO_RES_PROBE");
+		if (value == nullptr || value[0] == '\0' || value[0] == '0') return 0;
+		const int n = std::atoi(value);
+		return n > 1 ? n : 800;
+	}();
+	return limit;
+}
+
+void ResProbe(const ImageInfo& info) {
+	const int limit = ResProbeLimit();
+	if (limit == 0 || (info.type != Prospero::ImageType::kColor2D && info.type != Prospero::ImageType::kColor2DArray) ||
+	    info.extent.width < 64 ||
+	    info.extent.height < 32) {
+		return;
+	}
+	struct Seen {
+		uint32_t width, height, pitch, format;
+	};
+	static std::mutex                   mutex;
+	static int                          lines = 0;
+	static std::vector<std::pair<uint64_t, Seen>> seen;
+	std::lock_guard lock(mutex);
+	if (lines >= limit) return;
+	const Seen now {info.extent.width, info.extent.height, info.pitch, static_cast<uint32_t>(info.guest_format)};
+	const Seen* before = nullptr;
+	for (const auto& [address, entry]: seen) {
+		if (address == info.data.address) {
+			if (entry.width == now.width && entry.height == now.height && entry.pitch == now.pitch &&
+			    entry.format == now.format) {
+				return; // (seen: logged once)
+			}
+			before = &entry;
+		}
+	}
+	const auto& mip0 = info.mip_layout[0];
+	if (before != nullptr) {
+		std::printf("Res probe: SIZE CHANGE at 0x%llx: %ux%u pitch %u format %u, was %ux%u pitch %u format %u\n",
+		            static_cast<unsigned long long>(info.data.address), now.width, now.height, now.pitch,
+		            now.format, before->width, before->height, before->pitch, before->format);
+		lines++;
+	}
+	std::printf("Res probe: image 0x%llx +0x%llx: %ux%u format %u (vk %d) tile %u pitch %u, mip 0 padded %ux%u, "
+	            "%u mips %u layers %u samples%s\n",
+	            static_cast<unsigned long long>(info.data.address), static_cast<unsigned long long>(info.data.size),
+	            info.extent.width, info.extent.height, static_cast<uint32_t>(info.guest_format),
+	            static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.tile_mode), info.pitch, mip0.pitch,
+	            mip0.height, info.resources.levels, info.resources.layers, info.samples,
+	            info.HasMetadata() ? (info.metadata.kind == ImageMetadataKind::Dcc ? " DCC" : " HTILE") : "");
+	std::fflush(stdout);
+	seen.push_back({info.data.address, now});
+	if (++lines >= limit) {
+		std::printf("Res probe: %d lines, stopped (KYTY_ASTRO_RES_PROBE)\n", lines);
+		std::fflush(stdout);
+	}
+}
+
 } // namespace
 
 void Image::NoteContentWrite() noexcept {
@@ -1018,6 +1081,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
       m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
+	ResProbe(info);
 	m_cpu_dirty =
 	    !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
 	NoteImageStateChange();

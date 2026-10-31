@@ -212,6 +212,11 @@ size tables. Before 23s it missed one of them (stored as 16-bit numbers, used fo
 which gave bands on bright surfaces and a tinted lower third of the picture at 720p and 540p, with or
 without DLSS (issue #5). The console's "Astro Bot 720p: ... 16-bit size table(s)" line says it was found.
 
+23t (diagnostic, Windows only): `KYTY_ASTRO_RES_PROBE=1` logs every 2D image the game creates (64x32
+and up) with its address, size, format, tiling and row pitch, up to 800 lines, and marks memory used
+at two sizes with "SIZE CHANGE". For issue #5: run it once at 720p and once at 1080p on the same
+screen and attach both logs. Leave it unset otherwise.
+
 ## Astro's Playroom (PPSA01325)
 
 Everything above works in Playroom too: **DLSS-G**, **FSR frame generation**, **DLSS and FSR
