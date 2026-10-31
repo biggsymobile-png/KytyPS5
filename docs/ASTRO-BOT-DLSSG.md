@@ -275,6 +275,14 @@ folder itself, so add settings there, e.g. `"KYTY_ASTRO_RENDER_RES": "1080",` an
 Batocera: run the community `install_ps5_kyty.sh` with this release's Linux file:
 `KYTY_URL=<the .tar.gz's download link> bash install_ps5_kyty.sh`.
 
+## Settings window on small or scaled screens
+
+Since 23w the settings windows (Global settings and each game's settings) scroll, and open no
+larger than the screen's free area, Windows display scaling included. Before, Global settings
+could not be made shorter than everything on its General tab, so on a 1080p screen at 125%
+scaling Save and Cancel were below the bottom of the screen (issue #6). The window can be
+resized freely; it remembers the size you leave it at.
+
 ## Separate settings per build (portable)
 
 These builds keep their own `Kyty.ini` (game folders, per-game settings) next to the launcher

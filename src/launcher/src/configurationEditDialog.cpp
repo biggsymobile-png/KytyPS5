@@ -26,6 +26,10 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QScreen>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QShowEvent>
 #include <QSettings>
 #include <QStandardItemModel>
 #include <QSlider>
@@ -209,6 +213,7 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	        });
 
 	setSizeGripEnabled(true);
+	WrapTabsInScrollAreas();
 
 	restoreGeometry(g_last_geometry);
 
@@ -554,7 +559,7 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const Q
 	SetAudioMixVisible(*m_ui, true);
 	update_game_directory_buttons();
 	layout()->activate();
-	resize(size().expandedTo(minimumSizeHint()));
+	m_fitted_to_screen = false; // (sized to the larger global page when shown, FitToScreen)
 }
 
 QString ConfigurationEditDialog::GetAddonsDirectory() const {
@@ -601,6 +606,92 @@ void ConfigurationEditDialog::moveEvent(QMoveEvent* event) {
 void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 	QDialog::resizeEvent(event);
 	g_last_geometry = saveGeometry();
+}
+
+// Each tab's page scrolls (issue #6): the global settings are taller than a 1080p screen at 125%
+// scaling, and the dialog could not be smaller than everything on the General tab, so Save and
+// Cancel were below the screen. The pages keep their own widgets (m_ui->debug_tab and so on).
+void ConfigurationEditDialog::WrapTabsInScrollAreas() {
+	auto* tabs = m_ui->settings_tabs;
+	for (int index = 0; index < tabs->count(); index++) {
+		QWidget* page = tabs->widget(index);
+		if (qobject_cast<QScrollArea*>(page) != nullptr) continue;
+		const QString title   = tabs->tabText(index);
+		const QString tooltip = tabs->tabToolTip(index);
+		tabs->removeTab(index);
+		auto* scroll = new QScrollArea;
+		scroll->setFrameShape(QFrame::NoFrame);
+		scroll->setWidgetResizable(true);
+		scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+		scroll->setWidget(page);
+		page->setAutoFillBackground(false);
+		scroll->viewport()->setAutoFillBackground(false);
+		tabs->insertTab(index, scroll, title);
+		tabs->setTabToolTip(index, tooltip);
+	}
+	tabs->setCurrentIndex(0);
+}
+
+void ConfigurationEditDialog::ShowTabPage(QWidget* page) {
+	for (QWidget* parent = page; parent != nullptr; parent = parent->parentWidget()) {
+		if (auto* scroll = qobject_cast<QScrollArea*>(parent); scroll != nullptr) {
+			m_ui->settings_tabs->setCurrentWidget(scroll);
+			scroll->ensureWidgetVisible(page);
+			return;
+		}
+	}
+}
+
+// Opens at the size that shows the whole tab without scrolling where the screen has room, and never
+// larger than the screen's free area (Windows scaling included): the rest scrolls.
+void ConfigurationEditDialog::FitToScreen() {
+	const QScreen* screen = this->screen();
+	if (screen == nullptr) return;
+	QRect available = screen->availableGeometry();
+	// (The title bar and borders are outside the dialog's own size.)
+	const QMargins frame(geometry().left() - frameGeometry().left(), geometry().top() - frameGeometry().top(),
+	                     frameGeometry().right() - geometry().right(),
+	                     frameGeometry().bottom() - geometry().bottom());
+	const QSize room = available.marginsRemoved(frame).size();
+
+	auto* current = qobject_cast<QScrollArea*>(m_ui->settings_tabs->currentWidget());
+	QSize want = size();
+	if (current != nullptr && current->widget() != nullptr) {
+		QSize content(0, 0);
+		for (int index = 0; index < m_ui->settings_tabs->count(); index++) {
+			if (auto* scroll = qobject_cast<QScrollArea*>(m_ui->settings_tabs->widget(index));
+			    scroll != nullptr && scroll->widget() != nullptr) {
+				content = content.expandedTo(scroll->widget()->sizeHint());
+			}
+		}
+		const QSize chrome = size() - current->viewport()->size();
+		const int   bar    = current->verticalScrollBar()->sizeHint().width();
+		const QSize whole  = chrome + content;
+		// A saved size the user chose is kept; the first time, the whole page where it fits.
+		want = g_last_geometry.isEmpty() ? whole : size();
+		if (whole.height() > room.height()) {
+			want.setWidth(std::max(want.width(), whole.width() + bar)); // (room for the scroll bar)
+		}
+	}
+	setMinimumWidth(std::min(minimumWidth(), room.width()));
+	want = want.boundedTo(room);
+	resize(want);
+	// Keep it on the screen.
+	QRect frame_now = frameGeometry();
+	frame_now.moveLeft(std::clamp(frame_now.left(), available.left(),
+	                              std::max(available.left(), available.right() - frame_now.width() + 1)));
+	frame_now.moveTop(std::clamp(frame_now.top(), available.top(),
+	                             std::max(available.top(), available.bottom() - frame_now.height() + 1)));
+	move(frame_now.topLeft());
+}
+
+void ConfigurationEditDialog::showEvent(QShowEvent* event) {
+	QDialog::showEvent(event);
+	if (!m_fitted_to_screen) {
+		m_fitted_to_screen = true;
+		layout()->activate();
+		FitToScreen();
+	}
 }
 
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings) {
@@ -678,7 +769,7 @@ void ConfigurationEditDialog::save() {
 	for (auto* field: {m_ui->lineEdit_shader_log_folder, m_ui->lineEdit_printf_file,
 	                   m_ui->lineEdit_cmd_dump_folder}) {
 		if (field->isEnabled() && field->text().isEmpty()) {
-			m_ui->settings_tabs->setCurrentWidget(m_ui->debug_tab);
+			ShowTabPage(m_ui->debug_tab);
 			field->setFocus();
 			break;
 		}
