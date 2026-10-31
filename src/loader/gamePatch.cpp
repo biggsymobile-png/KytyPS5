@@ -904,7 +904,12 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 		static constexpr uint32_t kWidths[5]  = {1920, 2432, 2432, 3328, 3840};
 		static constexpr uint32_t kHeights[5] = {1080, 1368, 1368, 1872, 2160};
 		static constexpr float    kWidthsF[5] = {1920.0f, 2432.0f, 2432.0f, 3328.0f, 3840.0f};
-		std::vector<uint8_t*> widths, heights, widths_f;
+		// The same sizes as 16-bit numbers (five widths, then five heights): one table in 01.018, read
+		// by GfxSceneParameters to size a render target. Below 1080p it must shrink with the others,
+		// or that target stays 1920x1080 while the rest are 1280x720 (bands and a tinted lower third,
+		// issue #5).
+		static constexpr uint16_t kSizes16[10] = {1920, 2432, 2432, 3328, 3840, 1080, 1368, 1368, 1872, 2160};
+		std::vector<uint8_t*> widths, heights, widths_f, sizes16;
 		for (Elf64_Half index = 0; index < ehdr->e_phnum; index++) {
 			const auto& segment = phdr[index];
 			if (segment.p_type != PT_LOAD || (segment.p_flags & PF_X) != 0 || segment.p_filesz < sizeof(kWidths)) {
@@ -924,6 +929,7 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 			find(kWidths, sizeof(kWidths), widths);
 			find(kHeights, sizeof(kHeights), heights);
 			find(kWidthsF, sizeof(kWidthsF), widths_f);
+			find(kSizes16, sizeof(kSizes16), sizes16);
 		}
 		if (widths.empty() || widths.size() != heights.size() || widths.size() > 8 || widths_f.size() > 8) {
 			::printf("Game patch: Astro Bot render resolution %dp not applied: this version (%s) has %zu width and "
@@ -946,6 +952,17 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 			for (auto* entry: widths) std::memcpy(entry, &width, sizeof(width));
 			for (auto* entry: heights) std::memcpy(entry, &h0, sizeof(h0));
 			for (auto* entry: widths_f) std::memcpy(entry, &w0f, sizeof(w0f));
+			if (sizes16.size() <= 8) {
+				const uint16_t w16 = static_cast<uint16_t>(width);
+				const uint16_t h16 = static_cast<uint16_t>(low_height);
+				for (auto* entry: sizes16) {
+					std::memcpy(entry, &w16, sizeof(w16));
+					std::memcpy(entry + 10, &h16, sizeof(h16));
+				}
+			}
+			::printf("Game patch: Astro Bot %dp: %zu size tables, %zu 16-bit size table(s)%s (KYTY_ASTRO_RENDER_RES)\n",
+			         low_height, widths.size(), sizes16.size(),
+			         sizes16.empty() ? ", none found in this version" : sizes16.size() > 8 ? ", too many: left" : "");
 			for (auto* entry: tier0) {
 				std::memcpy(entry + 2, &width, sizeof(width));
 				const uint32_t h = static_cast<uint32_t>(low_height);

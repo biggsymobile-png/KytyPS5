@@ -207,6 +207,11 @@ matches; US, European and Asian editions) and **Astro's Playroom** (found by its
 The console says whether it was applied, and why not if it was not. An enabled "Fixed render
 resolution" patch in a patch file takes precedence.
 
+720p and 540p are below the game's lowest size (1080p): the emulator shrinks that size in the game's
+size tables. Before 23s it missed one of them (stored as 16-bit numbers, used for one render target),
+which gave bands on bright surfaces and a tinted lower third of the picture at 720p and 540p, with or
+without DLSS (issue #5). The console's "Astro Bot 720p: ... 16-bit size table(s)" line says it was found.
+
 ## Astro's Playroom (PPSA01325)
 
 Everything above works in Playroom too: **DLSS-G**, **FSR frame generation**, **DLSS and FSR
