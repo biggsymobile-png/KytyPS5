@@ -275,6 +275,13 @@ folder itself, so add settings there, e.g. `"KYTY_ASTRO_RENDER_RES": "1080",` an
 Batocera: run the community `install_ps5_kyty.sh` with this release's Linux file:
 `KYTY_URL=<the .tar.gz's download link> bash install_ps5_kyty.sh`.
 
+## CPU target test (23x, Windows only)
+
+23x is a test build of the emulator compiled for x86-64-v3 CPUs (AVX2, FMA, BMI1/2), which every
+CPU that can run PS5 games already needs, as the games use those instructions themselves. Floating-
+point results stay the same as before. Compare its frame rate with 23w in the same scene; if it
+helps, later releases will use it.
+
 ## Settings window on small or scaled screens
 
 Since 23w the settings windows (Global settings and each game's settings) scroll, and open no

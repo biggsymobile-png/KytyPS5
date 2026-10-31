@@ -23,6 +23,10 @@ on:
         description: Windows release with the command processor's per-draw diagnostics (KYTY_CP_COMMIT_STATS) compiled in - test builds only, about 2-3% slower
         type: boolean
         default: false
+      cpu_v3:
+        description: Windows release built for x86-64-v3 CPUs (AVX2, FMA, BMI2; every CPU that runs PS5 games has them) - test builds for now
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -590,6 +594,7 @@ jobs:
       tag: ${{ inputs.release_tag }}
       draft: ${{ inputs.draft }}
       cp_diagnostics: ${{ inputs.cp_diagnostics }}
+      cpu_v3: ${{ inputs.cpu_v3 }}
 
   # The Linux build added to this fork's release (windows_only off): a .tar.gz ending in
   # Linux-x86_64.tar.gz with kyty_emulator at its top, as Linux installers (Batocera's
