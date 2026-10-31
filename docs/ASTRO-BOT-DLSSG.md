@@ -212,6 +212,12 @@ size tables. Before 23s it missed one of them (stored as 16-bit numbers, used fo
 which gave bands on bright surfaces and a tinted lower third of the picture at 720p and 540p, with or
 without DLSS (issue #5). The console's "Astro Bot 720p: ... 16-bit size table(s)" line says it was found.
 
+23u: the cause was the lighting's tile grid. The game splits the picture into 16x16-pixel tiles
+for its lights and keeps their number per size (120x68 at 1080p) in another table, which stayed
+at 120x68 below 1080p: the lights of one tile row landed in the next, giving stepped bands at 720p
+and one edge at 540p. The emulator now sets it to 80x45 (720p) or 60x34 (540p); the console line
+says "1 lighting tile table(s)".
+
 23t (diagnostic, Windows only): `KYTY_ASTRO_RES_PROBE=1` logs every 2D image the game creates (64x32
 and up) with its address, size, format, tiling and row pitch, up to 800 lines, and marks memory used
 at two sizes with "SIZE CHANGE". For issue #5: run it once at 720p and once at 1080p on the same
