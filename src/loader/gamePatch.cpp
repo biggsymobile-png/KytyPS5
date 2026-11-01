@@ -958,6 +958,37 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 			for (auto* entry: widths) std::memcpy(entry, &width, sizeof(width));
 			for (auto* entry: heights) std::memcpy(entry, &h0, sizeof(h0));
 			for (auto* entry: widths_f) std::memcpy(entry, &w0f, sizeof(w0f));
+			// 01.007: no run of five float widths (01.018's layout); its tier-0 float width is two
+			// single 1920.0 floats at 0x87e9ac8 and 0x87edb60 (teogorghin's 01.007 patch file, 960x540
+			// mod). Written only on 01.007, inside the game and while each still holds 1920.0.
+			std::vector<uint8_t*> single_f;
+			if (widths_f.empty() && version == "01.007.000") {
+				static constexpr uint64_t kSingleF1007[2] = {0x87e9ac8, 0x87edb60};
+				for (const uint64_t offset: kSingleF1007) {
+					const uint64_t address = main_program->base_vaddr + offset;
+					float          value   = 0.0f;
+					// Only in a non-code PT_LOAD segment, like the tables above (the same memory the
+					// searches write to).
+					bool in_data = false;
+					for (Elf64_Half index = 0; index < ehdr->e_phnum && !in_data; index++) {
+						const auto& segment = phdr[index];
+						in_data = segment.p_type == PT_LOAD && (segment.p_flags & PF_X) == 0 &&
+						          offset >= segment.p_vaddr &&
+						          offset + sizeof(float) <= segment.p_vaddr + segment.p_filesz;
+					}
+					if (in_data && IsInsideProgram(*main_program, address, sizeof(float))) {
+						std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+					}
+					if (value == 1920.0f) {
+						std::memcpy(reinterpret_cast<void*>(address), &w0f, sizeof(w0f));
+						single_f.push_back(reinterpret_cast<uint8_t*>(address));
+					} else {
+						::printf("Game patch: Astro Bot %dp: 01.007 float width at game+0x%llx not 1920.0, left "
+						         "(KYTY_ASTRO_RENDER_RES)\n",
+						         low_height, static_cast<unsigned long long>(offset));
+					}
+				}
+			}
 			if (sizes16.size() <= 8) {
 				const uint16_t w16 = static_cast<uint16_t>(width);
 				const uint16_t h16 = static_cast<uint16_t>(low_height);
@@ -974,12 +1005,44 @@ void ApplyAstroRenderResolution(Program* main_program, const std::string& title_
 					std::memcpy(entry + 20, &tiles_x, sizeof(tiles_x));
 				}
 			}
-			::printf("Game patch: Astro Bot %dp: %zu size tables, %zu 16-bit size table(s)%s, %zu lighting tile "
-			         "table(s) (%ux%u tiles)%s (KYTY_ASTRO_RENDER_RES)\n",
-			         low_height, widths.size(), sizes16.size(),
+			::printf("Game patch: Astro Bot %dp: %zu size tables, %zu float width table(s)%s, %zu 16-bit size "
+			         "table(s)%s, %zu lighting tile table(s) (%ux%u tiles)%s (KYTY_ASTRO_RENDER_RES)\n",
+			         low_height, widths.size(), widths_f.size() + single_f.size(),
+			         !single_f.empty()  ? " (01.007 single floats)"
+			         : widths_f.empty() ? " (none in this version)"
+			                            : "",
+			         sizes16.size(),
 			         sizes16.empty() ? " (none in this version)" : sizes16.size() > 8 ? " (too many: left)" : "",
 			         tiles16.size(), tiles_x, tiles_y,
 			         tiles16.empty() ? " (none in this version)" : tiles16.size() > 8 ? " (too many: left)" : "");
+			// Where each structure was patched (game+offset), so a report shows which ones this version
+			// has: one line, only the kinds that were written.
+			{
+				std::string where;
+				const auto  list = [&](const char* name, const std::vector<uint8_t*>& entries) {
+					if (entries.empty() || entries.size() > 8) {
+						return;
+					}
+					where += where.empty() ? " " : "; ";
+					where += name;
+					for (const auto* entry: entries) {
+						char text[24];
+						std::snprintf(text, sizeof(text), " 0x%llx",
+						              static_cast<unsigned long long>(reinterpret_cast<uint64_t>(entry) -
+						                                              main_program->base_vaddr));
+						where += text;
+					}
+				};
+				list("widths", widths);
+				list("heights", heights);
+				list("float widths", widths_f);
+				list("01.007 float widths", single_f);
+				list("16-bit sizes", sizes16);
+				list("lighting tiles", tiles16);
+				list("tier code", tier0);
+				::printf("Game patch: Astro Bot %dp patched at game+:%s (KYTY_ASTRO_RENDER_RES)\n", low_height,
+				         where.c_str());
+			}
 			for (auto* entry: tier0) {
 				std::memcpy(entry + 2, &width, sizeof(width));
 				const uint32_t h = static_cast<uint32_t>(low_height);

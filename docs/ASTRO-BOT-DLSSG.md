@@ -218,6 +218,13 @@ at 120x68 below 1080p: the lights of one tile row landed in the next, giving ste
 and one edge at 540p. The emulator now sets it to 80x45 (720p) or 60x34 (540p); the console line
 says "1 lighting tile table(s)".
 
+23y: **01.007 at 540p and 720p.** In 01.007 one size the game uses (the base width as a decimal
+number) is not stored as in 01.018, so it stayed at 1920 and the picture came out softer and slower
+than it should. The emulator now also sets it on 01.007 (thanks to teogorghin, whose patch file
+showed where it is), and only where it still finds 1920. The console now says how many of these
+were found ("float width table(s)") and adds a "patched at game+:" line listing where each size was
+changed: please include both lines if 540p or 720p looks wrong on your version.
+
 23t (diagnostic, Windows only): `KYTY_ASTRO_RES_PROBE=1` logs every 2D image the game creates (64x32
 and up) with its address, size, format, tiling and row pitch, up to 800 lines, and marks memory used
 at two sizes with "SIZE CHANGE". For issue #5: run it once at 720p and once at 1080p on the same
@@ -246,7 +253,7 @@ double speed without a decouple patch, as its game logic steps once per frame). 
 game's settings, Graphics & display; frontends: `--vblank-frequency 60`) or use a patch file's
 decouple mod.
 
-## Shader maths profile (experimental)
+## Shader maths profile
 
 **Relaxed shader maths** (`KYTY_FLOAT_PROFILE`): `precise` (the default) copies the PS5 GPU's exact
 floating-point rules, which takes several instructions for things like min/max with NaNs, tiny
@@ -267,6 +274,11 @@ launcher, or `"KYTY_FSR": "1",` and `"KYTY_FRAMEGEN_BACKEND": "fsr",` in `u59-pr
 any Vulkan GPU (frame generation: see above, Vblank frequency at twice the game's frame rate). The built-in **render resolution**, the **shader maths profile** and everything else
 from Jetsku's int21 are in them too. The macOS build is new and untested by us: please report
 whether it works (and the console's `FSR upscaling:` and `Frame generation:` lines if it does not).
+
+23y: **Linux with AMD (RADV, Mesa 26.3):** a crash while drawing (in `vkCmdDraw`) with recent Mesa
+drivers is fixed, from mainline KytyPS5 (`597137e8`). The emulator now switches on the Vulkan
+extension `VK_EXT_extended_dynamic_state` wherever the driver has it; other drivers should not
+notice, though the first start may build the driver's own shader cache again.
 
 Started without the launcher (as frontends do), the emulator applies `u59-preset.json` from its
 folder itself, so add settings there, e.g. `"KYTY_ASTRO_RENDER_RES": "1080",` and
@@ -421,7 +433,8 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 Report problems on the fork's [Issues page](https://github.com/biggsymobile-png/KytyPS5/issues/new?template=bug_report.yml):
 the form asks for the build, game version, GPU and settings, and the console log. Please include your GPU, driver version, game and version, and all the `Frame generation:`,
 `DLSS upscaling:`, `FSR upscaling:`, `Game patch:` and `Streamline` lines from the console (or the
-lines just before a crash).
+lines just before a crash). From 23y a crash inside the game's own checks shows a `game assert:` line
+with the game's whole message: please include it.
 
 ## How it works
 

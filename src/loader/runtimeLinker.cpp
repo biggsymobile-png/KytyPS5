@@ -920,6 +920,38 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			append("\n");
 		}
+		{
+			// A game assert (Astro Bot, Playroom: "int 0x41" with the message in rsi, "ASSERT:
+			// D:\asobi..."): the whole message as text, up to 512 bytes or its terminating zero, read
+			// 16 bytes at a time while readable. The register dump below shows only 64 aligned bytes.
+			const auto at_int41 = [](uint64_t address) {
+				return IsReadableRange(address, 2) && reinterpret_cast<const uint8_t*>(address)[0] == 0xcd &&
+				       reinterpret_cast<const uint8_t*>(address)[1] == 0x41;
+			};
+			if ((at_int41(info->exception_address) || at_int41(info->exception_address - 2)) &&
+			    info->rsi >= 0x10000) {
+				std::string message;
+				bool        ended = false;
+				for (uint64_t offset = 0; offset < 512 && !ended; offset += 16) {
+					if (!IsReadableRange(info->rsi + offset, 16)) {
+						break;
+					}
+					const auto* text = reinterpret_cast<const uint8_t*>(info->rsi + offset);
+					for (int i = 0; i < 16; i++) {
+						if (text[i] == 0) {
+							ended = true;
+							break;
+						}
+						message += (text[i] == '\n' || (text[i] >= 0x20 && text[i] < 0x7f))
+						               ? static_cast<char>(text[i])
+						               : '.';
+					}
+				}
+				if (!message.empty()) {
+					append("game assert: {}{}\n", message, ended ? "" : " (cut)");
+				}
+			}
+		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 			append("stack:");
