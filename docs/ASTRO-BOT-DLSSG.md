@@ -309,8 +309,9 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   compute queues in turn on one thread. When a compute queue was waiting for a value the graphics
   queue writes (a "label"), the graphics queue could write it, carry on, and reset it for the next
   frame before the waiting queue looked again: the waiting queue then waited for ever, and the game
-  froze (seen when diving into Sky Garden). Now a queue that writes memory another queue is waiting
-  on hands over straight away, so the waiting queue sees the value first. Diagnosis by TheCruZ
+  froze (seen when diving into Sky Garden). Now a queue that writes the value another queue is
+  waiting for hands over straight away, so the waiting queue sees it first (a write the waiting
+  queue would not accept, such as the reset, changes nothing). Diagnosis by TheCruZ
   ([KytyPS5-GTA](https://github.com/TheCruZ/KytyPS5-GTA)); this is our own implementation for
   Jetsku's command processor. Please report freezes, hitches, and also **the water in Astro Bot**
   (white or opaque water would mean the queues now run in a wrong order: try
@@ -456,11 +457,23 @@ off by default:
 - `KYTY_HANG_TRACE=1`: a `_HangTrace` folder with `summary.csv`, one row a second (`flips` is the
   frames shown that second, plus GPU busy and idle time, queue waits, readbacks and shader compile
   stalls). From 23z it also has `flip_max_ms` (the longest frame that second), `hitches_50ms`,
-  `hitches_250ms` (frames longer than 50 / 250 ms) and `label_handoffs` (how often the 23z queue
-  handover stepped in).
+  `hitches_250ms` (frames longer than 50 / 250 ms), `label_handoffs` (how often the 23z queue
+  handover stepped in) and `label_handoffs_skipped` (writes to a waited value that the waiting
+  queue would not accept yet).
 
 For a fair comparison play the same stretch the same way in each build (for example the first
 two minutes of Sky Garden from the level start), with the same settings, and send both files.
+
+**Optional experiments (23z, off by default).** If you have time, run the same stretch once more
+with one of these set, and send the logs with the plain run:
+
+- `KYTY_READ_FAULT_PUBLISHED=1`: when a game thread reads memory the GPU wrote, it gets the last
+  copy the GPU published instead of waiting for the GPU. Can be faster; can also show
+  out-of-date values (flicker, wrong positions, a hang). `KYTY_READ_FAULT_PUBLISHED=verify` checks
+  how often the copy was out of date without using it.
+- `KYTY_GPU_OCCLUSION=1`: real occlusion results instead of "everything is visible", so the game
+  can skip objects hidden behind others. May be faster or slower; please also say whether
+  anything flickers or pops in (Creamy Canyon especially).
 
 ## How it works
 

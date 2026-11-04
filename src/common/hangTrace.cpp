@@ -342,6 +342,7 @@ struct Totals {
 	std::atomic<uint64_t> hitches_50ms {0};
 	std::atomic<uint64_t> hitches_250ms {0};
 	std::atomic<uint64_t> label_handoffs {0};
+	std::atomic<uint64_t> label_handoffs_skipped {0};
 	std::atomic<uint64_t> lod_packets {0};
 	std::atomic<uint64_t> lod_prior_nonzero {0};
 	std::atomic<uint64_t> tex_mipstats {0};
@@ -1036,9 +1037,9 @@ void Publish() {
 		line += fmt::format(",{},{}", take(g_totals.compile_disk_loads),
 		                    take(g_totals.compile_disk_load_ns) / 1000u);
 		// Frame pacing and label handoffs (appended last so that no existing column moves).
-		line += fmt::format(",{:.1f},{},{},{}", static_cast<double>(take(g_totals.flip_max_ns)) / 1e6,
+		line += fmt::format(",{:.1f},{},{},{},{}", static_cast<double>(take(g_totals.flip_max_ns)) / 1e6,
 		                    take(g_totals.hitches_50ms), take(g_totals.hitches_250ms),
-		                    take(g_totals.label_handoffs));
+		                    take(g_totals.label_handoffs), take(g_totals.label_handoffs_skipped));
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -1175,7 +1176,7 @@ void Initialize() {
 	// Persistent program cache (KYTY_PROGRAM_CACHE): permutations reloaded instead of translated
 	// and emitted, and the time their keys, lookups and decoding took.
 	summary_header += ",compile_disk_loads,compile_disk_load_us";
-	summary_header += ",flip_max_ms,hitches_50ms,hitches_250ms,label_handoffs";
+	summary_header += ",flip_max_ms,hitches_50ms,hitches_250ms,label_handoffs,label_handoffs_skipped";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.compiles = OpenFile("compiles.csv",
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
@@ -1945,11 +1946,12 @@ void RecordFlip() {
 	}
 }
 
-void RecordLabelHandoff() {
+void RecordLabelHandoff(bool handed_over) {
 	if (!Enabled()) {
 		return;
 	}
-	g_totals.label_handoffs.fetch_add(1, std::memory_order_relaxed);
+	(handed_over ? g_totals.label_handoffs : g_totals.label_handoffs_skipped)
+	    .fetch_add(1, std::memory_order_relaxed);
 }
 
 void RecordGpuFrame(const GpuFrame& frame) {

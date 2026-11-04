@@ -237,6 +237,10 @@ public:
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	// 0 for the graphics queue, 1.. for the async compute queues (the hang watchdog's numbering).
+	[[nodiscard]] uint32_t QueueIndex() const {
+		return m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1);
+	}
 
 	[[nodiscard]] FrontMode GetFrontMode() const noexcept { return m_front_mode; }
 	// A reference front (KYTY_CP_SEQ_VERIFY) and a speculative one (KYTY_CP_SEQ_PREFETCH) only
@@ -339,7 +343,7 @@ private:
 	// The back: executes one op with today's code (the direct path's bodies).
 	CpSeq::Result ExecuteOp(CpSeq::OpKind kind, const void* payload, const void* data);
 	// KYTY_LABEL_HANDOFF (graphicsRun.cpp): ends the slice after a write another queue waits on.
-	void          NoteHandoffWrite(CpSeq::OpKind kind, const void* payload);
+	void          NoteHandoffAfterOp(CpSeq::OpKind kind, const void* payload);
 	void          ExecDrawIndex(const CpSeq::DrawIndexOp& op);
 	void          ExecDrawAuto(const CpSeq::DrawAutoOp& op);
 	void          ExecDrawIndirect(const CpSeq::DrawIndirectOp& op);

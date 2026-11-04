@@ -425,15 +425,18 @@ void GuestGpu::NotifyProgress() {
 // Bot's frame slots reset their handoff labels to 0 when a new frame starts in the slot, and a
 // compute queue that missed the label waited forever, and every queue waiting on it (the freeze
 // when diving into Sky Garden). On a real GPU the queues run side by side and the waiter sees the
-// label as soon as it lands. Now the memory each suspended wait reads is noted, and a packet that
-// writes it ends the writer's slice after that packet: every suspended queue retries its wait
-// before the writer goes on. A write the GPU makes later (a deferred label) wakes the waiters when
-// it lands, and also ends the slice running then.
+// label as soon as it lands. Now the memory and condition of each suspended wait are noted, and
+// a packet whose write satisfies one ends the writer's slice after that packet: every suspended
+// queue retries its wait before the writer goes on. The written value is tested first, so a write
+// the waiter would not accept (a label reset while it waits for the next value) changes nothing.
+// A label the GPU writes later (deferred) is tested when it lands, and ends the slice running then.
 // Diagnosis of the freeze: TheCruZ (KytyPS5-GTA, "let queues waiting on a label run before its
 // writer goes on"); this is an implementation for this command processor.
 static Live::Switch g_label_handoff("KYTY_LABEL_HANDOFF", Live::ParseDefaultOn);
-void GuestGpu::NoteBlockedWait(uint32_t queue, uint64_t address, uint32_t size) noexcept {
-	if (queue >= QueueCount || size == 0 || !g_label_handoff.On()) {
+void GuestGpu::NoteBlockedWait(uint32_t queue, uint64_t address, uint32_t size, uint64_t ref,
+                               uint64_t mask, uint32_t func) noexcept {
+	if (queue >= QueueCount || (size != sizeof(uint32_t) && size != sizeof(uint64_t)) ||
+	    !g_label_handoff.On()) {
 		return;
 	}
 	std::scoped_lock lock(m_waited_mutex);
@@ -441,7 +444,7 @@ void GuestGpu::NoteBlockedWait(uint32_t queue, uint64_t address, uint32_t size) 
 	if (range.size == 0) {
 		m_waited_count.fetch_add(1, std::memory_order_relaxed);
 	}
-	range = {address, size};
+	range = {address, size, ref, mask, func};
 }
 
 void GuestGpu::ClearBlockedWait(uint32_t queue) noexcept {
@@ -456,29 +459,46 @@ void GuestGpu::ClearBlockedWait(uint32_t queue) noexcept {
 	}
 }
 
-bool GuestGpu::NoteLabelWrite(uint32_t writer, uint64_t address, uint64_t size) noexcept {
+bool GuestGpu::NoteLabelWrite(uint32_t writer, uint64_t address, uint64_t size,
+                              const void* bytes) noexcept {
 	if (m_waited_count.load(std::memory_order_relaxed) == 0 || size == 0 || address == 0 ||
 	    !g_label_handoff.On()) {
 		return false;
 	}
-	bool waited = false;
+	bool handoff = false;
+	bool skipped = false;
 	{
 		std::scoped_lock lock(m_waited_mutex);
-		for (uint32_t queue = 0; queue < QueueCount; queue++) {
+		for (uint32_t queue = 0; queue < QueueCount && !handoff; queue++) {
 			const auto& range = m_waited[queue];
-			if (queue != writer && range.size != 0 && range.address < address + size &&
-			    address < range.address + range.size) {
-				waited = true;
-				break;
+			if (queue == writer || range.size == 0 || range.address >= address + size ||
+			    address >= range.address + range.size) {
+				continue;
 			}
+			// The whole waited value was written: hand over only if it now passes the wait (a
+			// label reset to 0 while the waiter wants 1 would wake it for nothing). A partial
+			// write, or one whose bytes are unknown, hands over.
+			if (bytes != nullptr && address <= range.address &&
+			    range.address + range.size <= address + size) {
+				uint64_t value = 0;
+				std::memcpy(&value, static_cast<const uint8_t*>(bytes) + (range.address - address),
+				            static_cast<size_t>(range.size));
+				if (!TestWaitRegMemValue(value, range.ref, range.mask, range.func)) {
+					skipped = true;
+					continue;
+				}
+			}
+			handoff = true;
 		}
 	}
-	if (waited) {
+	if (handoff) {
 		m_handoff_wake.store(true, std::memory_order_release);
 		m_has_blocked.store(true, std::memory_order_release);
-		HangTrace::RecordLabelHandoff();
+		HangTrace::RecordLabelHandoff(true);
+	} else if (skipped) {
+		HangTrace::RecordLabelHandoff(false);
 	}
-	return waited;
+	return handoff;
 }
 
 bool GuestGpu::HasRunnableComputeWork() {
@@ -524,6 +544,11 @@ void GuestGpu::AddDeferredLabel(uint64_t address, uint32_t size, uint64_t tick, 
                                 bool cp_visible) {
 	Common::LockGuard lock(m_queue_mutex);
 	m_deferred_labels.push_back({address, size, tick, value, cp_visible && size <= sizeof(value)});
+	// KYTY_LABEL_HANDOFF: the command processor's waits see a CP-visible label now (split mode).
+	if (cp_visible && size <= sizeof(value)) {
+		NoteLabelWrite(g_current_processor != nullptr ? g_current_processor->QueueIndex() : UINT32_MAX,
+		               address, size, &value);
+	}
 	if (cp_visible) {
 		m_cp_visible_labels.store(true, std::memory_order_relaxed);
 	}
@@ -539,10 +564,12 @@ void GuestGpu::RemoveDeferredLabel(uint64_t address, uint64_t tick) {
 		                                return label.address == address && label.tick == tick;
 	                                });
 	EXIT_IF(found == m_deferred_labels.end());
-	const auto label_size = found->size;
+	const auto label_size  = found->size;
+	const auto label_value = found->value;
 	m_deferred_labels.erase(found);
 	// KYTY_LABEL_HANDOFF: the label has landed; the slice running now ends after its packet.
-	NoteLabelWrite(UINT32_MAX, address, label_size);
+	NoteLabelWrite(UINT32_MAX, address, label_size,
+	               label_size <= sizeof(label_value) ? &label_value : nullptr);
 	HangWatchdog::NoteEvent(address, "deferred-label", tick, INT16_MIN, false, 0, 0, true);
 	m_deferred_label_count.store(static_cast<uint32_t>(m_deferred_labels.size()),
 	                             std::memory_order_release);
@@ -1243,7 +1270,8 @@ CpSeq::Result CommandProcessor::ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& o
 		if (passed) {
 			g_gpu_state->ClearBlockedWait(queue);
 		} else {
-			g_gpu_state->NoteBlockedWait(queue, op.addr, static_cast<uint32_t>(sizeof(T)));
+			g_gpu_state->NoteBlockedWait(queue, op.addr, static_cast<uint32_t>(sizeof(T)), op.ref,
+			                             op.mask, op.func);
 		}
 	}
 	if (HangTrace::CpTraceEnabled()) {
@@ -4770,56 +4798,23 @@ CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payloa
 		case OpKind::SkipSlots: EXIT("stream ops are consumed by ResolveSubmission\n"); break;
 		case OpKind::Count: EXIT("invalid op kind\n");
 	}
-	NoteHandoffWrite(kind, payload);
+	NoteHandoffAfterOp(kind, payload);
 	return {};
 }
 
-// KYTY_LABEL_HANDOFF: after an operation that writes guest memory, end this slice when another
-// queue is suspended on a wait that reads it, or when a deferred label landed meanwhile.
-void CommandProcessor::NoteHandoffWrite(CpSeq::OpKind kind, const void* payload) {
-	using CpSeq::OpKind;
+// KYTY_LABEL_HANDOFF: the command processor's own writes are reported where they happen
+// (NoteCpWrite, labels made visible to it or landing). A DMA or COPY_DATA runs on the GPU, so its
+// bytes are not known here: it hands over whenever it writes waited memory. Either way the slice
+// ends after this operation, and every suspended queue retries before this one goes on.
+void CommandProcessor::NoteHandoffAfterOp(CpSeq::OpKind kind, const void* payload) {
 	if (g_gpu_state == nullptr || g_current_execution == nullptr) {
 		return;
 	}
-	uint64_t address = 0;
-	uint64_t size    = 0;
-	switch (kind) {
-		case OpKind::WriteData: {
-			const auto& op = *static_cast<const CpSeq::WriteDataOp*>(payload);
-			address        = op.dst;
-			size           = uint64_t {op.dw_num} * sizeof(uint32_t);
-			break;
-		}
-		case OpKind::DmaData: {
-			const auto& op = *static_cast<const CpSeq::DmaDataOp*>(payload);
-			address        = op.dst;
-			size           = op.num_bytes;
-			break;
-		}
-		case OpKind::EndOfPipe: {
-			const auto& op = *static_cast<const CpSeq::EndOfPipeOp*>(payload);
-			address        = op.dst;
-			size           = op.size;
-			break;
-		}
-		case OpKind::ReleaseMem: {
-			const auto& op = *static_cast<const CpSeq::ReleaseMemOp*>(payload);
-			address        = op.body[2] | (static_cast<uint64_t>(op.body[3]) << 32u);
-			size           = sizeof(uint64_t);
-			break;
-		}
-		case OpKind::ReferenceClock: {
-			const auto& op = *static_cast<const CpSeq::ReferenceClockOp*>(payload);
-			address        = op.dst;
-			size           = op.num_bytes;
-			break;
-		}
-		default: break;
+	if (kind == CpSeq::OpKind::DmaData) {
+		const auto& op = *static_cast<const CpSeq::DmaDataOp*>(payload);
+		g_gpu_state->NoteLabelWrite(QueueIndex(), op.dst, op.num_bytes, nullptr);
 	}
-	const auto writer =
-	    m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1);
-	const bool waited = size != 0 && g_gpu_state->NoteLabelWrite(writer, address, size);
-	if (waited || g_gpu_state->m_handoff_wake.load(std::memory_order_acquire)) {
+	if (g_gpu_state->m_handoff_wake.load(std::memory_order_acquire)) {
 		g_current_execution->m_yield = true;
 	}
 }
@@ -4966,6 +4961,13 @@ void CommandProcessor::CopyFrontState(const CommandProcessor& from) {
 void NoteCpWrite(uint64_t address, uint64_t size) {
 	if (CpSeq::ConfiguredMode() == CpSeq::Mode::Thread && address != 0 && size != 0) {
 		Coherence::NoteContentWrite(address, size, Coherence::Source::CpWrite);
+	}
+	// KYTY_LABEL_HANDOFF: every caller has just stored these bytes on this thread, so they can be
+	// read back to test the waits they may satisfy.
+	if (g_gpu_state != nullptr && address != 0 && size != 0) {
+		g_gpu_state->NoteLabelWrite(
+		    g_current_processor != nullptr ? g_current_processor->QueueIndex() : UINT32_MAX, address,
+		    size, reinterpret_cast<const void*>(address));
 	}
 	// KYTY_LABEL_MODE=split: a later CP write replaces a pending label's value in the CP's view.
 	if (g_gpu_state != nullptr && address != 0 && size != 0) {

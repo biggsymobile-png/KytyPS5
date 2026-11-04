@@ -144,13 +144,18 @@ private:
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
-	// KYTY_LABEL_HANDOFF (graphicsRun.cpp): the memory a suspended queue's WAIT_REG_MEM reads, so
-	// that a queue writing it ends its slice and the waiter retries before the writer goes on.
-	void NoteBlockedWait(uint32_t queue, uint64_t address, uint32_t size) noexcept;
+	// KYTY_LABEL_HANDOFF (graphicsRun.cpp): the memory and condition of a suspended queue's
+	// WAIT_REG_MEM, so that a queue writing a value that satisfies it ends its slice and the
+	// waiter retries before the writer goes on.
+	void NoteBlockedWait(uint32_t queue, uint64_t address, uint32_t size, uint64_t ref,
+	                     uint64_t mask, uint32_t func) noexcept;
 	void ClearBlockedWait(uint32_t queue) noexcept;
-	// A write of [address, address + size) by the queue `writer`: true when another queue is
-	// suspended on a wait that reads those bytes (the waiters are then retried after this slice).
-	bool NoteLabelWrite(uint32_t writer, uint64_t address, uint64_t size) noexcept;
+	// A write of [address, address + size) by the queue `writer` (UINT32_MAX: no queue). `bytes`
+	// holds the bytes written (nullptr: unknown). True when another queue is suspended on a wait
+	// that reads them and the written value may satisfy it (the waiters are then retried after
+	// this slice). A write that covers a wait exactly and fails its condition hands nothing over.
+	bool NoteLabelWrite(uint32_t writer, uint64_t address, uint64_t size,
+	                    const void* bytes) noexcept;
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_submission_mutex;
@@ -169,7 +174,10 @@ private:
 	// KYTY_LABEL_HANDOFF: per queue, the range its suspended WAIT_REG_MEM reads (size 0: none).
 	struct WaitedRange {
 		uint64_t address = 0;
-		uint64_t size    = 0;
+		uint64_t size    = 0; // 4 or 8; 0: no wait
+		uint64_t ref     = 0;
+		uint64_t mask    = 0;
+		uint32_t func    = 0;
 	};
 	std::mutex                                     m_waited_mutex;
 	std::array<WaitedRange, QueueCount>            m_waited {};   // m_waited_mutex
@@ -204,6 +212,7 @@ private:
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;
+	friend void NoteCpWrite(uint64_t address, uint64_t size); // KYTY_LABEL_HANDOFF
 };
 } // namespace Libs::Graphics
 

@@ -351,8 +351,9 @@ void RecordDoneWait(uint64_t wait_ns);
 // two guest flips that ended in this second, and how many such gaps exceeded 50 and 250 ms.
 void RecordFlip();
 // KYTY_LABEL_HANDOFF (graphicsRun.cpp): a queue's slice ended because another queue waits on the
-// memory it wrote (summary.csv label_handoffs).
-void RecordLabelHandoff();
+// memory it wrote (handed_over, summary.csv label_handoffs), or a write to waited memory did not
+// satisfy the wait and changed nothing (label_handoffs_skipped).
+void RecordLabelHandoff(bool handed_over);
 
 // GPU execution timing for one guest flip (see graphics/host_gpu/renderer/gpuTiming.h).
 struct GpuFrame {
