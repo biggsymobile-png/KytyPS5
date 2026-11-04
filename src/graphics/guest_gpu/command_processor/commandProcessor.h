@@ -338,6 +338,8 @@ private:
 	CpSeq::Result ExecLockstepRead(const CpSeq::LockstepReadOp& op);
 	// The back: executes one op with today's code (the direct path's bodies).
 	CpSeq::Result ExecuteOp(CpSeq::OpKind kind, const void* payload, const void* data);
+	// KYTY_LABEL_HANDOFF (graphicsRun.cpp): ends the slice after a write another queue waits on.
+	void          NoteHandoffWrite(CpSeq::OpKind kind, const void* payload);
 	void          ExecDrawIndex(const CpSeq::DrawIndexOp& op);
 	void          ExecDrawAuto(const CpSeq::DrawAutoOp& op);
 	void          ExecDrawIndirect(const CpSeq::DrawIndirectOp& op);

@@ -347,7 +347,12 @@ void RecordUncleanRead(uint64_t address, uint64_t size, const char* reason, cons
 void RecordQueueWait(uint32_t queue, uint64_t wait_ns);
 void RecordQueueBusy(uint32_t queue, uint64_t busy_ns, bool complete);
 void RecordDoneWait(uint64_t wait_ns);
+// Also fills summary.csv's flip_max_ms, hitches_50ms and hitches_250ms: the longest time between
+// two guest flips that ended in this second, and how many such gaps exceeded 50 and 250 ms.
 void RecordFlip();
+// KYTY_LABEL_HANDOFF (graphicsRun.cpp): a queue's slice ended because another queue waits on the
+// memory it wrote (summary.csv label_handoffs).
+void RecordLabelHandoff();
 
 // GPU execution timing for one guest flip (see graphics/host_gpu/renderer/gpuTiming.h).
 struct GpuFrame {

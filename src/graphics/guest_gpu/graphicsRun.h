@@ -144,6 +144,14 @@ private:
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
+	// KYTY_LABEL_HANDOFF (graphicsRun.cpp): the memory a suspended queue's WAIT_REG_MEM reads, so
+	// that a queue writing it ends its slice and the waiter retries before the writer goes on.
+	void NoteBlockedWait(uint32_t queue, uint64_t address, uint32_t size) noexcept;
+	void ClearBlockedWait(uint32_t queue) noexcept;
+	// A write of [address, address + size) by the queue `writer`: true when another queue is
+	// suspended on a wait that reads those bytes (the waiters are then retried after this slice).
+	bool NoteLabelWrite(uint32_t writer, uint64_t address, uint64_t size) noexcept;
+
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_submission_mutex;
 	Common::Mutex                                  m_queue_mutex;
@@ -158,6 +166,16 @@ private:
 	std::atomic_bool                               m_cp_visible_labels {false}; // ever added
 	// Some queue front is marked blocked (set under m_queue_mutex; NotifyProgress fast path).
 	std::atomic_bool                               m_has_blocked {false};
+	// KYTY_LABEL_HANDOFF: per queue, the range its suspended WAIT_REG_MEM reads (size 0: none).
+	struct WaitedRange {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+	std::mutex                                     m_waited_mutex;
+	std::array<WaitedRange, QueueCount>            m_waited {};   // m_waited_mutex
+	std::atomic_uint32_t                           m_waited_count {0};
+	// A write reached a waited range: clear the blocked fronts after the writer's slice.
+	std::atomic_bool                               m_handoff_wake {false};
 	// Bounded Done (KYTY_AGC_DONE_MODE): admission sequence numbers of submissions not yet
 	// completed, the last sequence admitted before the latest Done, and its waiters.
 	std::set<uint64_t>                             m_in_flight;

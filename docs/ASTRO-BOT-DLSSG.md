@@ -304,6 +304,18 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 
 ## Known issues
 
+- **Build 23z (test): fewer freezes when one GPU queue waits for another** (`KYTY_LABEL_HANDOFF`, on
+  by default; `KYTY_LABEL_HANDOFF=0` turns it off). The emulator runs the game's graphics and
+  compute queues in turn on one thread. When a compute queue was waiting for a value the graphics
+  queue writes (a "label"), the graphics queue could write it, carry on, and reset it for the next
+  frame before the waiting queue looked again: the waiting queue then waited for ever, and the game
+  froze (seen when diving into Sky Garden). Now a queue that writes memory another queue is waiting
+  on hands over straight away, so the waiting queue sees the value first. Diagnosis by TheCruZ
+  ([KytyPS5-GTA](https://github.com/TheCruZ/KytyPS5-GTA)); this is our own implementation for
+  Jetsku's command processor. Please report freezes, hitches, and also **the water in Astro Bot**
+  (white or opaque water would mean the queues now run in a wrong order: try
+  `KYTY_LABEL_HANDOFF=0` and tell us).
+
 - **Build 23q (test): DLSS and FSR upscale Astro Bot to the full output size** (issue #4). Before,
   they stopped at 2432x1368 and the game stretched that to a 4K screen, so 720p, 1080p and 1368p
   all looked like 1368p. See DLSS and FSR upscaling above. (23p did not switch it on: Astro Bot's
@@ -435,6 +447,20 @@ the form asks for the build, game version, GPU and settings, and the console log
 `DLSS upscaling:`, `FSR upscaling:`, `Game patch:` and `Streamline` lines from the console (or the
 lines just before a crash). From 23y a crash inside the game's own checks shows a `game assert:` line
 with the game's whole message: please include it.
+
+**Comparing performance between builds.** Two logs work in every build, cost almost nothing and are
+off by default:
+
+- `KYTY_FRAME_TIMES_LOG=frames.csv`: one line per frame, `t_us,interval_us` (the time since the
+  previous frame). Good for average fps, 1% lows and counting stutters.
+- `KYTY_HANG_TRACE=1`: a `_HangTrace` folder with `summary.csv`, one row a second (`flips` is the
+  frames shown that second, plus GPU busy and idle time, queue waits, readbacks and shader compile
+  stalls). From 23z it also has `flip_max_ms` (the longest frame that second), `hitches_50ms`,
+  `hitches_250ms` (frames longer than 50 / 250 ms) and `label_handoffs` (how often the 23z queue
+  handover stepped in).
+
+For a fair comparison play the same stretch the same way in each build (for example the first
+two minutes of Sky Garden from the level start), with the same settings, and send both files.
 
 ## How it works
 

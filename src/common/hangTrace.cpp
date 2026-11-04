@@ -336,6 +336,12 @@ struct Totals {
 	std::atomic<uint64_t> apr_shrinks_since_flip {0}; // not reset by the summary
 	std::atomic<uint64_t> apr_shrink_max_per_flip {0};
 	std::atomic<uint64_t> pending_ops_max {0};
+	// Frame pacing (RecordFlip): the longest flip-to-flip gap ending in the second and the gaps
+	// over 50 / 250 ms; label handoffs (RecordLabelHandoff).
+	std::atomic<uint64_t> flip_max_ns {0};
+	std::atomic<uint64_t> hitches_50ms {0};
+	std::atomic<uint64_t> hitches_250ms {0};
+	std::atomic<uint64_t> label_handoffs {0};
 	std::atomic<uint64_t> lod_packets {0};
 	std::atomic<uint64_t> lod_prior_nonzero {0};
 	std::atomic<uint64_t> tex_mipstats {0};
@@ -1029,6 +1035,10 @@ void Publish() {
 		// Persistent program cache (appended last so that no existing column moves).
 		line += fmt::format(",{},{}", take(g_totals.compile_disk_loads),
 		                    take(g_totals.compile_disk_load_ns) / 1000u);
+		// Frame pacing and label handoffs (appended last so that no existing column moves).
+		line += fmt::format(",{:.1f},{},{},{}", static_cast<double>(take(g_totals.flip_max_ns)) / 1e6,
+		                    take(g_totals.hitches_50ms), take(g_totals.hitches_250ms),
+		                    take(g_totals.label_handoffs));
 		std::fputs(line.c_str(), g_files.summary);
 		std::fputc('\n', g_files.summary);
 	}
@@ -1165,6 +1175,7 @@ void Initialize() {
 	// Persistent program cache (KYTY_PROGRAM_CACHE): permutations reloaded instead of translated
 	// and emitted, and the time their keys, lookups and decoding took.
 	summary_header += ",compile_disk_loads,compile_disk_load_us";
+	summary_header += ",flip_max_ms,hitches_50ms,hitches_250ms,label_handoffs";
 	g_files.summary = OpenFile("summary.csv", summary_header.c_str());
 	g_files.compiles = OpenFile("compiles.csv",
 	                            "t_ms,kind,stage,guest_hash,id,id2,origin,translate_us,emit_us,"
@@ -1907,6 +1918,19 @@ void RecordFlip() {
 		return;
 	}
 	g_totals.flips.fetch_add(1, std::memory_order_relaxed);
+	{
+		// Flips come from the presentation thread only; the gap is attributed to the second in
+		// which it ended.
+		static uint64_t previous_flip_ns = 0;
+		const auto      now_ns           = NowNs();
+		if (previous_flip_ns != 0 && now_ns > previous_flip_ns) {
+			const auto gap = now_ns - previous_flip_ns;
+			UpdateMax(g_totals.flip_max_ns, gap);
+			if (gap > 50'000'000u) g_totals.hitches_50ms.fetch_add(1, std::memory_order_relaxed);
+			if (gap > 250'000'000u) g_totals.hitches_250ms.fetch_add(1, std::memory_order_relaxed);
+		}
+		previous_flip_ns = now_ns;
+	}
 	UpdateMax(g_totals.apr_shrink_max_per_flip,
 	          g_totals.apr_shrinks_since_flip.exchange(0, std::memory_order_relaxed));
 	if (FrameTimesEnabled()) {
@@ -1919,6 +1943,13 @@ void RecordFlip() {
 		}
 		g_previous_flip_ns = now;
 	}
+}
+
+void RecordLabelHandoff() {
+	if (!Enabled()) {
+		return;
+	}
+	g_totals.label_handoffs.fetch_add(1, std::memory_order_relaxed);
 }
 
 void RecordGpuFrame(const GpuFrame& frame) {

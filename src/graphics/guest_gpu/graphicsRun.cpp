@@ -418,6 +418,69 @@ void GuestGpu::NotifyProgress() {
 	m_work_available.Signal();
 }
 
+// KYTY_LABEL_HANDOFF (live, default on; =0 off): one thread runs every queue in turn, so a queue
+// suspended on a WAIT_REG_MEM sees a write to that memory only once the writing queue's slice ends.
+// The graphics queue gives way only to runnable queues (KYTY_GFX_SLICE_DRAWS), and a suspended one
+// is not, so it could write a label, run on and reset it before the waiter looked again: Astro
+// Bot's frame slots reset their handoff labels to 0 when a new frame starts in the slot, and a
+// compute queue that missed the label waited forever, and every queue waiting on it (the freeze
+// when diving into Sky Garden). On a real GPU the queues run side by side and the waiter sees the
+// label as soon as it lands. Now the memory each suspended wait reads is noted, and a packet that
+// writes it ends the writer's slice after that packet: every suspended queue retries its wait
+// before the writer goes on. A write the GPU makes later (a deferred label) wakes the waiters when
+// it lands, and also ends the slice running then.
+// Diagnosis of the freeze: TheCruZ (KytyPS5-GTA, "let queues waiting on a label run before its
+// writer goes on"); this is an implementation for this command processor.
+static Live::Switch g_label_handoff("KYTY_LABEL_HANDOFF", Live::ParseDefaultOn);
+void GuestGpu::NoteBlockedWait(uint32_t queue, uint64_t address, uint32_t size) noexcept {
+	if (queue >= QueueCount || size == 0 || !g_label_handoff.On()) {
+		return;
+	}
+	std::scoped_lock lock(m_waited_mutex);
+	auto&            range = m_waited[queue];
+	if (range.size == 0) {
+		m_waited_count.fetch_add(1, std::memory_order_relaxed);
+	}
+	range = {address, size};
+}
+
+void GuestGpu::ClearBlockedWait(uint32_t queue) noexcept {
+	if (queue >= QueueCount || m_waited_count.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	std::scoped_lock lock(m_waited_mutex);
+	auto&            range = m_waited[queue];
+	if (range.size != 0) {
+		range = {};
+		m_waited_count.fetch_sub(1, std::memory_order_relaxed);
+	}
+}
+
+bool GuestGpu::NoteLabelWrite(uint32_t writer, uint64_t address, uint64_t size) noexcept {
+	if (m_waited_count.load(std::memory_order_relaxed) == 0 || size == 0 || address == 0 ||
+	    !g_label_handoff.On()) {
+		return false;
+	}
+	bool waited = false;
+	{
+		std::scoped_lock lock(m_waited_mutex);
+		for (uint32_t queue = 0; queue < QueueCount; queue++) {
+			const auto& range = m_waited[queue];
+			if (queue != writer && range.size != 0 && range.address < address + size &&
+			    address < range.address + range.size) {
+				waited = true;
+				break;
+			}
+		}
+	}
+	if (waited) {
+		m_handoff_wake.store(true, std::memory_order_release);
+		m_has_blocked.store(true, std::memory_order_release);
+		HangTrace::RecordLabelHandoff();
+	}
+	return waited;
+}
+
 bool GuestGpu::HasRunnableComputeWork() {
 	Common::LockGuard lock(m_queue_mutex);
 	for (uint32_t id = 1; id < QueueCount; id++) {
@@ -476,7 +539,10 @@ void GuestGpu::RemoveDeferredLabel(uint64_t address, uint64_t tick) {
 		                                return label.address == address && label.tick == tick;
 	                                });
 	EXIT_IF(found == m_deferred_labels.end());
+	const auto label_size = found->size;
 	m_deferred_labels.erase(found);
+	// KYTY_LABEL_HANDOFF: the label has landed; the slice running now ends after its packet.
+	NoteLabelWrite(UINT32_MAX, address, label_size);
 	HangWatchdog::NoteEvent(address, "deferred-label", tick, INT16_MIN, false, 0, 0, true);
 	m_deferred_label_count.store(static_cast<uint32_t>(m_deferred_labels.size()),
 	                             std::memory_order_release);
@@ -1172,6 +1238,14 @@ CpSeq::Result CommandProcessor::ExecWaitRegMemSized(const CpSeq::WaitRegMemOp& o
 	else
 		HangWatchdog::NoteQueueWait(queue, "WAIT_REG_MEM", op.addr, op.ref, value, op.mask, op.func,
 		                            op.size);
+	// KYTY_LABEL_HANDOFF: a write to this memory by another queue ends that queue's slice.
+	if (g_gpu_state != nullptr) {
+		if (passed) {
+			g_gpu_state->ClearBlockedWait(queue);
+		} else {
+			g_gpu_state->NoteBlockedWait(queue, op.addr, static_cast<uint32_t>(sizeof(T)));
+		}
+	}
 	if (HangTrace::CpTraceEnabled()) {
 		// One row per wait: the first failed evaluation, and the pass (aux = failed retries).
 		struct WaitTrace {
@@ -1737,6 +1811,15 @@ void GuestGpu::ThreadRun(void* data) {
 			spin_deadline = 0;
 		}
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		// KYTY_LABEL_HANDOFF: memory a suspended queue waits on was written: every suspended
+		// front retries before the writer's next slice (it goes back behind them, round-robin).
+		if (gpu->m_handoff_wake.exchange(false, std::memory_order_acq_rel)) {
+			for (auto& queue: gpu->m_queues) {
+				if (!queue.empty()) {
+					queue.front().blocked = false;
+				}
+			}
+		}
 		if (!complete && submission.command_execution.Yielded()) {
 			// Yielded to other queues: runnable again in round-robin order.
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
@@ -4687,7 +4770,58 @@ CpSeq::Result CommandProcessor::ExecuteOp(CpSeq::OpKind kind, const void* payloa
 		case OpKind::SkipSlots: EXIT("stream ops are consumed by ResolveSubmission\n"); break;
 		case OpKind::Count: EXIT("invalid op kind\n");
 	}
+	NoteHandoffWrite(kind, payload);
 	return {};
+}
+
+// KYTY_LABEL_HANDOFF: after an operation that writes guest memory, end this slice when another
+// queue is suspended on a wait that reads it, or when a deferred label landed meanwhile.
+void CommandProcessor::NoteHandoffWrite(CpSeq::OpKind kind, const void* payload) {
+	using CpSeq::OpKind;
+	if (g_gpu_state == nullptr || g_current_execution == nullptr) {
+		return;
+	}
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	switch (kind) {
+		case OpKind::WriteData: {
+			const auto& op = *static_cast<const CpSeq::WriteDataOp*>(payload);
+			address        = op.dst;
+			size           = uint64_t {op.dw_num} * sizeof(uint32_t);
+			break;
+		}
+		case OpKind::DmaData: {
+			const auto& op = *static_cast<const CpSeq::DmaDataOp*>(payload);
+			address        = op.dst;
+			size           = op.num_bytes;
+			break;
+		}
+		case OpKind::EndOfPipe: {
+			const auto& op = *static_cast<const CpSeq::EndOfPipeOp*>(payload);
+			address        = op.dst;
+			size           = op.size;
+			break;
+		}
+		case OpKind::ReleaseMem: {
+			const auto& op = *static_cast<const CpSeq::ReleaseMemOp*>(payload);
+			address        = op.body[2] | (static_cast<uint64_t>(op.body[3]) << 32u);
+			size           = sizeof(uint64_t);
+			break;
+		}
+		case OpKind::ReferenceClock: {
+			const auto& op = *static_cast<const CpSeq::ReferenceClockOp*>(payload);
+			address        = op.dst;
+			size           = op.num_bytes;
+			break;
+		}
+		default: break;
+	}
+	const auto writer =
+	    m_interrupt_event_id == 0 ? 0u : static_cast<uint32_t>(m_interrupt_event_id - 0x20 + 1);
+	const bool waited = size != 0 && g_gpu_state->NoteLabelWrite(writer, address, size);
+	if (waited || g_gpu_state->m_handoff_wake.load(std::memory_order_acquire)) {
+		g_current_execution->m_yield = true;
+	}
 }
 
 bool CommandProcessor::CondExec(uint64_t address) {
