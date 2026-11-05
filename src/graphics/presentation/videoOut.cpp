@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/cpuPlacement.h"
+#include "common/sectionLog.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/paceLog.h"
@@ -1556,6 +1557,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		Graphics::EopTimestamps::OnGuestFlip();
 		Profiler::PublishFrameWork();
 		HangTrace::RecordFlip();
+		SectionLog::NoteFlip(); // KYTY_SECTION_LOG (temporary)
 		m_presenter.Renderer().GetTextureCache().AdvanceFrame();
 		m_presenter.Renderer().GetBufferCache().AdvanceFrame();
 

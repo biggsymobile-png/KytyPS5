@@ -304,6 +304,17 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 
 ## Known issues
 
+- **Build 24a (test): the final space section, and a log to find it.** After the last world, the
+  on-rails space shooter expects the game's own 60 fps timing. **Below a Vblank frequency of 60**
+  (for example 40), with the built-in Decouple or the patch file's Decouple mod, your shots
+  explode just in front of the ship instead of reaching their targets. For now press the
+  **Decouple on/off key (F10)** when the section starts and again when it ends, or play it at
+  Vblank 60 (the section then runs more slowly below 60 fps without Decouple; that is expected).
+  The aim is to have the emulator do this by itself: raise the Vblank to 60 and switch Decouple
+  off for that section only, then restore both. To find a reliable sign that the section has
+  started, this build adds a temporary log, `KYTY_SECTION_LOG` (see Reporting problems). It will be
+  removed again once the fix is in.
+
 - **Build 23z (test): fewer freezes when one GPU queue waits for another** (`KYTY_LABEL_HANDOFF`, on
   by default; `KYTY_LABEL_HANDOFF=0` turns it off). The emulator runs the game's graphics and
   compute queues in turn on one thread. When a compute queue was waiting for a value the graphics
@@ -463,6 +474,15 @@ off by default:
 
 For a fair comparison play the same stretch the same way in each build (for example the first
 two minutes of Sky Garden from the level start), with the same settings, and send both files.
+
+**Finding the space section (24a, temporary).** If you can reach the final space section, set
+`KYTY_SECTION_LOG=section.csv` and play from a little before the blast-off until about a minute
+into the shooter, **pressing F10 once as the shooting starts** (that puts a `mark` line in the log at
+the right moment) and once more just before you stop. Then close the emulator and send
+`section.csv`. It has one line for each thing the game uses for the first time in that session
+(`t_ms,flip,event,detail`): `open` and `apr` (files, as paths inside the game's folder only, no
+folders of yours), `gfx` and `cs` (new shaders, by hash) and `mark` (the F10 presses). It costs
+nothing when it is not set.
 
 **Optional experiments (23z, off by default).** If you have time, run the same stretch once more
 with one of these set, and send the logs with the plain run:

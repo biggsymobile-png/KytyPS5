@@ -10,6 +10,7 @@
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/sectionLog.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/memory.h"
@@ -424,6 +425,8 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+
+	SectionLog::NoteFileOpen(path); // KYTY_SECTION_LOG (temporary)
 
 	auto flags_u = static_cast<uint32_t>(flags);
 

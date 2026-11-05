@@ -15,6 +15,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/rendererBatch.h"
+#include "common/sectionLog.h"
 #include "common/sehGuard.h"
 #include "common/skipInvalid.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -7509,6 +7510,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipelineImpl(
 	const uint64_t ps_hash =
 	    ps_active && ps_input_info->stage.program ? ps_input_info->stage.program->shader_hash : 0;
 	const bool prefetched = ready.pipeline != nullptr;
+	SectionLog::NoteGraphicsPipeline(vs_hash, ps_hash); // KYTY_SECTION_LOG (temporary)
 	auto cached = prefetched ? std::move(ready.pipeline) : std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	// Pipeline libraries (6/7): the monolithic create info goes to the library path, which may
@@ -7663,6 +7665,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	    compute_program.id);
 	const uint64_t cs_hash = input_info.stage.program ? input_info.stage.program->shader_hash : 0;
 	Common::CrashContext::Scope note("compute pipeline build (CS)", cs_hash);
+	SectionLog::NoteComputePipeline(cs_hash); // KYTY_SECTION_LOG (temporary)
 	FastFirstState::ComputeFast fast_result;
 	ComputePipelineCreateHook   fast_hook;
 	if (m_fast_first != nullptr && m_fast_first->scheduler.Stopped() == false) {

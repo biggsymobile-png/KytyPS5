@@ -3,6 +3,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/sectionLog.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
@@ -1458,6 +1459,7 @@ bool ToggleDecouple() {
 	auto*      off_switch = reinterpret_cast<volatile uint8_t*>(g_decouple.gate + 1);
 	const bool now_off    = *off_switch == 0;
 	*off_switch           = now_off ? 1 : 0;
+	SectionLog::NoteMarker(now_off ? "decouple key: off" : "decouple key: on"); // KYTY_SECTION_LOG
 	Log::WriteToConsoleAndLog(
 	    now_off ? "Decouple: off (the game's own fixed 60 fps timing: steady physics, slow motion below 60 fps); "
 	              "press the key again to turn it back on (KYTY_ASTRO_DECOUPLE_KEY)\n"

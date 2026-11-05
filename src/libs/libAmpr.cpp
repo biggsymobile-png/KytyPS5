@@ -5,6 +5,7 @@
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/sectionLog.h"
 #include "common/stringUtils.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
@@ -2062,6 +2063,7 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	Profiler::ScopedLoadingOperation loading(Profiler::LoadingOperation::AprRead);
 	Profiler::CountLoadingEvent(Profiler::LoadingEvent::AprRequestedBytes, size);
+	SectionLog::NoteAprFile(host_path); // KYTY_SECTION_LOG (temporary)
 	if (bytes_read == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
