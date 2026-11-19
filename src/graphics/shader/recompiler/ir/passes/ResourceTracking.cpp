@@ -4913,7 +4913,7 @@ private:
 		DescriptorSource runtime;
 		runtime.dword_count = 8u;
 		runtime.dwords.fill(Value(0u));
-		runtime.indirect_descriptor.emplace();
+		runtime.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor {});
 		runtime.indirect_descriptor->runtime = true;
 		source                               = InternSource(runtime);
 		if (!m_logged_runtime_image) {
