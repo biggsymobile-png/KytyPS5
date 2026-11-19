@@ -643,15 +643,8 @@ static QStringList SetupEmulatorProcess(QProcess* process, const QString& interp
 		                   QString::fromLatin1(Configuration::GyroRecenterKeyName(info.decouple_key)));
 		process->setProcessEnvironment(environment);
 	}
-	// The per-game "smooth frametime fix" checkbox (Immediate mode only) turns the absolute
-	// vblank timeline on. Otherwise the variable is left alone, so a value from u59-preset.json
-	// or the user's environment still applies (the emulator default is off). It goes over the
-	// environment ApplyTitlePreset set, so a title preset stays applied.
-	if (info.present_mode == Configuration::PresentMode::Immediate && info.smooth_frametime_fix) {
-		auto environment = process->processEnvironment();
-		environment.insert(QStringLiteral("KYTY_PRESENT_ABS_VBLANK"), QStringLiteral("1"));
-		process->setProcessEnvironment(environment);
-	}
+	// (int22's per-game "smooth frametime fix" checkbox is not offered here: "Smooth frame pacing"
+	// above sets the same KYTY_PRESENT_ABS_VBLANK in every present mode. The saved value is kept.)
 	return args;
 }
 

@@ -65,21 +65,24 @@ between the emulator and the driver, so if another game misbehaves with this bui
 
 ## Settings
 
-In the launcher, a game's **Graphics & display** settings have:
+In the launcher, a game's **Graphics & display** settings have (from 25a the Astro Bot and Playroom
+options sit under their own heading, and every tickbox is in one block underneath; hover over a
+setting's name or its box for a description):
 
 - **Frame generation:** Off, 2x, 3x, 4x (NVIDIA DLSS-G; 3x and 4x need an RTX 50 card), or
   **2x (AMD FSR 3.1, any GPU)**.
 - **Upscaling:** the game's own TAA, NVIDIA DLSS or AMD FSR 3.1.
 - **Render resolution:** the game's 3D resolution, for both Astro Bot and Playroom (lower is faster).
-- **Relaxed shader maths:** simpler shader maths, see below.
+- **Relaxed shader maths: min/max, conversions (this build):** simpler shader maths, see below.
 - **Smooth frame pacing** (`KYTY_PRESENT_ABS_VBLANK`): after a slow frame a vblank is skipped
   instead of the next frames being shown back to back. Only the display skips it: the game still
-  counts the vblank, so its speed stays right.
+  counts the vblank, so its speed stays right. Works in every present mode.
 - **Frame rate limit** (`KYTY_FRAMEGEN_FPS_CAP`): with DLSS-G, NVIDIA Reflex holds the rendered
   frames to that rate so generated frames are evenly spaced; pick one your PC holds, e.g. 40 or 60
   with Vblank frequency 120.
 
-They take precedence over `u59-preset.json`.
+The **Gyro re-centre key** is under **Audio & controller** (from 25a). These settings take precedence
+over `u59-preset.json`.
 
 ### Recommended on a G-Sync / FreeSync display: the smoothest way to play
 
@@ -123,7 +126,7 @@ and uses the file instead: add settings to it, one `"NAME": "value",` line each,
 | `KYTY_FSR_SHARPNESS=0.5` | FSR upscaling's sharpening, 0 to 1 (default off) |
 | `KYTY_ASTRO_RENDER_RES=1080` | Render resolution: 540, 720, 1080, 1368, 1872 or 2160, both games (launcher: Render resolution) |
 | `KYTY_FRAMEGEN_FPS_CAP=40` | With DLSS-G: Reflex limits the rendered frames to 40 fps (launcher: Frame rate limit) |
-| `KYTY_FLOAT_PROFILE=relaxed` | Simpler shader maths (launcher: Relaxed shader maths) |
+| `KYTY_FLOAT_PROFILE=relaxed` | Simpler shader maths (launcher: Relaxed shader maths: min/max, conversions) |
 | `KYTY_STREAMLINE_DIR=<folder>` | Use Streamline files from another folder |
 | `KYTY_VRAM_BUDGET_MB=12000` | Leave video memory for DLSS-G (helps on 16 GB cards at 4K) |
 | `KYTY_PORTABLE=0` | Use the shared `Kyty.ini` instead of this build's own (see below) |
@@ -257,7 +260,7 @@ decouple mod.
 
 ## Shader maths profile
 
-**Relaxed shader maths** (`KYTY_FLOAT_PROFILE`): `precise` (the default) copies the PS5 GPU's exact
+**Relaxed shader maths: min/max, conversions (this build)** (`KYTY_FLOAT_PROFILE`): `precise` (the default) copies the PS5 GPU's exact
 floating-point rules, which takes several instructions for things like min/max with NaNs, tiny
 (denormal) numbers and rounding modes. `relaxed` maps those to the PC GPU's own instructions
 instead: smaller shaders that compile and run a little faster, which can mean less stutter when new
@@ -315,11 +318,16 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
     PSSR in **PS5 Pro mode** (other games, with a DLSS model you supply). It does nothing for Astro
     Bot or Playroom. This fork's DLSS frame generation and DLSS/FSR upscaling are the **Frame
     generation** and **Upscaling** settings, as before.
-  - **Two relaxed-maths options**: **Relaxed shader maths (faster)** is this fork's
-    `KYTY_FLOAT_PROFILE` (see Shader maths profile); **Relaxed shader float math** is upstream's
-    `KYTY_RELAXED_FLOAT`, a separate switch. Use one or the other, not both, when you compare.
-  - **Smooth frame pacing** (this fork, all present modes) and int22's per-game **smooth frametime
-    fix** (Immediate only) both turn on the absolute vblank timeline.
+  - **Two relaxed-maths options**, renamed so they can be told apart: **Relaxed shader maths:
+    min/max, conversions (this build)** is this fork's `KYTY_FLOAT_PROFILE` (see Shader maths
+    profile); **Relaxed shader float: min/max, denormals (upstream)** is upstream's
+    `KYTY_RELAXED_FLOAT`. Both use the PC GPU's own min/max; this build's also converts and packs
+    natively, upstream's skips denormal flushes everywhere. Tick one at a time when you compare.
+  - int22's **smooth frametime fix** tickbox is not in this launcher: it sets the same switch as
+    **Smooth frame pacing**, which works in every present mode.
+  - **Settings layout:** the Astro Bot / Playroom settings have their own heading, all tickboxes sit
+    together in two columns, the gyro re-centre key moved to **Audio & controller**, and a
+    setting's name shows the same description as its box when you hover over it.
   - **NVIDIA Smooth Motion / CUDA:** int22 finds a working address for CUDA's early start by itself
     (it replaces this fork's fixed 512 GiB floor from PR #58). If DLSS frame generation or Smooth
     Motion stopped working for you in this build, please report the console's `CUDA:` lines.
@@ -416,7 +424,7 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
   - **Gyro centred from the start, and a re-centre key.** The learned resting offset is saved per
     controller in `gyro-calibration.txt` and loaded at the next start (put the pad down for 3 s in
     the first session). Hold the controller the way you play and press the re-centre key in the
-    game window (launcher: the game's settings, Graphics & display, "Gyro re-centre key"; default
+    game window (launcher: the game's settings, Audio & controller from 25a, "Gyro re-centre key"; default
     F9) to make that its neutral position.
   - From [moooohung](https://github.com/moooohung) (pull request #2): Korean and Japanese text no
     longer shows as `?` (every installed CJK font is tried), and FSR frame generation enables the

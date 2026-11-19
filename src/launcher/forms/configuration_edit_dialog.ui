@@ -49,6 +49,7 @@
             </property>
             <item row="0" column="0">
              <widget class="QLabel" name="label_user_name">
+              <property name="toolTip"><string>Local user name exposed to games</string></property>
               <property name="text"><string>User name:</string></property>
              </widget>
             </item>
@@ -60,6 +61,7 @@
             </item>
             <item row="1" column="0">
              <widget class="QLabel" name="label_user_id">
+              <property name="toolTip"><string>Local user ID exposed to games</string></property>
               <property name="text"><string>User ID:</string></property>
              </widget>
             </item>
@@ -70,6 +72,7 @@
             </item>
             <item row="2" column="0">
              <widget class="QLabel" name="label_console_language">
+              <property name="toolTip"><string>Language</string></property>
               <property name="text"><string>Console language:</string></property>
              </widget>
             </item>
@@ -83,7 +86,7 @@
          </item>
          <item row="2" column="0">
           <widget class="QGroupBox" name="audio_group">
-           <property name="title"><string>Audio</string></property>
+           <property name="title"><string>Audio &amp;&amp; controller</string></property>
            <layout class="QFormLayout" name="audioLayout">
             <property name="fieldGrowthPolicy">
              <enum>QFormLayout::AllNonFixedFieldsGrow</enum>
@@ -228,6 +231,17 @@
              <property name="checked"><bool>true</bool></property>
             </widget>
            </item>
+           <item row="7" column="0">
+             <widget class="QLabel" name="label_gyro_recenter_key">
+              <property name="toolTip"><string>Hold the controller the way you normally play and press this key in the game window: its motion controls (gyro) take that as their neutral position. Useful if the game started while the controller was held at an angle (KYTY_GYRO_RECENTER_KEY).</string></property>
+              <property name="text"><string>Gyro re-centre key:</string></property>
+             </widget>
+            </item>
+           <item row="7" column="1">
+             <widget class="QComboBox" name="comboBox_gyro_recenter_key">
+              <property name="toolTip"><string>Hold the controller the way you normally play and press this key in the game window: its motion controls (gyro) take that as their neutral position. Useful if the game started while the controller was held at an angle (KYTY_GYRO_RECENTER_KEY).</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>
@@ -242,6 +256,7 @@
             </property>
             <item row="0" column="0">
              <widget class="QLabel" name="label_screen_resolution">
+              <property name="toolTip"><string>Window resolution as WIDTHxHEIGHT; pick a preset or type a custom size. Non-16:9 sizes such as 21:9 show the game with black bars unless Stretch to window is on.</string></property>
               <property name="text"><string>Screen resolution:</string></property>
              </widget>
             </item>
@@ -262,6 +277,7 @@
             </item>
             <item row="1" column="0">
              <widget class="QLabel" name="label_present_mode">
+              <property name="toolTip"><string>Vulkan swapchain presentation mode</string></property>
               <property name="text"><string>Present mode:</string></property>
              </widget>
             </item>
@@ -270,18 +286,13 @@
               <property name="toolTip"><string>Vulkan swapchain presentation mode</string></property>
              </widget>
             </item>
-            <item row="2" column="1">
-             <widget class="QCheckBox" name="checkBox_smooth_frametime_fix">
-              <property name="toolTip"><string>Use absolute vblank pacing and present ready frames between vblanks in Immediate mode</string></property>
-              <property name="text"><string>Enable smooth frametime fix</string></property>
-             </widget>
-            </item>
-            <item row="3" column="0">
+            <item row="2" column="0">
              <widget class="QLabel" name="label_vblank_frequency">
+              <property name="toolTip"><string>Virtual display refresh rate used for frame pacing</string></property>
               <property name="text"><string>Vblank frequency:</string></property>
              </widget>
             </item>
-            <item row="3" column="1">
+            <item row="2" column="1">
              <widget class="QSpinBox" name="spinBox_vblank_frequency">
               <property name="toolTip"><string>Virtual display refresh rate used for frame pacing</string></property>
               <property name="minimum"><number>30</number></property>
@@ -289,105 +300,74 @@
               <property name="value"><number>60</number></property>
              </widget>
             </item>
-            <item row="4" column="0">
+            <item row="3" column="0">
              <widget class="QLabel" name="label_shader_optimization">
+              <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
               <property name="text"><string>Shader optimization:</string></property>
              </widget>
             </item>
-            <item row="4" column="1">
+            <item row="3" column="1">
              <widget class="QComboBox" name="comboBox_shader_optimization_type">
               <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
              </widget>
             </item>
-            <item row="5" column="0">
+            <item row="4" column="0">
              <widget class="QLabel" name="label_gpu">
+              <property name="toolTip"><string>Graphics device used by the emulator</string></property>
               <property name="text"><string>GPU:</string></property>
              </widget>
             </item>
-            <item row="5" column="1">
+            <item row="4" column="1">
              <widget class="QComboBox" name="comboBox_gpu">
               <property name="toolTip"><string>Graphics device used by the emulator</string></property>
              </widget>
             </item>
-            <item row="6" column="1">
-             <widget class="QCheckBox" name="checkBox_readback">
-              <property name="toolTip"><string>Read back writable linear images</string></property>
-              <property name="text"><string>Enable readback</string></property>
+            <item row="5" column="1">
+             <widget class="QLabel" name="label_astro_heading">
+              <property name="text"><string>&lt;b&gt;Astro Bot and Astro's Playroom&lt;/b&gt;</string></property>
+              <property name="toolTip"><string>The settings below apply to Astro Bot and Astro's Playroom only (frame generation, upscaling, render resolution, built-in Decouple).</string></property>
              </widget>
             </item>
-            <item row="7" column="1">
-             <widget class="QCheckBox" name="checkBox_readback_tiled">
-              <property name="toolTip"><string>Read back small writable tiled images</string></property>
-              <property name="text"><string>Enable tiled readback</string></property>
-             </widget>
-            </item>
-            <item row="8" column="1">
-             <widget class="QCheckBox" name="checkBox_gpu_occlusion">
-              <property name="toolTip"><string>Off (default): occlusion queries report everything as visible, which is much faster in heavy levels but may draw objects or effects that the game hides behind walls. On: the GPU counts visible samples as on the console (slower; fixes rare visibility issues).</string></property>
-              <property name="text"><string>Accurate occlusion queries (slower; fixes rare visibility issues)</string></property>
-             </widget>
-            </item>
-            <item row="9" column="1">
-             <widget class="QCheckBox" name="checkBox_tessellation">
-              <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
-              <property name="text"><string>Enable tessellation support (experimental)</string></property>
-             </widget>
-            </item>
-            <item row="10" column="1">
-             <widget class="QCheckBox" name="checkBox_hdr">
-              <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
-              <property name="text"><string>Enable HDR display support</string></property>
-             </widget>
-            </item>
-            <item row="11" column="1">
-             <widget class="QCheckBox" name="checkBox_readback_storage">
-              <property name="toolTip"><string>Read back shader-written images when the game flushes the GPU cache for the CPU. Images from linear and tiled readback are read back then too.</string></property>
-              <property name="text"><string>Enable storage readback</string></property>
-             </widget>
-            </item>
-            <item row="12" column="1">
-             <widget class="QCheckBox" name="checkBox_relaxed_shader_float">
-              <property name="toolTip"><string>Use the host GPU's native float operations in shaders. Faster, but can be inaccurate.</string></property>
-              <property name="text"><string>Relaxed shader float math</string></property>
-             </widget>
-            </item>
-            <item row="13" column="1">
-             <widget class="QCheckBox" name="checkBox_fast_gpu_sync">
-              <property name="toolTip"><string>Trims redundant GPU barriers (synchronisation between GPU work): KYTY_GPU_HAZARD=3, KYTY_INDIRECT_ARGS_RANGES=1, KYTY_GUEST_BARRIER_SCOPE=rel=drop, KYTY_DMA_BARRIER_BATCH=1. Gave about 1 fps in heavy Astro Bot scenes. Turn it off if graphics glitch. A value set for one of these in u59-preset.json or a title preset is kept.</string></property>
-              <property name="text"><string>Faster GPU synchronisation (experimental)</string></property>
-             </widget>
-            </item>
-            <item row="14" column="0">
+            <item row="6" column="0">
              <widget class="QLabel" name="label_frame_generation">
+              <property name="toolTip"><string>Frame generation (Astro Bot, Astro's Playroom). DLSS-G: an RTX 40 or 50 card and the Streamline files in the "streamline" folder; 3x and 4x need an RTX 50 card. AMD FSR 3.1 (experimental): any GPU, 2x, with FSR upscaling or the game's own (not with DLSS upscaling); on Linux and macOS the only choice, best with Vblank frequency at twice the game's frame rate (e.g. 120).</string></property>
               <property name="text"><string>Frame generation:</string></property>
              </widget>
             </item>
-            <item row="14" column="1">
+            <item row="6" column="1">
              <widget class="QComboBox" name="comboBox_frame_generation">
               <property name="toolTip"><string>Frame generation (Astro Bot, Astro's Playroom). DLSS-G: an RTX 40 or 50 card and the Streamline files in the "streamline" folder; 3x and 4x need an RTX 50 card. AMD FSR 3.1 (experimental): any GPU, 2x, with FSR upscaling or the game's own (not with DLSS upscaling); on Linux and macOS the only choice, best with Vblank frequency at twice the game's frame rate (e.g. 120).</string></property>
              </widget>
             </item>
-            <item row="15" column="0">
+            <item row="7" column="0">
              <widget class="QLabel" name="label_upscaler">
+              <property name="toolTip"><string>DLSS (any RTX card) or FSR 3.1 (any GPU) replaces the game's own anti-aliasing (TAA) and upscales from the render resolution below (Astro Bot).</string></property>
               <property name="text"><string>Upscaling:</string></property>
              </widget>
             </item>
-            <item row="15" column="1">
+            <item row="7" column="1">
              <widget class="QComboBox" name="comboBox_upscaler">
               <property name="toolTip"><string>DLSS (any RTX card) or FSR 3.1 (any GPU) replaces the game's own anti-aliasing (TAA) and upscales from the render resolution below (Astro Bot).</string></property>
              </widget>
             </item>
-            <item row="16" column="0">
+            <item row="8" column="0">
              <widget class="QLabel" name="label_render_resolution">
+              <property name="toolTip"><string>Astro Bot (01.018) and Astro's Playroom (01.905): the resolution the game draws its 3D image at, before its TAA, DLSS or FSR upscales it. Lower is faster; 960x540 is the fastest. No patch file needed (a "Fixed render resolution" patch, if enabled, wins).</string></property>
               <property name="text"><string>Render resolution:</string></property>
              </widget>
             </item>
-            <item row="17" column="0">
+            <item row="8" column="1">
+             <widget class="QComboBox" name="comboBox_render_resolution">
+              <property name="toolTip"><string>Astro Bot (01.018) and Astro's Playroom (01.905): the resolution the game draws its 3D image at, before its TAA, DLSS or FSR upscales it. Lower is faster; 960x540 is the fastest. No patch file needed (a "Fixed render resolution" patch, if enabled, wins).</string></property>
+             </widget>
+            </item>
+            <item row="9" column="0">
              <widget class="QLabel" name="label_frame_rate_limit">
+              <property name="toolTip"><string>With frame generation on: NVIDIA Reflex holds the game's rendered frames to at most this rate, so generated frames are evenly spaced (on screen: this times the frame generation factor). Pick a rate your PC holds steadily, e.g. 40 or 60 with a 120 Vblank frequency. Off: no limit.</string></property>
               <property name="text"><string>Frame rate limit:</string></property>
              </widget>
             </item>
-            <item row="17" column="1">
+            <item row="9" column="1">
              <widget class="QSpinBox" name="spinBox_frame_rate_limit">
               <property name="toolTip"><string>With frame generation on: NVIDIA Reflex holds the game's rendered frames to at most this rate, so generated frames are evenly spaced (on screen: this times the frame generation factor). Pick a rate your PC holds steadily, e.g. 40 or 60 with a 120 Vblank frequency. Off: no limit.</string></property>
               <property name="specialValueText"><string>Off</string></property>
@@ -397,64 +377,104 @@
               <property name="value"><number>19</number></property>
              </widget>
             </item>
-            <item row="19" column="1">
-             <widget class="QCheckBox" name="checkBox_relaxed_shader_maths">
-              <property name="toolTip"><string>Maps the PS5 GPU's exact float rules (NaN-aware min/max, denormals, rounding) to the PC GPU's own instructions. Smaller shaders that compile and run a little faster; if you see sparkles, black or white pixels or broken effects, turn it off. The first start after changing it compiles the shaders again (KYTY_FLOAT_PROFILE=relaxed).</string></property>
-              <property name="text"><string>Relaxed shader maths (faster)</string></property>
-             </widget>
-            </item>
-            <item row="18" column="1">
-             <widget class="QCheckBox" name="checkBox_smooth_frame_pacing">
-              <property name="toolTip"><string>Runs the emulator's virtual vblank on an absolute timeline: after a slow frame, a vblank is skipped instead of the next frames being shown back to back to catch up. Can feel smoother when the frame rate dips (KYTY_PRESENT_ABS_VBLANK). With Present mode Immediate, frames are shown as soon as they are ready, at most one per vblank: the best choice on G-Sync/FreeSync displays. Only the display skips a missed vblank; the game still counts it, so its speed stays right.</string></property>
-              <property name="text"><string>Smooth frame pacing (skip missed vblanks)</string></property>
-             </widget>
-            </item>
-            <item row="20" column="0">
-             <widget class="QLabel" name="label_gyro_recenter_key">
-              <property name="text"><string>Gyro re-centre key:</string></property>
-             </widget>
-            </item>
-            <item row="20" column="1">
-             <widget class="QComboBox" name="comboBox_gyro_recenter_key">
-              <property name="toolTip"><string>Hold the controller the way you normally play and press this key in the game window: its motion controls (gyro) take that as their neutral position. Useful if the game started while the controller was held at an angle (KYTY_GYRO_RECENTER_KEY).</string></property>
-             </widget>
-            </item>
-            <item row="21" column="1">
-             <widget class="QCheckBox" name="checkBox_decouple">
-              <property name="toolTip"><string>Astro Bot and Astro's Playroom: game time follows the real frame rate, so the game keeps its normal speed below 60 fps (without it, it plays in slow motion). Off: the game's own fixed 60 fps timing, or the patch file's Decouple mod if you enabled it (KYTY_ASTRO_DECOUPLE).</string></property>
-              <property name="text"><string>Built-in Decouple (normal game speed below 60 fps)</string></property>
-              <property name="checked"><bool>true</bool></property>
-             </widget>
-            </item>
-            <item row="22" column="0">
+            <item row="10" column="0">
              <widget class="QLabel" name="label_decouple_step_limit">
+              <property name="toolTip"><string>The longest time one game step may cover, e.g. after a stutter. Long steps can make the game's physics fail and crash, mostly on slower PCs. A smaller step (1/35, 1/40) is safer, but below that frame rate the game slows down a little: at 1/40 s and 30 fps it runs at 75% speed (KYTY_ASTRO_DECOUPLE_DT_CAP).</string></property>
               <property name="text"><string>Decouple step limit:</string></property>
              </widget>
             </item>
-            <item row="22" column="1">
+            <item row="10" column="1">
              <widget class="QComboBox" name="comboBox_decouple_step_limit">
               <property name="toolTip"><string>The longest time one game step may cover, e.g. after a stutter. Long steps can make the game's physics fail and crash, mostly on slower PCs. A smaller step (1/35, 1/40) is safer, but below that frame rate the game slows down a little: at 1/40 s and 30 fps it runs at 75% speed (KYTY_ASTRO_DECOUPLE_DT_CAP).</string></property>
              </widget>
             </item>
-            <item row="23" column="0">
+            <item row="11" column="0">
              <widget class="QLabel" name="label_decouple_key">
+              <property name="toolTip"><string>Press this key in the game window to switch Decouple off (the game's own steady 60 fps timing) and on again. Use it if one place still crashes: switch Decouple off there, and back on afterwards. The console says which state it is in (KYTY_ASTRO_DECOUPLE_KEY).</string></property>
               <property name="text"><string>Decouple on/off key:</string></property>
              </widget>
             </item>
-            <item row="23" column="1">
+            <item row="11" column="1">
              <widget class="QComboBox" name="comboBox_decouple_key">
               <property name="toolTip"><string>Press this key in the game window to switch Decouple off (the game's own steady 60 fps timing) and on again. Use it if one place still crashes: switch Decouple off there, and back on afterwards. The console says which state it is in (KYTY_ASTRO_DECOUPLE_KEY).</string></property>
              </widget>
             </item>
-            <item row="24" column="0" colspan="2">
+            <item row="12" column="0" colspan="2">
+             <layout class="QGridLayout" name="graphicsChecksLayout">
+              <property name="horizontalSpacing"><number>18</number></property>
+              <item row="0" column="0">
+               <widget class="QCheckBox" name="checkBox_decouple">
+                <property name="toolTip"><string>Astro Bot and Astro's Playroom: game time follows the real frame rate, so the game keeps its normal speed below 60 fps (without it, it plays in slow motion). Off: the game's own fixed 60 fps timing, or the patch file's Decouple mod if you enabled it (KYTY_ASTRO_DECOUPLE).</string></property>
+                <property name="text"><string>Built-in Decouple (normal game speed below 60 fps)</string></property>
+                <property name="checked"><bool>true</bool></property>
+               </widget>
+              </item>
+              <item row="0" column="1">
+               <widget class="QCheckBox" name="checkBox_smooth_frame_pacing">
+                <property name="toolTip"><string>Runs the emulator's virtual vblank on an absolute timeline: after a slow frame, a vblank is skipped instead of the next frames being shown back to back to catch up. Can feel smoother when the frame rate dips (KYTY_PRESENT_ABS_VBLANK). With Present mode Immediate, frames are shown as soon as they are ready, at most one per vblank: the best choice on G-Sync/FreeSync displays. Only the display skips a missed vblank; the game still counts it, so its speed stays right.</string></property>
+                <property name="text"><string>Smooth frame pacing (skip missed vblanks, any present mode)</string></property>
+               </widget>
+              </item>
+              <item row="1" column="0">
+               <widget class="QCheckBox" name="checkBox_fast_gpu_sync">
+                <property name="toolTip"><string>Trims redundant GPU barriers (synchronisation between GPU work): KYTY_GPU_HAZARD=3, KYTY_INDIRECT_ARGS_RANGES=1, KYTY_GUEST_BARRIER_SCOPE=rel=drop, KYTY_DMA_BARRIER_BATCH=1. Gave about 1 fps in heavy Astro Bot scenes. Turn it off if graphics glitch. A value set for one of these in u59-preset.json or a title preset is kept.</string></property>
+                <property name="text"><string>Faster GPU synchronisation (experimental)</string></property>
+               </widget>
+              </item>
+              <item row="1" column="1">
+               <widget class="QCheckBox" name="checkBox_hdr">
+                <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
+                <property name="text"><string>HDR display support</string></property>
+               </widget>
+              </item>
+              <item row="2" column="0">
+               <widget class="QCheckBox" name="checkBox_relaxed_shader_maths">
+                <property name="toolTip"><string>This build's shader maths profile (KYTY_FLOAT_PROFILE=relaxed): NaN-aware min, max and min/max/median of three, float-to-integer conversions and half-float packing use the PC GPU's own instructions instead of copying the PS5 GPU exactly, and the inputs of rcp, sqrt, exp, log and compares are not flushed. Smaller shaders that compile and run a little faster. If you see sparkles, black or white pixels, flicker or broken effects, turn it off. Separate from &quot;Relaxed shader float&quot;: tick one at a time when you compare. The first start after changing it compiles the shaders again.</string></property>
+                <property name="text"><string>Relaxed shader maths: min/max, conversions (this build)</string></property>
+               </widget>
+              </item>
+              <item row="2" column="1">
+               <widget class="QCheckBox" name="checkBox_relaxed_shader_float">
+                <property name="toolTip"><string>Upstream KytyPS5's relaxed float maths (KYTY_RELAXED_FLOAT): NaN-aware min and max (also 64-bit) use the PC GPU's own instructions, and tiny (denormal) inputs are not flushed anywhere in the shader. Faster, but can be inaccurate. Separate from &quot;Relaxed shader maths&quot; (this build's profile): tick one at a time when you compare.</string></property>
+                <property name="text"><string>Relaxed shader float: min/max, denormals (upstream)</string></property>
+               </widget>
+              </item>
+              <item row="3" column="0">
+               <widget class="QCheckBox" name="checkBox_readback">
+                <property name="toolTip"><string>Read back writable linear images</string></property>
+                <property name="text"><string>Enable readback</string></property>
+               </widget>
+              </item>
+              <item row="3" column="1">
+               <widget class="QCheckBox" name="checkBox_readback_tiled">
+                <property name="toolTip"><string>Read back small writable tiled images</string></property>
+                <property name="text"><string>Enable tiled readback</string></property>
+               </widget>
+              </item>
+              <item row="4" column="0">
+               <widget class="QCheckBox" name="checkBox_readback_storage">
+                <property name="toolTip"><string>Read back shader-written images when the game flushes the GPU cache for the CPU. Images from linear and tiled readback are read back then too.</string></property>
+                <property name="text"><string>Enable storage readback</string></property>
+               </widget>
+              </item>
+              <item row="4" column="1">
+               <widget class="QCheckBox" name="checkBox_gpu_occlusion">
+                <property name="toolTip"><string>Off (default): occlusion queries report everything as visible, which is much faster in heavy levels but may draw objects or effects that the game hides behind walls. On: the GPU counts visible samples as on the console (slower; fixes rare visibility issues).</string></property>
+                <property name="text"><string>Accurate occlusion queries (slower)</string></property>
+               </widget>
+              </item>
+              <item row="5" column="0">
+               <widget class="QCheckBox" name="checkBox_tessellation">
+                <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
+                <property name="text"><string>Tessellation support (experimental)</string></property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item row="13" column="0" colspan="2">
              <widget class="QLabel" name="label_decouple_help">
               <property name="text"><string>Decouple step limit: if Astro Bot or Astro's Playroom crashes on your PC, try a smaller step (1/35 or 1/40). If one place still crashes, switch Decouple off there with the on/off key.</string></property>
               <property name="wordWrap"><bool>true</bool></property>
-             </widget>
-            </item>
-            <item row="16" column="1">
-             <widget class="QComboBox" name="comboBox_render_resolution">
-              <property name="toolTip"><string>Astro Bot (01.018) and Astro's Playroom (01.905): the resolution the game draws its 3D image at, before its TAA, DLSS or FSR upscales it. Lower is faster; 960x540 is the fastest. No patch file needed (a "Fixed render resolution" patch, if enabled, wins).</string></property>
              </widget>
             </item>
            </layout>
@@ -512,6 +532,7 @@
              <layout class="QFormLayout" name="pssrLayout">
               <item row="0" column="0">
                <widget class="QLabel" name="label_pssr_upscaler">
+                <property name="toolTip"><string>DLSS needs an NVIDIA RTX GPU</string></property>
                 <property name="text"><string>PSSR upscaler:</string></property>
                </widget>
               </item>
@@ -522,6 +543,7 @@
               </item>
               <item row="1" column="0">
                <widget class="QLabel" name="label_dlss_folder">
+                <property name="toolTip"><string>Folder with nvngx_dlss.dll (Windows) or libnvidia-ngx-dlss.so.* (Linux)</string></property>
                 <property name="text"><string>DLSS model folder:</string></property>
                </widget>
               </item>
@@ -669,6 +691,7 @@
           </item>
           <item row="3" column="0">
            <widget class="QLabel" name="label_keyboard_player">
+            <property name="toolTip"><string>Gamepads fill the remaining players in connection order. Every player uses the same input mapping.</string></property>
             <property name="text"><string>Keyboard player:</string></property>
            </widget>
           </item>
