@@ -21,12 +21,7 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #else
 #include <map>
 #include <sys/mman.h>
@@ -131,6 +126,7 @@ struct ProtectionCall {
   uint64_t size;
 };
 std::vector<ProtectionCall> g_protection_ranges;
+std::vector<bool> g_protection_writable; // per g_protection_ranges entry: made read-write
 std::mutex g_protection_log_mutex;
 // Runs once, on the calling thread, before the next host protection call (a window inside the
 // page manager's host update: host_lock held, the counts read, the result not yet recorded).
@@ -153,6 +149,7 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     std::lock_guard lock(g_protection_log_mutex);
     g_protection_calls++;
     g_protection_ranges.push_back({vaddr, size});
+    g_protection_writable.push_back(protection == PAGE_READWRITE);
   }
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
@@ -180,7 +177,7 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE) {
 void TestWatchAndUnwatch() {
   g_protection_calls = 0;
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size * 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -196,7 +193,7 @@ void TestWatchAndUnwatch() {
 
 void TestSharedWatcherCounts() {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -242,9 +239,59 @@ void TestResyncHostProtection() {
   Check(VirtualFree(allocation, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+// KYTY_MPROTECT_TRACKED_ONCE (based on Senaxx/KytyPS5 c453d3fd5): a writable guest mprotect over
+// watched pages never makes a watched page writable, not even for a moment: each page gets the
+// tracker's protection or the guest's mode in its single host call.
+void TestProtectGuestWritable() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *allocation = Allocate(region_size * 3);
+  const auto allocation_base = reinterpret_cast<uint64_t>(allocation);
+  const auto address = (allocation_base + region_size - 1) & ~(region_size - 1);
+  auto *memory = reinterpret_cast<uint8_t *>(address);
+
+  RegionBits read_mask;
+  read_mask.Set(2);
+  manager.UpdatePageWatchers<true>(address + page_size, page_size);
+  manager.UpdatePageWatchersForRegion<true, true>(address, read_mask);
+  // The guest had made the range read-only before (the tracker's pages keep theirs).
+  DWORD old_protection = 0;
+  Check(VirtualProtect(memory, page_size, PAGE_READONLY, &old_protection) != 0 &&
+            VirtualProtect(memory + page_size * 3, page_size, PAGE_READONLY, &old_protection) != 0,
+        "VirtualProtect failed");
+  {
+    std::lock_guard lock(g_protection_log_mutex);
+    g_protection_ranges.clear();
+    g_protection_writable.clear();
+  }
+  manager.ProtectGuestWritable(address, page_size * 4, Common::VirtualMemory::Mode::ReadWrite);
+  Check(IsWritable(memory) && Protection(memory + page_size) == PAGE_READONLY &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS && IsWritable(memory + page_size * 3),
+        "a writable guest protect did not keep the watched pages' protection");
+  bool opened_watched = false;
+  for (size_t i = 0; i < g_protection_ranges.size(); i++) {
+    const auto &call = g_protection_ranges[i];
+    if (g_protection_writable[i] && call.address < address + page_size * 3 &&
+        call.address + call.size > address + page_size) {
+      opened_watched = true;
+    }
+  }
+  Check(!opened_watched, "a writable guest protect opened a watched page");
+  // The tracker's record stays right: unwatching makes the pages writable again.
+  manager.UpdatePageWatchers<false>(address + page_size, page_size);
+  manager.UpdatePageWatchersForRegion<false, true>(address, read_mask);
+  Check(IsWritable(memory + page_size) && IsWritable(memory + page_size * 2),
+        "unwatch after a writable guest protect did not restore access");
+  // A region the tracker never watched gets the guest's mode.
+  manager.ProtectGuestWritable(address + region_size, page_size, Common::VirtualMemory::Mode::Read);
+  Check(Protection(memory + region_size) == PAGE_READONLY, "an unwatched region did not get the guest's mode");
+  Check(VirtualFree(allocation, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestCrossRegionRange() {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   auto *memory = Allocate(region_size * 2);
   const auto base = reinterpret_cast<uint64_t>(memory);
@@ -282,7 +329,7 @@ void TestCrossRegionRange() {
 
 void TestBatchedWatcherRanges() {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   constexpr uint64_t allocation_size = region_size * 3;
   auto *memory = Allocate(allocation_size);
@@ -578,7 +625,7 @@ void SetDeferMode(DeferMode mode) { PageManager::SetDeferModeForTests(mode); }
 void TestDeferredReleaseWaitsForScope(DeferMode mode) {
   SetDeferMode(mode);
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size * 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -620,7 +667,7 @@ void TestDeferredReleaseWaitsForScope(DeferMode mode) {
 void TestDeferredReleaseRacingWatch(DeferMode mode) {
   SetDeferMode(mode);
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -678,7 +725,7 @@ void TestDeferredReleaseRacingWatch(DeferMode mode) {
 void TestDeferredBatchOverflow() {
   SetDeferMode(DeferMode::On);
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   constexpr uint64_t pages = 40 * 80; // 40 spans, 80 pages apart (beyond the merge gap)
   auto *memory = Allocate(page_size * pages);
   const auto address = reinterpret_cast<uint64_t>(memory);
@@ -711,7 +758,7 @@ void TestDeferredBatchOverflow() {
 void TestDeferredReleaseStress(DeferMode mode) {
   SetDeferMode(mode);
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   constexpr uint64_t pages = 16;
   auto *memory = Allocate(page_size * pages);
   const auto address = reinterpret_cast<uint64_t>(memory);
@@ -827,7 +874,7 @@ void TestParkingLock() {
 
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   if (std::strcmp(name, "invalid-range") == 0) {
     manager.UpdatePageWatchers<true>((1ull << 40u) - 1, 2);
   } else if (std::strcmp(name, "unknown-untrack") == 0) {
@@ -851,12 +898,13 @@ void TestParkingLock() {
     const auto region_base = address & ~(TRACKER_REGION_SIZE - 1);
     const auto page = static_cast<size_t>((address - region_base) / page_size);
     mask.Set(page);
-    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
-    manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+    for (uint32_t count = 0; count < 256; count++) {
+      manager.UpdatePageWatchersForRegion<true, true>(region_base, mask);
+    }
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    for (uint32_t count = 0; count < 128; count++) {
+    for (uint32_t count = 0; count < 256; count++) {
       manager.UpdatePageWatchers<true>(address, page_size);
     }
   }
@@ -919,7 +967,7 @@ void TestDeferredProtects(const char *mode) {
   Live::OnCpFlip();
   Check(PageManager::DeferProtectsMode() != 0, "KYTY_DEFER_PROTECTS did not switch on");
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size * 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto before = PageManager::GetDeferProtectsStats();
@@ -983,7 +1031,7 @@ void TestDeferredProtectRacingRelease() {
   Live::Testing::StageText("KYTY_DEFER_PROTECTS=1\n");
   Live::OnCpFlip();
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto before = PageManager::GetDeferProtectsStats();
@@ -1033,7 +1081,7 @@ void TestDeferredProtectCoWatch(bool fix) {
                            (fix ? "1" : "0") + "\n");
   Live::OnCpFlip();
   PageManager manager;
-  const auto page_size = manager.GetPageSize();
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_size * 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto before = PageManager::GetDeferProtectsStats();
@@ -1098,6 +1146,7 @@ int main(int argc, char **argv) {
   TestCountWatchedPages();
   TestReadWriteWatcherInteractions();
   TestResyncHostProtection();
+  TestProtectGuestWritable();
   TestConcurrentSharedWatchers();
   TestFatalPaths();
 
@@ -1112,6 +1161,7 @@ int main(int argc, char **argv) {
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestResyncHostProtection();
+  TestProtectGuestWritable();
   TestConcurrentSharedWatchers();
   const auto verify_after = PageManager::GetDeferStats();
   Check(verify_after.verify_checks > verify_before.verify_checks &&

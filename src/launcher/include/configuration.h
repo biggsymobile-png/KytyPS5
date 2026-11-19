@@ -8,8 +8,11 @@
 #include <QColor>
 #include <QJsonObject>
 #include <QMetaEnum>
+#include <QList>
 #include <QMetaType>
 #include <QObject>
+#include <QPair>
+#include <QProcessEnvironment>
 #include <QSettings>
 #include <QString>
 #include <QStringList>
@@ -21,10 +24,7 @@ inline QStringList EnumToList() {
 	auto        me    = QMetaEnum::fromType<T>();
 	int         count = me.keyCount();
 	for (int i = 0; i < count; i++) {
-		auto key = QString(me.key(i));
-		ret << (key.startsWith('R') && key.size() > 2 && key.at(1).isDigit()
-		            ? key.remove('R').toLower()
-		            : key);
+		ret << QString(me.key(i));
 	}
 	return ret;
 }
@@ -32,16 +32,12 @@ inline QStringList EnumToList() {
 template <class T>
 T TextToEnum(const QString& text) {
 	auto me = QMetaEnum::fromType<T>();
-	return static_cast<T>(me.keyToValue(
-	    ((text.size() > 1 && text.at(0).isDigit()) ? 'R' + text.toUpper() : text).toUtf8().data()));
+	return static_cast<T>(me.keyToValue(text.toUtf8().constData()));
 }
 
 template <class T>
 QString EnumToText(T value) {
-	auto me  = QMetaEnum::fromType<T>();
-	auto key = QString(me.valueToKey(static_cast<int>(value)));
-	return (key.startsWith('R') && key.size() > 2 && key.at(1).isDigit() ? key.remove('R').toLower()
-	                                                                     : key);
+	return QString(QMetaEnum::fromType<T>().valueToKey(static_cast<int>(value)));
 }
 
 struct ControllerSettings {
@@ -50,12 +46,16 @@ struct ControllerSettings {
 	int     vibration_intensity = 100;
 	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
 	int     keyboard_player     = 0;
+	bool    wheel_enabled       = false;
+	// wheel.json beside the settings file; set when the settings are read, not stored.
+	QString wheel_config;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
 		s->setValue("controller_speaker_volume", speaker_volume);
 		s->setValue("controller_vibration_intensity", vibration_intensity);
 		s->setValue("controller_keyboard_player", keyboard_player);
+		s->setValue("wheel_enabled", wheel_enabled);
 	}
 
 	void ReadSettings(QSettings* s) {
@@ -70,6 +70,7 @@ struct ControllerSettings {
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
 		keyboard_player = qBound(0, s->value("controller_keyboard_player", 0).toInt(),
 		                         Config::MAX_PLAYERS);
+		wheel_enabled       = s->value("wheel_enabled", false).toBool();
 	}
 };
 
@@ -114,16 +115,16 @@ public:
 	static constexpr int DEFAULT_CONSOLE_LANGUAGE = 1;
 	static constexpr int MAX_CONSOLE_LANGUAGE     = 29;
 
-	enum class Resolution {
-		R1280X720,
-		R1920X1080,
-		R2560X1440,
-		R3840X2160,
-	};
-	Q_ENUM(Resolution)
+	static constexpr int MIN_SCREEN_SIZE = 320;
+	static constexpr int MAX_SCREEN_SIZE = 16384;
+
+	static QString NormalizeResolution(const QString& text);
+	// The window size of a new configuration, of Reset, and of a saved value that cannot be read.
+	static QString DefaultScreenResolution() { return QStringLiteral("1920x1080"); }
 
 	enum class ShaderOptimizationType { None, Size, Performance };
 	Q_ENUM(ShaderOptimizationType)
+	static ShaderOptimizationType ShaderOptimizationTypeFromText(const QString& text);
 
 	enum class PresentMode { Fifo, Mailbox, Immediate };
 	Q_ENUM(PresentMode)
@@ -131,62 +132,71 @@ public:
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
+	enum class PssrUpscaler { Linear, DLSS };
+	Q_ENUM(PssrUpscaler)
+
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
 	Configuration() = default;
 
-	QString    name;
-	QString    title_id;    /* Serial / title id from sce_sys/param.json */
-	QString    gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
-	QString    firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
-	QString    basedir;     /* Game base directory */
-	QString    game_path;   /* Launcher-unique game path */
-	QString    addons_dir;  /* Global setting; not saved per game. */
-	bool       custom_settings = false;
-	GameStatus game_status     = GameStatus::Unknown;
-	QString    game_comment;
+	QString     name;
+	QString     title_id;    /* Serial / title id from sce_sys/param.json */
+	QString     gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
+	QString     firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
+	QString     basedir;     /* Game base directory */
+	QString     game_path;   /* Launcher-unique game path */
+	QString     addons_dir;  /* Global setting; not saved per game. */
+	QStringList addcont;     /* User add-ons ("LABEL" or "LABEL=DIR"), saved by title ID. */
+	bool        custom_settings = false;
+	bool        pro_supported   = false; /* attribute3 bit 22 from sce_sys/param.json */
+	GameStatus  game_status     = GameStatus::Unknown;
+	QString     game_comment;
 
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
 	// So do the audio mix levels.
 	AudioMixSettings audio_mix;
-	// And the occlusion mode: false = the bundled preset's (performance: always visible),
-	// true = accurate GPU occlusion queries (--gpu-occlusion on).
-	bool gpu_occlusion_accurate = false;
-
-	void WriteGlobalOnlySettings(QSettings* s) const {
-		audio_mix.WriteSettings(s);
-		s->setValue("gpu_occlusion_accurate", gpu_occlusion_accurate);
-	}
-	void ReadGlobalOnlySettings(QSettings* s) {
-		audio_mix.ReadSettings(s);
-		gpu_occlusion_accurate = s->value("gpu_occlusion_accurate", false).toBool();
-	}
+	void WriteGlobalOnlySettings(QSettings* s) const { audio_mix.WriteSettings(s); }
+	void ReadGlobalOnlySettings(QSettings* s) { audio_mix.ReadSettings(s); }
 	void CopyGlobalOnlySettingsFrom(const Configuration& other) {
-		controller             = other.controller;
-		audio_mix              = other.audio_mix;
-		gpu_occlusion_accurate = other.gpu_occlusion_accurate;
+		controller = other.controller;
+		audio_mix  = other.audio_mix;
 	}
 
-	Resolution             screen_resolution           = Resolution::R1280X720;
+	QString                screen_resolution           = DefaultScreenResolution();
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	bool                   smooth_frametime_fix        = false;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
+	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
+	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
+	int                    flush_draws                 = 0;
 	bool                   tessellation_enabled        = false;
+	bool                   occlusion_queries_enabled   = false;
+	// Occlusion mode, saved per game (key gpu_occlusion_accurate): false = the bundled preset's
+	// (performance: always visible), true = accurate GPU occlusion queries (--gpu-occlusion on).
+	// A game config saved before it was per game inherits the global value when read.
+	bool                   gpu_occlusion_accurate      = false;
+	bool                   relaxed_shader_float        = false;
+	// "Faster GPU synchronisation (experimental)", per game (key fast_gpu_sync): the game starts
+	// with FastGpuSyncVariables() (ApplyFastGpuSync).
+	bool                   fast_gpu_sync               = false;
+	bool                   shader_cache_enabled        = true;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
+	bool                   psn_emulation_enabled       = false;
 	int                    vblank_frequency            = 60;
 	// NVIDIA DLSS (Streamline; Astro Bot): frames generated per rendered frame (0 off, 1 = 2x,
 	// 2 = 3x, 3 = 4x; KYTY_FRAMEGEN) and the upscaler in place of the game's TAA (0 the game's,
@@ -232,7 +242,11 @@ public:
 	QString                printf_output_file          = "_kyty.txt";
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
+	bool                   pro_enabled                 = false;
+	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
+	QString                dlss_folder;
 	QString                amd_cpu_mode                = QStringLiteral("auto"); // or "on", "off"
+	bool                   guest_tsc_enabled           = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -246,19 +260,29 @@ public:
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;
+		smooth_frametime_fix        = other.smooth_frametime_fix;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hdr_enabled                 = other.hdr_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
+		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		readback_tiled_images       = other.readback_tiled_images;
+		readback_storage_images     = other.readback_storage_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
+		flush_draws                 = other.flush_draws;
 		tessellation_enabled        = other.tessellation_enabled;
+		occlusion_queries_enabled   = other.occlusion_queries_enabled;
+		gpu_occlusion_accurate      = other.gpu_occlusion_accurate;
+		relaxed_shader_float        = other.relaxed_shader_float;
+		fast_gpu_sync               = other.fast_gpu_sync;
+		shader_cache_enabled        = other.shader_cache_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;
+		psn_emulation_enabled       = other.psn_emulation_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		frame_generation            = other.frame_generation;
 		upscaler                    = other.upscaler;
@@ -282,7 +306,11 @@ public:
 		printf_output_file          = other.printf_output_file;
 		profiler_enabled            = other.profiler_enabled;
 		renderdoc_enabled           = other.renderdoc_enabled;
+		pro_enabled                 = other.pro_enabled;
+		pssr_upscaler               = other.pssr_upscaler;
+		dlss_folder                 = other.dlss_folder;
 		amd_cpu_mode                = other.amd_cpu_mode;
+		guest_tsc_enabled           = other.guest_tsc_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -297,6 +325,7 @@ public:
 		basedir         = other.basedir;
 		game_path       = other.game_path;
 		custom_settings = other.custom_settings;
+		pro_supported   = other.pro_supported;
 		game_status     = other.game_status;
 		game_comment    = other.game_comment;
 	}
@@ -305,8 +334,25 @@ public:
 	void ReadSettings(QSettings* s);
 
 	[[nodiscard]] QVariantMap GameSettings() const;
+
+	// The emulator switches of fast_gpu_sync: precise GPU hazards, ranged indirect arguments, guest
+	// release barriers dropped where nothing waits on them, batched DMA barriers.
+	[[nodiscard]] static const QList<QPair<QString, QString>>& FastGpuSyncVariables();
+	// With fast_gpu_sync, adds each of FastGpuSyncVariables() that environment does not set yet:
+	// a value from u59-preset.json, a title preset or the user's environment wins. Without it,
+	// nothing changes.
+	void ApplyFastGpuSync(QProcessEnvironment& environment) const;
 	// Call on a temporary configuration: validation can fail after loading values.
 	bool SetGameSettings(const QJsonObject& settings, QString& error);
+
+	// The launcher settings a title was tested with (the table in configuration.cpp), as in a game
+	// config export: setting name -> text value. Empty for a title without an entry. A game without
+	// a config of its own runs with them over the global settings; Reset and the Recommended
+	// button of its dialog set them.
+	[[nodiscard]] static QJsonObject RecommendedGameSettings(const QString& title_id);
+	// Sets RecommendedGameSettings(title_id) over the current values and leaves every other
+	// setting as it is; false (nothing changed) for a title without an entry.
+	bool ApplyRecommendedGameSettings(const QString& title_id);
 
 private:
 	template <class Settings>

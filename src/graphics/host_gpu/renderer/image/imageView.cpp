@@ -32,11 +32,6 @@ namespace {
 
 [[nodiscard]] bool IsValidViewType(const VulkanImage& image, const ImageViewInfo& info) {
 	switch (image.image_type) {
-		case vk::ImageType::e1D:
-			if (info.type != vk::ImageViewType::e1D && info.type != vk::ImageViewType::e1DArray) {
-				return false;
-			}
-			return info.type != vk::ImageViewType::e1D || info.layer_count == 1;
 		case vk::ImageType::e2D:
 			switch (info.type) {
 				case vk::ImageViewType::e2D: return info.layer_count == 1;
@@ -362,18 +357,30 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
 	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
 		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
-		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
+		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u "
+		     "detail: image=%d image_type=%d fmt_ok=%d ranges_ok=%d map_ok=%d type_ok=%d aspect_ok=%d "
+		     "extent=%ux%ux%u flags=0x%x\n",
 		     static_cast<int>(image.format), static_cast<int>(normalized.format),
 		     static_cast<int>(normalized.type),
 		     static_cast<vk::ImageAspectFlags::MaskType>(normalized.aspect), normalized.base_level,
 		     normalized.level_count, normalized.base_layer, normalized.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
-		     image.layers);
+		     image.layers, static_cast<int>(image.image != nullptr),
+		     static_cast<int>(image.image_type), static_cast<int>(format_compatible),
+		     static_cast<int>(ranges_valid), static_cast<int>(mapping_valid),
+		     static_cast<int>(IsValidViewType(image, normalized)),
+		     static_cast<int>(IsValidAspect(image, normalized.aspect)), image.extent.width,
+		     image.extent.height, image.extent.depth,
+		     static_cast<uint32_t>(static_cast<vk::ImageCreateFlags::MaskType>(image.flags)));
 	}
 
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;
+	// 8 and 8_8 sRGB views of UNorm images only sample (upstream e914ec6db).
+	if (normalized.format == vk::Format::eR8Srgb || normalized.format == vk::Format::eR8G8Srgb) {
+		usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
+	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
@@ -402,6 +409,9 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     static_cast<vk::ImageAspectFlags::MaskType>(view_info.aspect), view_info.base_level,
 		     view_info.level_count, view_info.base_layer, view_info.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(view_info.usage));
+	}
+	if (DeadViewScrubEnabled()) {
+		NoteImageViewCreated(view);
 	}
 	SetVulkanObjectNameF(
 	    m_graphics.device, view,

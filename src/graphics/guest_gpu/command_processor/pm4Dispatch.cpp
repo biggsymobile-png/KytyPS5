@@ -187,7 +187,7 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_DRAW_INDEX_INDIRECT_MULTI] = CpOpDrawIndirectMulti;
 	g_cp_op_func[Pm4::IT_DRAW_INDEX_2]              = CpOpDrawIndex;
 	g_cp_op_func[Pm4::IT_DRAW_INDEX_OFFSET_2]       = CpOpDrawIndexOffset;
-	g_cp_op_func[Pm4::IT_DISPATCH_DRAW_PREAMBLE]    = CpOpDrawIndex;
+	g_cp_op_func[Pm4::IT_DRAW_INDEX_MULTI_INST]     = CpOpDrawIndexMultiInst;
 	g_cp_op_func[Pm4::IT_PFP_SYNC_ME]               = CpOpPfpSyncMe;
 	g_cp_op_func[Pm4::IT_INDEX_TYPE]                = CpOpIndexType;
 	g_cp_op_func[Pm4::IT_NUM_INSTANCES]             = CpOpNumInstances;
@@ -203,6 +203,8 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_EVENT_WRITE_EOS]           = CpOpEventWriteEos;
 	g_cp_op_func[Pm4::IT_DMA_DATA]                  = CpOpDmaData;
 	g_cp_op_func[Pm4::IT_ACQUIRE_MEM]               = CpOpAcquireMem;
+	g_cp_op_func[Pm4::IT_RELEASE_MEM]               = CpOpReleaseMem;
+	g_cp_op_func[Pm4::IT_MEM_SEMAPHORE]             = CpOpMemSemaphore;
 	g_cp_op_func[Pm4::IT_REWIND]                    = CpOpRewind;
 	g_cp_op_func[Pm4::IT_SET_CONTEXT_REG]           = CpOpSetContextReg;
 	g_cp_op_func[Pm4::IT_SET_SH_REG]                = CpOpSetShaderReg;
@@ -234,6 +236,7 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 	g_cp_op_custom_func[Pm4::R_FLIP]           = CpOpFlip;
 	g_cp_op_custom_func[Pm4::R_RELEASE_MEM]    = CpOpReleaseMem;
 	g_cp_op_custom_func[Pm4::R_CONTEXT_STATE]  = CpOpContextState;
+	g_cp_op_custom_func[Pm4::R_PSSR]           = CpOpPssr;
 
 	return g_cp_op_custom_func;
 }

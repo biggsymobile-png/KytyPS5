@@ -8,14 +8,40 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
+#include <set>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+
+// KYTY_OBJPRIM_ID (based on Erlou93/KytyPS5-Yotei): what the hardware writes to the ObjPrimID colour
+// slot, VGT_OBJECT_ID (push-constant dword) plus the primitive index of the draw when
+// ADD_PIPED_PRIM_ID is set. Stored in the entry block: a fragment the guest code discards writes
+// nothing, like any colour output.
+void EmitObjprimIdOutput(EmitterState& state) {
+	const auto& pixel   = *state.input_info.pixel;
+	const auto  pointer = state.builder.AllocateId();
+	auto        value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
+	                          state.push_constant_variable, ConstantU32(state, 0),
+	                          ConstantU32(state, pixel.objprim_push_dword));
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	if (pixel.objprim_add_prim_id) {
+		const auto variable = InputVariableForKind(state, IR::StageInputKind::PrimitiveId);
+		EXIT_IF(variable == 0);
+		const auto primitive = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeI32(state), primitive, variable);
+		const auto primitive_u32 = Unary(state, spv::OpBitcast, TypeU32(state), primitive);
+		value = Binary(state, spv::OpIAdd, TypeU32(state), value, primitive_u32);
+	}
+	state.builder.AddFunction(spv::OpStore, state.objprim_output_variable, value);
+}
 
 void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	const auto kill_label  = state.builder.AllocateId();
@@ -237,6 +263,30 @@ bool IsLoopMergeBlock(const IR::Program& program, uint32_t target) {
 	});
 }
 
+// KYTY_CALL_LOOP_CAP: the merge of a loop of a bracketed callee body (CFG::Terminator::call_loop).
+bool IsCallLoopMergeBlock(const IR::Program& program, uint32_t target) {
+	return std::ranges::any_of(program.block_info, [=](const IR::BlockInfo& info) {
+		return info.terminator.loop_header && info.terminator.call_loop && info.terminator.merge_block == target;
+	});
+}
+
+// True once the invocation has run more rounds of such loops than the cap.
+uint32_t CallLoopExhausted(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.call_loop_variable);
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), exhausted, count,
+	                          ConstantU32(state, GetCodegenOptions().call_loop_cap));
+	return exhausted;
+}
+
+void SpendCallLoop(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.call_loop_variable);
+	state.builder.AddFunction(spv::OpStore, state.call_loop_variable,
+	                          EmitAddU32(state, count, ConstantU32(state, 1)));
+}
+
 // An exhausted invocation reports once, at return, by adding one to the last GDS dword.
 void EmitLoopGuardReport(EmitterState& state) {
 	if (state.loop_guard_variable == 0 || state.gds_variable == 0 || state.gds_length == 0) {
@@ -274,6 +324,9 @@ void EmitLoopGuardReport(EmitterState& state) {
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitLoopGuardReport(ctx.state);
 	EmitBvhNodeReport(ctx.state);
+	if (PopsInterlockActive(ctx.state)) {
+		ctx.state.builder.AddFunction(spv::OpEndInvocationInterlockEXT);
+	}
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
@@ -291,6 +344,36 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 		return Binary(ctx.state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state), word,
 		              ConstantU32(ctx.state, zero ? ~0u : 0u));
 	}
+	// KYTY_NATIVE_WAVE64_BRANCH (Senaxx 49723097f): a wave64 workgroup shader on a 64-wide host
+	// subgroup (compute and mesh shaders on AMD) runs natively, one guest lane per invocation. Its
+	// VCC/EXEC/SCC branch decides for the wave, as the two emulated halves below do; a lane's own
+	// bit would split the wave. Lanes a partial workgroup lacks are not in the ballot, so a zero
+	// condition holds when no present lane fails it.
+	if (ctx.other_half == nullptr && !ctx.state.split_wave &&
+	    kind != CFG::BranchCondition::ScalarInstruction &&
+	    kind != CFG::BranchCondition::GotoVariable && GetCodegenOptions().native_wave64_branch &&
+	    ctx.state.program.wave_size == 64u) {
+		const auto* workgroup = ShaderWorkgroupInput(ctx.state.program.stage, ctx.state.input_info);
+		if (workgroup != nullptr && workgroup->host_subgroup_size == 64u) {
+			auto& state     = ctx.state;
+			auto  predicate = ctx.Def(info.condition);
+			if (zero) {
+				predicate = Unary(state, spv::OpLogicalNot, TypeBool(state), predicate);
+			}
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+			const auto ballot = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+			                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+			const auto low  = state.builder.AllocateId();
+			const auto high = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+			const auto any = Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
+			return Binary(state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), any,
+			              ConstantU32(state, 0));
+		}
+	}
 	// Scalar-instruction conditions already test the full wave's raw register values.
 	if ((ctx.other_half == nullptr && !ctx.state.split_wave) ||
 	    info.terminator.condition == CFG::BranchCondition::ScalarInstruction ||
@@ -303,6 +386,18 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
+	if (zero && ctx.other_half != nullptr && !ctx.state.split_wave &&
+	    GetCodegenOptions().wave64_active_zero) {
+		// KYTY_WAVE64_ACTIVE_ZERO: "zero" holds when every running host invocation agrees in both
+		// halves; invocations that are not running have no ballot bit (CodegenOptions.h).
+		const auto active      = ctx.Ballot(IR::Value(true));
+		const auto active_word = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), active_word,
+		                              active, 0);
+		const auto low_all  = Binary(ctx.state, spv::OpIEqual, TypeBool(ctx.state), low, active_word);
+		const auto high_all = Binary(ctx.state, spv::OpIEqual, TypeBool(ctx.state), high, active_word);
+		return Binary(ctx.state, spv::OpLogicalAnd, TypeBool(ctx.state), low_all, high_all);
+	}
 	const auto combined =
 	    EmitBinaryU32(ctx.state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
 	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
@@ -320,6 +415,9 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 		if (term.loop_header) {
 			if (ctx.state.loop_guard_variable != 0) {
 				SpendLoopGuard(ctx.state);
+			}
+			if (ctx.state.call_loop_variable != 0 && term.call_loop) {
+				SpendCallLoop(ctx.state);
 			}
 			const auto* merge = TargetBlock(program, term.merge_block);
 			const auto* cont  = TargetBlock(program, term.continue_block);
@@ -377,6 +475,25 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 						                              exhausted);
 						ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), forced,
 						                              condition, alive);
+					}
+					condition = forced;
+				}
+			}
+			if (ctx.state.call_loop_variable != 0) {
+				// KYTY_CALL_LOOP_CAP: an exhausted invocation leaves the bracketed bodies' loops.
+				const bool true_exits  = IsCallLoopMergeBlock(program, term.true_block);
+				const bool false_exits = IsCallLoopMergeBlock(program, term.false_block);
+				if (true_exits != false_exits) {
+					const auto exhausted = CallLoopExhausted(ctx.state);
+					const auto forced    = ctx.state.builder.AllocateId();
+					if (true_exits) {
+						ctx.state.builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), forced, condition,
+						                              exhausted);
+					} else {
+						const auto alive = ctx.state.builder.AllocateId();
+						ctx.state.builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), alive, exhausted);
+						ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), forced, condition,
+						                              alive);
 					}
 					condition = forced;
 				}
@@ -679,12 +796,18 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 &&
 	    (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
 	     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane ||
+	     // Native ray tracing: the wave's next instance is chosen once for both halves.
+	     inst.GetOpcode() == IR::ValueOpcode::RayQueryNext ||
 	     // Upstream 8cc5f5364: SMEM loads (SGPR operands, no EXEC) are identical in both halves.
 	     inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer ||
 	     (inst.GetOpcode() == IR::ValueOpcode::LoadAddressU32 &&
 	      ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
 		// Both operations already combine both emulated halves into one whole-wave result.
 		ctx.Define(inst, ctx.other_half->Result(inst));
+		return;
+	}
+	if (ctx.half != 0 && inst.GetOpcode() == IR::ValueOpcode::RayQueryCount) {
+		// Counted once for both halves (EmitRayQueryCount).
 		return;
 	}
 	if ((inst.GetOpcode() == IR::ValueOpcode::SelectU32 ||
@@ -762,6 +885,8 @@ template <typename EmitInstruction>
 void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
 	ctx.state.current_block = block;
 	EmitLabel(ctx.state, ctx.Label(block));
+	// KYTY_SPLIT_LDS_WRITE_SYNC: a read may reach this block on another path.
+	ctx.state.lds_split_synced = false;
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
@@ -771,7 +896,16 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 		} else {
 			emitted_non_phi = true;
 		}
-		if (ctx.state.split_wave && SyncsLdsAccess(ctx.state, inst)) {
+		const bool lds_write_sync = ctx.state.split_wave && GetCodegenOptions().split_lds_write_sync &&
+		                            AccessesLds(ctx.state.program, inst);
+		const bool lds_write = lds_write_sync && IR::SharedAccessOf(inst.GetOpcode()) != IR::SharedAccess::Read;
+		if (lds_write_sync) {
+			// KYTY_SPLIT_LDS_WRITE_SYNC: a write waits for the other half only when this half read the
+			// LDS since the last barrier (it may overwrite what the other half has yet to read).
+			if (lds_write && !ctx.state.lds_split_synced) {
+				EmitWaveBarrier(ctx.state);
+			}
+		} else if (ctx.state.split_wave && SyncsLdsAccess(ctx.state, inst)) {
 			// The guest's lanes ran in lockstep: a lane may read what another lane of its wave
 			// wrote, or overwrite what it read, without waiting. A split wave's halves do not.
 			EmitWaveBarrier(ctx.state);
@@ -784,10 +918,21 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			                  inst.GetOpcode() != IR::ValueOpcode::StoreCompletion &&
 			                  inst.GetOpcode() != IR::ValueOpcode::DataCacheInvalidate &&
 			                  inst.GetOpcode() != IR::ValueOpcode::MeshAllocate)) {
+				if (half != 0 && ctx.state.lane_share.active && LaneShareReuse(ctx, lane, inst)) {
+					continue;
+				}
 				emit_instruction(lane, inst);
 			}
 		}
 		ctx.state.lane_half = 0;
+		if (lds_write_sync) {
+			// A write is followed by a barrier, so the other half's later reads see it; a read
+			// leaves the halves unsynchronized for the next write.
+			if (lds_write) {
+				EmitWaveBarrier(ctx.state);
+			}
+			ctx.state.lds_split_synced = lds_write;
+		}
 	}
 }
 
@@ -878,6 +1023,285 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitStructuredTerminator(ctx, block, program.block_info[index]);
 	}
 	PatchStructuredPhis(ctx, structured);
+}
+
+// A guest barrier where a mesh subgroup that runs in passes is cut (see EmitMeshEntryPoint).
+struct MeshSplit {
+	size_t block    = 0; // index in program.blocks
+	size_t position = 0; // the barrier's position in that block
+};
+
+// The program's barriers as split points, or why the program cannot run in passes. A barrier
+// qualifies at the top level only: no edge bypasses or re-enters its block and no loop or
+// selection spans it, so the code before it is a whole region. The guest must also not end
+// before its last barrier, which would leave a later segment running for a finished wave.
+const char* FindMeshSplits(const IR::Program& program, std::vector<MeshSplit>& splits) {
+	splits.clear();
+	if (program.dispatcher_fallback) {
+		return "the control flow needs the dispatcher";
+	}
+	const auto count = program.blocks.size();
+	std::unordered_map<uint32_t, size_t> index_of;
+	for (size_t i = 0; i < count; i++) {
+		index_of.emplace(program.block_info[i].id, i);
+	}
+	const auto index = [&](uint32_t id) {
+		const auto found = index_of.find(id);
+		return found == index_of.end() ? SIZE_MAX : found->second;
+	};
+	// Successors in program order; a block whose terminator returns (as the structured emitter
+	// treats it) is an exit.
+	std::vector<std::vector<size_t>> successors(count);
+	std::vector<bool>                exits(count, false);
+	for (size_t i = 0; i < count; i++) {
+		const auto& info = program.block_info[i];
+		const auto& term = info.terminator;
+		if (term.kind == CFG::TerminatorKind::Branch && index(term.true_block) != SIZE_MAX) {
+			successors[i] = {index(term.true_block)};
+		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
+		           index(term.true_block) != SIZE_MAX && index(term.false_block) != SIZE_MAX &&
+		           !info.condition.IsEmpty()) {
+			successors[i] = {index(term.true_block), index(term.false_block)};
+		} else if (term.kind == CFG::TerminatorKind::IndirectBranch ||
+		           term.kind == CFG::TerminatorKind::Unsupported) {
+			return "an indirect branch";
+		} else {
+			exits[i] = true;
+		}
+	}
+	const auto top_level = [&](size_t k) {
+		for (size_t i = 0; i < count; i++) {
+			for (const auto j: successors[i]) {
+				if ((i < k && j > k) || (i >= k && j <= k)) {
+					return false;
+				}
+			}
+			const auto& term = program.block_info[i].terminator;
+			if (i < k && ((term.merge_block != UINT32_MAX && index(term.merge_block) > k) ||
+			              (term.loop_header && index(term.continue_block) >= k))) {
+				return false;
+			}
+		}
+		return true;
+	};
+	for (size_t k = 0; k < count; k++) {
+		size_t position = 0;
+		for (const auto& inst: *program.blocks[k]) {
+			if (inst.GetOpcode() == IR::ValueOpcode::Barrier) {
+				if (!top_level(k)) {
+					return "a barrier inside a loop or branch";
+				}
+				splits.push_back({k, position});
+			}
+			position++;
+		}
+	}
+	for (size_t i = 0; !splits.empty() && i < splits.back().block; i++) {
+		if (exits[i]) {
+			return "the program can end before a barrier";
+		}
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			// Scratch lives in Function variables, which do not outlive a segment.
+			if (IR::AddressOpcodeInfoOf(inst.GetOpcode()).access != IR::AddressAccess::None &&
+			    program.memory_info.at(inst.Flags<IR::MemoryFlags>().index).kind ==
+			        IR::ResourceKind::Scratch) {
+				return "scratch memory";
+			}
+		}
+	}
+	return nullptr;
+}
+
+// Which values cross a split: each is kept in a Private array with one element per lane of each
+// pass, stored at the end of the segment that defines it and loaded by every later segment that
+// uses it.
+struct MeshSegmentPlan {
+	std::vector<MeshSplit>                              splits;
+	std::unordered_map<const IR::Inst*, uint32_t>       spills;
+	std::vector<std::vector<const IR::Inst*>>           stores;
+	std::vector<std::vector<const IR::Inst*>>           loads;
+};
+
+MeshSegmentPlan PlanMeshSegments(EmitterState& state, std::vector<MeshSplit> splits) {
+	const auto&     program = state.program;
+	MeshSegmentPlan plan;
+	plan.splits = std::move(splits);
+	plan.stores.resize(plan.splits.size() + 1);
+	plan.loads.resize(plan.splits.size() + 1);
+	std::unordered_map<const IR::Inst*, uint32_t> segment_of;
+	std::vector<uint32_t>                         terminator_segment(program.blocks.size());
+	uint32_t                                      segment = 0;
+	size_t                                        next    = 0;
+	for (size_t block = 0; block < program.blocks.size(); block++) {
+		size_t position = 0;
+		for (const auto& inst: *program.blocks[block]) {
+			if (next < plan.splits.size() && plan.splits[next].block == block &&
+			    plan.splits[next].position == position) {
+				segment++;
+				next++;
+			}
+			segment_of.emplace(&inst, segment);
+			position++;
+		}
+		terminator_segment[block] = segment;
+	}
+	std::set<std::pair<const IR::Inst*, uint32_t>> visited;
+	std::function<void(IR::Value, uint32_t)>       use = [&](IR::Value value, uint32_t user) {
+        value            = value.Resolve();
+        const auto* inst = value.TryInstruction();
+        if (inst == nullptr || !visited.emplace(inst, user).second) {
+            return;
+        }
+        const auto found = segment_of.find(inst);
+        if (found == segment_of.end() || found->second >= user) {
+            return;
+        }
+        if (TypeId(state, inst->GetType()) == 0) {
+            // A handle the emitter reads through its producer: the producer's operands are
+            // what the user's segment loads.
+            for (size_t index = 0; index < inst->NumArgs(); index++) {
+                use(inst->Arg(index), user);
+            }
+            return;
+        }
+        if (!plan.spills.contains(inst)) {
+            const auto slots  = state.lane_count * state.mesh_passes;
+            const auto array  = state.builder.Type(spv::OpTypeArray, TypeId(state, inst->GetType()),
+                                                   ConstantU32(state, slots));
+            plan.spills.emplace(inst, state.builder.DefineGlobalVariable(
+                                          TypePointer(state, spv::StorageClassPrivate, array),
+                                          spv::StorageClassPrivate));
+            plan.stores[found->second].push_back(inst);
+        }
+        plan.loads[user].push_back(inst);
+	};
+	for (size_t block = 0; block < program.blocks.size(); block++) {
+		for (const auto& inst: *program.blocks[block]) {
+			for (size_t index = 0; index < inst.NumArgs(); index++) {
+				use(inst.Arg(index), segment_of.at(&inst));
+			}
+		}
+		const auto& info = program.block_info[block];
+		if (!info.condition.IsEmpty()) {
+			use(info.condition, terminator_segment[block]);
+		}
+		if (!info.indirect_target.IsEmpty()) {
+			use(info.indirect_target, terminator_segment[block]);
+		}
+	}
+	return plan;
+}
+
+// The element of a crossing value's array for this lane in the current pass.
+uint32_t MeshSpillPointer(ValueEmitContext& lane, uint32_t variable, const IR::Inst& inst) {
+	auto&      state = lane.state;
+	const auto pass  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), pass, state.mesh_pass_variable);
+	const auto slot = Binary(state, spv::OpIAdd, TypeU32(state),
+	                         Binary(state, spv::OpIMul, TypeU32(state), pass,
+	                                ConstantU32(state, state.lane_count)),
+	                         ConstantU32(state, lane.half));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassPrivate,
+	                                      TypeId(state, inst.GetType())),
+	                          pointer, variable, slot);
+	return pointer;
+}
+
+// The guest program as one function per segment between its barriers. Each segment emits its
+// blocks once; the block a barrier cuts continues under a fresh label in the next segment.
+void EmitMeshSegmentFunctions(ValueEmitContext& ctx, const MeshSegmentPlan& plan) {
+	auto&       state   = ctx.state;
+	const auto& program = state.program;
+	size_t      block   = 0;
+	size_t      start   = 0;
+	for (size_t segment = 0; segment <= plan.splits.size(); segment++) {
+		const auto function = state.builder.AllocateId();
+		state.mesh_segment_funcs.push_back(function);
+		state.builder.AddFunction(spv::OpFunction, TypeVoid(state), function,
+		                          spv::FunctionControlMaskNone, TypeFunction(state));
+		EmitLabel(state, state.builder.AllocateId());
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			auto& lane = half == 0 ? ctx : *ctx.other_half;
+			if (lane.scratch_u32_variable != 0) {
+				lane.scratch_u32_variable = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+				    lane.scratch_u32_variable, spv::StorageClassFunction);
+			}
+		}
+		if (state.gds_variable != 0) {
+			state.gds_length = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
+			                          state.gds_variable, 0);
+		}
+		EmitMemoryOffsets(state);
+		for (const auto* inst: plan.loads[segment]) {
+			for (uint32_t half = 0; half < state.lane_count; half++) {
+				auto&      lane  = half == 0 ? ctx : *ctx.other_half;
+				const auto value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeId(state, inst->GetType()), value,
+				                          MeshSpillPointer(lane, plan.spills.at(inst), *inst));
+				lane.definitions.insert_or_assign(inst, value);
+			}
+		}
+		StructuredFunctionState structured;
+		if (start == 0) {
+			state.builder.AddFunction(spv::OpBranch, ctx.Label(program.blocks[block]));
+		} else {
+			const auto resume = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBranch, resume);
+			EmitLabel(state, resume);
+		}
+		const auto* end = segment < plan.splits.size() ? &plan.splits[segment] : nullptr;
+		while (block < program.blocks.size()) {
+			const auto* ir_block = program.blocks[block];
+			state.current_block  = ir_block;
+			if (start == 0) {
+				EmitLabel(state, ctx.Label(ir_block));
+			}
+			const auto stop     = end != nullptr && end->block == block ? end->position : SIZE_MAX;
+			size_t     position = 0;
+			for (const auto& inst: *ir_block) {
+				if (position >= start && position < stop &&
+				    inst.GetOpcode() != IR::ValueOpcode::Barrier) {
+					for (uint32_t half = 0; half < state.lane_count; half++) {
+						state.lane_half = half;
+						if (half == 0 || inst.GetOpcode() != IR::ValueOpcode::MeshAllocate) {
+							EmitStructuredInstruction(half == 0 ? ctx : *ctx.other_half, structured,
+							                          inst);
+						}
+					}
+					state.lane_half = 0;
+				}
+				position++;
+			}
+			if (stop != SIZE_MAX) {
+				start = stop + 1;
+				break;
+			}
+			structured.block_exit_labels.emplace(ir_block, state.current_label);
+			EmitStructuredTerminator(ctx, ir_block, program.block_info[block]);
+			block++;
+			start = 0;
+		}
+		if (end != nullptr) {
+			for (const auto* inst: plan.stores[segment]) {
+				for (uint32_t half = 0; half < state.lane_count; half++) {
+					auto& lane = half == 0 ? ctx : *ctx.other_half;
+					state.builder.AddFunction(spv::OpStore,
+					                          MeshSpillPointer(lane, plan.spills.at(inst), *inst),
+					                          lane.Def(IR::Value(const_cast<IR::Inst*>(inst))));
+				}
+			}
+			state.builder.AddFunction(spv::OpReturn);
+		}
+		PatchStructuredPhis(ctx, structured);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+	}
 }
 
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
@@ -977,6 +1401,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
 		case IR::Type::F64: return TypeF64(state);
+		case IR::Type::Bvh8Result: return TypeBvh8Result(state);
 		case IR::Type::U32x3: return TypeU32Vector(state, 3);
 		case IR::Type::U32x4: return TypeU32Vector(state, 4);
 		case IR::Type::F32x2: return TypeF32Vector(state, 2);
@@ -1041,21 +1466,25 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	}
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
+	const auto low_value   = other_half == nullptr || half == 0 ? Def(predicate) : other_half->Def(predicate);
 	const auto low         = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
-	                          other_half == nullptr || half == 0 ? Def(predicate)
-	                                                             : other_half->Def(predicate));
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope, low_value);
 	if (other_half == nullptr) {
 		return EmitWaveBallot(state, low);
 	}
-	const auto high      = state.builder.AllocateId();
-	const auto low_word  = state.builder.AllocateId();
-	const auto high_word = state.builder.AllocateId();
-	const auto ballot    = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope,
-	                          half == 1 ? Def(predicate) : other_half->Def(predicate));
+	const auto high_value = half == 1 ? Def(predicate) : other_half->Def(predicate);
+	const auto low_word   = state.builder.AllocateId();
+	const auto ballot     = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low_word, low, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
+	// KYTY_LANE2_SHARE: both halves hold the same id (a constant, or a value proven equal in both
+	// halves), so the high half's ballot is the low half's.
+	uint32_t high_word = low_word;
+	if (high_value != low_value || !GetCodegenOptions().lane2_share) {
+		const auto high = state.builder.AllocateId();
+		high_word       = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope, high_value);
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
+	}
 	state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
 	                          ConstantU32(state, 0), ConstantU32(state, 0));
 	return ballot;
@@ -1238,10 +1667,17 @@ void EmitProgram(EmitterState& state) {
 		high.other_half = &ctx;
 		high.half       = 1;
 	}
+	LaneShareClassify(state);
 	std::optional<DispatcherFunctionState> dispatcher;
 	if (state.program.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
+	}
+	if (GetCodegenOptions().call_loop_cap != 0u && !program.dispatcher_fallback &&
+	    std::ranges::any_of(program.block_info,
+	                        [](const IR::BlockInfo& info) { return info.terminator.call_loop; })) {
+		state.call_loop_variable = state.builder.AllocateId();
+		state.builder.AddName(state.call_loop_variable, "call_loop_rounds");
 	}
 	if (LoopGuardApplies(program.shader_hash) && !program.dispatcher_fallback) {
 		state.loop_guard_variable = state.builder.AllocateId();
@@ -1318,6 +1754,8 @@ void EmitProgram(EmitterState& state) {
 	}
 	DefineGetBdaPointer(state);
 	DefineBvhNodeTestFunction(state);
+	DefineBvh8IntersectFunction(state);
+	DefineIndirectFormatFunction(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
 			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32;
@@ -1328,6 +1766,16 @@ void EmitProgram(EmitterState& state) {
 			}
 			break;
 		}
+	}
+	if (state.mesh_passes > 1u) {
+		// TranslateProgram gave up on programs that cannot be cut.
+		std::vector<MeshSplit> splits;
+		if (const auto* reason = FindMeshSplits(program, splits); reason != nullptr) {
+			ctx.Fail(reason);
+		}
+		EmitMeshSegmentFunctions(ctx, PlanMeshSegments(state, std::move(splits)));
+		EmitMeshEntryPoint(state);
+		return;
 	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
@@ -1345,7 +1793,13 @@ void EmitProgram(EmitterState& state) {
 			}
 		}
 	}
-	if (state.requirements.function_lds) {
+	if (state.requirements.function_lds && state.lds_slot_plan) {
+		for (const auto& [key, variable]: state.lds_slot_variables) {
+			state.builder.AddFunction(spv::OpVariable,
+			                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+			                          variable, spv::StorageClassFunction);
+		}
+	} else if (state.requirements.function_lds) {
 		state.builder.AddFunction(
 		    spv::OpVariable,
 		    TypeU32ArrayPointer(state, spv::StorageClassFunction, LdsDwordCount(state)),
@@ -1369,11 +1823,17 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.loop_guard_variable, spv::StorageClassFunction);
 	}
+	if (state.call_loop_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.call_loop_variable, spv::StorageClassFunction);
+	}
 	if (state.bvh_node_count_variable != 0) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.bvh_node_count_variable, spv::StorageClassFunction);
 	}
+	DeclareRayQueryVariables(state);
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -1410,6 +1870,10 @@ void EmitProgram(EmitterState& state) {
 	if (state.loop_guard_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
 	}
+	if (state.call_loop_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.call_loop_variable, ConstantU32(state, 0));
+	}
+	InitializeRayQueryVariables(state);
 	EmitGeometryOutputDefaults(state);
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		// The workgroup's LDS region is the one of its index in the dispatch, x + nx * (y + ny * z),
@@ -1435,6 +1899,15 @@ void EmitProgram(EmitterState& state) {
 		                                      ConstantU32(state, 0));
 	}
 	EmitMemoryOffsets(state);
+	if (PopsInterlockActive(state)) {
+		// KYTY_POPS_INTERLOCK: the guest's POPS section (S_SETREG POPS_PACKER .. S_SENDMSG
+		// ORDERED_PS_DONE) widened to the whole program, so Begin and End each run exactly once in
+		// uniform control flow; EmitReturn ends it.
+		state.builder.AddFunction(spv::OpBeginInvocationInterlockEXT);
+	}
+	if (state.objprim_output_variable != 0) {
+		EmitObjprimIdOutput(state);
+	}
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {
@@ -1446,6 +1919,16 @@ void EmitProgram(EmitterState& state) {
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}
+	LaneShareReport(state);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+const char* MeshPassesUnsupported(const IR::Program& program) {
+	std::vector<Emitter::MeshSplit> splits;
+	return Emitter::FindMeshSplits(program, splits);
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv

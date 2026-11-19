@@ -142,6 +142,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 						case StageInputKind::PrimitiveId:
 						case StageInputKind::InstanceIndex:
 						case StageInputKind::BaseInstance:
+						case StageInputKind::BaseVertex:
 						case StageInputKind::FrontFacing:
 						case StageInputKind::LocalInvocationIndex:
 							if (component != 0u) {
@@ -165,6 +166,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 							break;
 						case StageInputKind::TessCoord:
 						case StageInputKind::WorkgroupId:
+						case StageInputKind::NumWorkgroups: // call-split wave index (CallSplit.h)
 						case StageInputKind::LocalInvocationId:
 						case StageInputKind::GlobalInvocationId:
 							if (component >= 3u) {
@@ -319,6 +321,9 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 					break;
 				case StageInputKind::BaseInstance:
 					AddInput(info, kind, 0, 1, "gl_BaseInstance");
+					break;
+				case StageInputKind::BaseVertex:
+					AddInput(info, kind, 0, 1, "gl_BaseVertex");
 					break;
 				case StageInputKind::InvocationId:
 					AddInput(info, kind, 0, 1, "gl_InvocationID");
@@ -485,6 +490,21 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	CollectBuiltinInputs(program, next);
 	CollectOutputs(program, input_info, next);
+	// KYTY_OBJPRIM_ID (based on Erlou93/KytyPS5-Yotei): the slot the hardware writes VGT_OBJECT_ID
+	// (+ the primitive index) to; the guest pixel shader does not export it.
+	if (program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
+	    input_info.pixel->HasObjprimOutput()) {
+		if (std::any_of(next.outputs.begin(), next.outputs.end(), [&](const auto& output) {
+			    return output.kind == StageOutputKind::Mrt &&
+			           output.location == input_info.pixel->objprim_slot;
+		    })) {
+			return Fail("ObjPrimID slot is also an exported MRT");
+		}
+		AddOutput(next, StageOutputKind::ObjPrimId, 0, input_info.pixel->objprim_slot, "out_objprim_id");
+		if (input_info.pixel->objprim_add_prim_id) {
+			AddInput(next, StageInputKind::PrimitiveId, 0, 1, "gl_PrimitiveID");
+		}
+	}
 	program.shader_info_complete = true;
 }
 

@@ -32,8 +32,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -141,7 +144,106 @@ bool CanRecycleImage(const vk::ImageCreateInfo& info) {
 	       info.initialLayout == vk::ImageLayout::eUndefined && !(info.flags & ~allowed_flags);
 }
 
+// KYTY_IMAGE_DESTROY_WORKER=1 (default off; TheCruZ/KytyPS5-GTA 6061bf2f): native images the pool
+// does not keep are destroyed by a worker thread in batches. Releasing a large render target's
+// memory takes 0.2 to 0.4 ms in the driver, on the thread that records the draws (RDR scales its
+// resolution every frame: ~6 such destroys per frame). An allocation that fails and the
+// allocator's destruction wait for the worker first, so no memory is held back.
+bool ImageDestroyWorkerEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_DESTROY_WORKER");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+class ImageGraveyard {
+public:
+	ImageGraveyard() = default;
+	~ImageGraveyard() {
+		Flush();
+		{
+			std::lock_guard lock(m_mutex);
+			m_stop = true;
+		}
+		m_wake.notify_one();
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+	ImageGraveyard(const ImageGraveyard&)            = delete;
+	ImageGraveyard& operator=(const ImageGraveyard&) = delete;
+
+	void Push(VmaAllocator allocator, VkImage image, VmaAllocation allocation) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (!m_thread.joinable()) {
+				m_thread = std::thread([this] { Run(); });
+			}
+			m_items.push_back({allocator, image, allocation});
+		}
+		m_wake.notify_one();
+	}
+
+	// Returns once every image pushed so far is destroyed.
+	void Flush() {
+		std::unique_lock lock(m_mutex);
+		m_idle.wait(lock, [this] { return m_items.empty() && !m_busy; });
+	}
+
+private:
+	struct Item {
+		VmaAllocator  allocator;
+		VkImage       image;
+		VmaAllocation allocation;
+	};
+
+	void Run() {
+		std::vector<Item> batch;
+		std::unique_lock  lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return m_stop || !m_items.empty(); });
+			if (m_items.empty()) {
+				return;
+			}
+			batch.swap(m_items);
+			m_busy = true;
+			lock.unlock();
+			for (const auto& item: batch) {
+				vmaDestroyImage(item.allocator, item.image, item.allocation);
+			}
+			batch.clear();
+			lock.lock();
+			m_busy = false;
+			m_idle.notify_all();
+		}
+	}
+
+	std::mutex              m_mutex;
+	std::condition_variable m_wake;
+	std::condition_variable m_idle;
+	std::vector<Item>       m_items;
+	bool                    m_busy = false;
+	bool                    m_stop = false;
+	std::thread             m_thread;
+};
+
+ImageGraveyard& Graveyard() {
+	static ImageGraveyard graveyard;
+	return graveyard;
+}
+
+void FlushImageGraveyard() {
+	if (ImageDestroyWorkerEnabled()) {
+		Graveyard().Flush();
+	}
+}
+
 void DestroyNativeImage(VmaAllocator allocator, vk::Image image, VmaAllocation allocation) {
+	if (ImageDestroyWorkerEnabled()) {
+		Graveyard().Push(allocator, image, allocation);
+		return;
+	}
 	Profiler::ScopedFrameWait timing(Profiler::FrameWait::NativeImageDestroy);
 	vmaDestroyImage(allocator, image, allocation);
 }
@@ -292,6 +394,19 @@ bool GraphicContext::CreateAllocator() {
 		}
 	}
 
+	// KYTY_VMA_BLOCK_MB=<n> (default unset: VMA's 256 MB; Sakura 45bc441ec via usa-ratt/
+	// KytyPS5-GT7): the size of the memory blocks VMA carves large heaps into. Smaller blocks leave
+	// less unused room inside them on a card short of video memory (64: 6.0 -> 4.35 GB at 1440p on
+	// a 6 GB card in the fork).
+	if (const char* value = std::getenv("KYTY_VMA_BLOCK_MB"); value != nullptr) {
+		const auto block_mb = std::strtoull(value, nullptr, 10);
+		if (block_mb != 0) {
+			info.preferredLargeHeapBlockSize = static_cast<VkDeviceSize>(block_mb) << 20u;
+			LOGF("KYTY_VMA_BLOCK_MB: VMA block size %" PRIu64 " MB\n",
+			     static_cast<uint64_t>(block_mb));
+		}
+	}
+
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
@@ -305,6 +420,7 @@ void GraphicContext::DestroyAllocator() {
 		return;
 	}
 	ClearRetiredImages();
+	FlushImageGraveyard(); // KYTY_IMAGE_DESTROY_WORKER
 	if (m_sparse_fence != nullptr) {
 		device.destroyFence(m_sparse_fence, nullptr);
 		m_sparse_fence = nullptr;
@@ -624,7 +740,7 @@ void GraphicContext::LogMemoryBudget() const {
 		return;
 	}
 
-	const auto& properties = GetPhysicalDeviceMemoryProperties();
+	const auto& properties = physical_device_memory_properties;
 	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);
 	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
@@ -671,6 +787,51 @@ void GraphicContext::ReportVramStats() {
 		                static_cast<uint32_t>(properties.memoryTypes[type].propertyFlags),
 		                ToMiB(static_cast<uint64_t>(stats.blockBytes)), stats.blockCount,
 		                ToMiB(static_cast<uint64_t>(stats.allocationBytes)), stats.allocationCount);
+	}
+	// Block census (from Erlou93/KytyPS5-Yotei v0.1.5 texture relocation, measurement only): VMA frees a
+	// block only when its last allocation goes, so a few residents can keep a nearly empty block. Per
+	// device-local, not host-visible memory type: blocks, those at least half empty (Erlou's relocation
+	// candidates) with their size, free space and allocations, and the free space of all blocks (their
+	// trigger: >= 1 GiB). Read from VMA's default block lists (no public API; as Erlou's CollectBlocks).
+	for (uint32_t type = 0; type < properties.memoryTypeCount; type++) {
+		const auto flags = properties.memoryTypes[type].propertyFlags;
+		if (!(flags & vk::MemoryPropertyFlagBits::eDeviceLocal) || (flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+			continue;
+		}
+		VmaBlockVector* vector = allocator->m_pBlockVectors[type];
+		if (vector == nullptr) {
+			continue;
+		}
+		uint64_t blocks = 0, size = 0, free = 0, empty_blocks = 0, half = 0, half_size = 0, half_free = 0,
+		         half_allocs = 0;
+		{
+			VmaMutexLockRead lock(vector->GetMutex(), allocator->m_UseMutex);
+			for (size_t i = 0; i < vector->GetBlockCount(); i++) {
+				const VmaBlockMetadata* metadata = vector->GetBlock(i)->m_pMetadata;
+				const uint64_t          bsize    = metadata->GetSize();
+				const uint64_t          bfree    = metadata->GetSumFreeSize();
+				const uint64_t          count    = metadata->GetAllocationCount();
+				blocks++;
+				size += bsize;
+				free += bfree;
+				if (count == 0) {
+					empty_blocks++;
+				} else if (bfree * 2u >= bsize) {
+					half++;
+					half_size += bsize;
+					half_free += bfree;
+					half_allocs += count;
+				}
+			}
+		}
+		if (blocks == 0) {
+			continue;
+		}
+		VramStats::Line("block census type %u: blocks=%llu (%.1f MiB) free=%.1f MiB empty_blocks=%llu | "
+		                ">=50%% empty: %llu blocks %.1f MiB, free %.1f MiB, %llu allocations",
+		                type, static_cast<unsigned long long>(blocks), ToMiB(size), ToMiB(free),
+		                static_cast<unsigned long long>(empty_blocks), static_cast<unsigned long long>(half),
+		                ToMiB(half_size), ToMiB(half_free), static_cast<unsigned long long>(half_allocs));
 	}
 	std::string kinds;
 	for (size_t index = 0; index < static_cast<size_t>(VramStats::Kind::Count); index++) {
@@ -825,6 +986,10 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		if (result == vk::Result::eErrorOutOfDeviceMemory && NativeImagePoolEnabled()) {
 			// Retained objects are optional. Release them before one allocation retry.
 			ClearRetiredImages();
+			FlushImageGraveyard(); // KYTY_IMAGE_DESTROY_WORKER
+			result = allocate();
+		} else if (result == vk::Result::eErrorOutOfDeviceMemory && ImageDestroyWorkerEnabled()) {
+			FlushImageGraveyard();
 			result = allocate();
 		}
 		if (result == vk::Result::eErrorOutOfDeviceMemory && ImageSystemMemoryFallbackEnabled()) {

@@ -1,8 +1,10 @@
 #include "graphics/shader/recompiler/CodegenFingerprint.h"
 
 #include "common/rendererBatch.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kytyCodegenVersion.h"
 
@@ -20,12 +22,12 @@ constexpr const char* kSwitches[] = {KYTY_CODEGEN_SWITCH_LIST nullptr};
 constexpr size_t      kSwitchCount = std::size(kSwitches) - 1;
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
-// Members: 38 bools, MadMode, PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer,
-// loop_guard_budget, loop_guard_shaders, dispatcher_cap, rt_node_budget, rt_function,
-// lds_limit_override.
+// Members: the bools and enums of both the Yotei/Insomniac and the GT7 lines (int22 merge), MadMode,
+// PsLiveExec, Wave32Clusters, LdsWaitcntBarrier, LdsDeviceBuffer, loop_guard_budget, loop_guard_shaders,
+// bda_force_shaders, dispatcher_cap, rt_node_budget, rt_function, lds_limit_override, call_loop_cap.
 // Add a new member to the fingerprint below, then update this size (a new bool can fill padding
 // and leave it).
-static_assert(sizeof(CodegenOptions) == 112,"CodegenOptions changed: update CodegenFingerprint");
+static_assert(sizeof(CodegenOptions) == 256,"CodegenOptions changed: update CodegenFingerprint");
 #endif
 
 class Bytes {
@@ -69,6 +71,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.fast_pkrtz ? 1u : 0u);
 	b.U8(options.single_f2i_saturation ? 1u : 0u);
 	b.U8(options.lod_stats_gate ? 1u : 0u);
+	b.U8(options.layer_clamp ? 1u : 0u);
 	b.U8(options.robust_buffer_loads ? 1u : 0u);
 	b.U8(options.readonly_buffers ? 1u : 0u);
 	b.U32(static_cast<uint32_t>(options.mad_mode));
@@ -84,8 +87,29 @@ std::vector<uint8_t> CodegenFingerprint() {
 	for (const auto hash: options.loop_guard_shaders) {
 		b.U64(hash);
 	}
+	if (!options.bda_force_shaders.empty()) {
+		b.Text("bda_force_shaders");
+		b.U32(static_cast<uint32_t>(options.bda_force_shaders.size()));
+		for (const auto hash: options.bda_force_shaders) {
+			b.U64(hash);
+		}
+	}
+	if (!options.indirect_format_stores_shaders.empty()) {
+		b.Text("indirect_format_stores_shaders");
+		b.U32(static_cast<uint32_t>(options.indirect_format_stores_shaders.size()));
+		for (const auto hash: options.indirect_format_stores_shaders) {
+			b.U64(hash);
+		}
+	}
 	b.U8(options.srt_variant_reads ? 1u : 0u);
+	b.U8(options.srt_image_reach ? 1u : 0u);
 	b.U8(options.mesh_indirect_params ? 1u : 0u);
+	if (options.bda_access_tags) {
+		b.Text("bda_access_tags"); // absent when off: fingerprints unchanged
+		if (options.bda_tags_gpu_count) {
+			b.Text("bda_tags_gpu_count");
+		}
+	}
 	b.U8(options.movrel_known_zeros ? 1u : 0u);
 	b.U8(options.movrel_switch ? 1u : 0u);
 	b.U8(options.uniform_lane_reads ? 1u : 0u);
@@ -96,6 +120,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U32(options.dispatcher_cap);
 	b.U8(options.ir_linear_uses ? 1u : 0u);
 	b.U8(options.fold_lane_masks ? 1u : 0u);
+	b.U8(options.vs_full_wave ? 1u : 0u);
 	b.U8(options.rt_stub ? 1u : 0u);
 	b.U8(options.rt_software ? 1u : 0u);
 	b.U32(options.rt_function);
@@ -104,6 +129,10 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(options.bda_store_log ? 1u : 0u);
 	b.U32(options.rt_node_budget);
 	b.U8(options.rt_node_stats ? 1u : 0u);
+	// Only when on, so the default fingerprint is unchanged.
+	if (options.rt_hw) {
+		b.U8(options.rt_hw_verify ? 3u : 1u);
+	}
 	b.U8(options.ps_helper_atomics_skip ? 1u : 0u);
 	b.U8(options.loop_guard_all ? 1u : 0u);
 	b.U8(options.volatile_loads ? 1u : 0u);
@@ -120,8 +149,241 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.branchless_lds) {
 		b.Text("branchless_lds");
 	}
+	if (options.indirect_coherent) {
+		b.Text("indirect_coherent");
+	}
+	if (options.buffer_pair_atomic) {
+		// The bound-V# pairs depend on the device (8-byte aligned bindings).
+		b.Text(Spirv::GetHostBufferPairAtomics() ? "buffer_pair_atomic" : "buffer_pair_atomic_bda");
+		// KYTY_BUFFER_PAIR_ATOMIC_HASHES limits it to some programs.
+		if (const char* hashes = std::getenv("KYTY_BUFFER_PAIR_ATOMIC_HASHES"); hashes != nullptr) {
+			b.Text(hashes);
+		}
+	}
+	if (options.indirect_format_compact) {
+		b.Text("indirect_format_compact");
+		if (const char* table = std::getenv("KYTY_INDIRECT_FORMAT_COMPACT_TABLE"); table != nullptr) b.Text(table);
+		if (const char* control = std::getenv("KYTY_INDIRECT_FORMAT_COMPACT_CONTROL"); control != nullptr) b.Text(control);
+	}
+	if (options.indirect_format_inline) {
+		b.Text("indirect_format_inline");
+	}
+	if (options.indirect_format_fast) {
+		b.Text("indirect_format_fast");
+		if (const char* fast = std::getenv("KYTY_INDIRECT_FORMAT_FAST"); fast != nullptr) b.Text(fast);
+	}
+	// KYTY_INDIRECT_FORMAT_INLINE_HASHES: these programs inline the full decoder.
+	if (const char* hashes = std::getenv("KYTY_INDIRECT_FORMAT_INLINE_HASHES"); hashes != nullptr) {
+		b.Text("indirect_format_inline_hashes");
+		b.Text(hashes);
+	}
+	// KYTY_INDIRECT_FORMAT_COUNT: the counter buffer's address is baked into the modules.
+	if (const char* count = std::getenv("KYTY_INDIRECT_FORMAT_COUNT"); count != nullptr && count[0] == '1') {
+		b.Text("indirect_format_count");
+		b.Text(std::to_string(Spirv::IndirectFormatCountAddress()));
+		// KYTY_INDIRECT_FORMAT_COMPARE: both decoders, mismatches counted (diagnostic).
+		if (const char* compare = std::getenv("KYTY_INDIRECT_FORMAT_COMPARE"); compare != nullptr && (compare[0] == '1' || compare[0] == '2')) {
+			b.Text("indirect_format_compare");
+			b.Text(compare);
+		}
+	}
+	// KYTY_COHERENT_LOAD_MODE / _ACQUIRE: coherent loads made otherwise than as plain loads.
+	if (const auto mode = Spirv::GetCoherentLoadMode(); mode != Spirv::CoherentLoadMode::Plain) {
+		b.Text("coherent_load");
+		b.Text(Spirv::CoherentLoadModeName(mode));
+	}
+	// KYTY_MESH_LAYER: mesh modules without their Layer output.
+	if (Spirv::GetHostMeshLayerDrop()) {
+		b.Text("mesh_layer_drop");
+	}
 	if (options.cfg_clone_exits) {
 		b.Text("cfg_clone_exits2"); // 2: MergeIgnoringReturnArms
+	}
+	if (options.indirect_format_d16) {
+		b.Text("indirect_format_d16_1");
+	}
+	if (options.drop_graphics_indirect_stores) {
+		b.Text("drop_graphics_indirect_stores1");
+	}
+	if (options.indirect_format_stores) {
+		b.Text("indirect_format_stores1");
+	}
+	if (options.graphics_bda_writes) {
+		b.Text("graphics_bda_writes1");
+	}
+	if (options.indirect_format_stores_log) {
+		b.Text("indirect_format_stores_log1");
+	}
+	if (options.r128_table_images) {
+		b.Text("r128_table_images1");
+	}
+	if (options.bounded_key_images) {
+		b.Text("bounded_key_images1");
+	}
+	if (options.null_buffer_share) {
+		b.Text("null_buffer_share1");
+	}
+	if (options.indirect_raw_outline) {
+		b.Text("indirect_raw_outline1");
+		if (options.huge_helper_outline) {
+			b.Text("huge_helper_outline1");
+		}
+	}
+	if (options.cfg_clone_regions) {
+		b.Text("cfg_clone_regions1");
+	}
+	if (options.heap_key_mask) {
+		b.Text("heap_key_mask");
+	}
+	if (options.wave64_active_zero) {
+		b.Text("wave64_active_zero");
+	}
+	if (options.lane2_share) {
+		b.Text("lane2_share");
+	}
+	if (options.known_bits_masks) {
+		b.Text("known_bits_masks");
+	}
+	if (options.gds_m0_base) {
+		b.Text("gds_m0_base");
+	}
+	if (options.lds_atomic_order) {
+		b.Text("lds_atomic_order");
+	}
+	if (options.split_lds_write_sync) {
+		b.Text("split_lds_write_sync");
+	}
+	if (options.storage_table_loose) {
+		b.Text("storage_table_loose");
+	}
+	if (options.sampled_table_reads) {
+		b.Text("sampled_table_reads");
+	}
+	if (options.scalar_load_groups) {
+		b.Text("scalar_load_groups");
+	}
+	if (options.srt_uniform) {
+		b.Text("srt_uniform");
+	}
+	if (options.null_image_keep_dim) {
+		b.Text("null_image_keep_dim");
+	}
+	if (options.storage_swizzle_canon) {
+		b.Text("storage_swizzle_canon");
+	}
+	if (options.raw_small_sint_storage) {
+		b.Text("raw_small_sint_storage");
+	}
+	if (options.point_integer_images) {
+		b.Text("point_integer_images");
+	}
+	if (options.pops_interlock) {
+		b.Text("pops_interlock");
+		b.U8(Spirv::GetHostFragmentInterlock() ? 1u : 0u);
+	}
+	if (options.format_missing_canonical) {
+		b.Text("format_missing_canonical");
+	}
+	if (options.indirect_format_all) {
+		b.Text("indirect_format_all");
+	}
+	if (options.format_store_dst_sel) {
+		b.Text("format_store_dst_sel");
+	}
+	if (options.barrier_acquire_stores) {
+		b.Text("barrier_acquire_stores");
+	}
+	if (options.image_glc_coherent) {
+		b.Text("image_glc_coherent");
+	}
+	if (options.buffer_oob_modes) {
+		b.Text("buffer_oob_modes");
+	}
+	if (options.implicit_lod_stages) {
+		b.Text("implicit_lod_stages");
+		b.U8(Spirv::GetHostComputeDerivativesLinear() ? 1u : 0u);
+	}
+	if (options.compare_sampler_split) {
+		b.Text("compare_sampler_split");
+	}
+	if (options.waterfall_active_leader) {
+		b.Text("waterfall_active_leader");
+	}
+	if (options.wave64_present_exec) {
+		b.Text("wave64_present_exec");
+	}
+	if (options.embedded_fetch_no_sgpr_offset) {
+		b.Text("embedded_fetch_no_sgpr_offset");
+	}
+	if (options.mov_no_float_mods) {
+		b.Text("mov_no_float_mods");
+	}
+	if (options.split_dpp_lane) {
+		b.Text("split_dpp_lane");
+	}
+	if (options.mov_int_mods) {
+		b.Text("mov_int_mods");
+	}
+	if (options.mad_flush) {
+		b.Text("mad_flush");
+	}
+	if (options.f16_exact_round) {
+		b.Text("f16_exact_round");
+	}
+	if (options.movrel_full_m0) {
+		b.Text("movrel_full_m0");
+	}
+	if (options.omod_zero) {
+		b.Text("omod_zero");
+	}
+	if (options.cvt_f32_f64_inf) {
+		b.Text("cvt_f32_f64_inf");
+	}
+	if (options.bfm_defined) {
+		b.Text("bfm_defined");
+	}
+	if (options.wave64_high_lanes) {
+		b.Text("wave64_high_lanes");
+	}
+	if (options.srgb8_decode) {
+		b.Text("srgb8_decode");
+		if (Prospero::Srgb8ViewActive()) {
+			b.Text("srgb8_view"); // KYTY_SRGB8_VIEW: 8 sRGB decoded by the sampler instead
+		}
+	}
+	if (options.depth_bits_read) {
+		b.Text("depth_bits_read");
+	}
+	if (options.bindless_3d_as_array) {
+		b.Text("bindless_3d_as_array");
+	}
+	if (options.runtime_images) {
+		b.Text("runtime_images");
+	}
+	if (options.runtime_int_images) {
+		b.Text("runtime_int_images");
+	}
+	if (options.bindless_strided) {
+		b.Text("bindless_strided");
+	}
+	if (options.bindless_samplers) {
+		b.Text("bindless_samplers");
+	}
+	if (options.workgroup_images) {
+		b.Text("workgroup_images");
+	}
+	if (options.table_key_bounds) {
+		b.Text("table_key_bounds");
+	}
+	if (options.selector_keys != 0u) {
+		b.Text("selector_keys");
+		b.U8(options.selector_keys);
+	}
+	if (options.native_wave64_branch) {
+		b.Text("native_wave64_branch");
+	}
+	if (options.sampler_reads_deferred) {
+		b.Text("sampler_reads_deferred");
 	}
 	if (options.wave64_warps) {
 		b.Text("wave64_warps");
@@ -132,6 +394,21 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.dcache_invalidate) {
 		b.Text("dcache_invalidate");
 	}
+	if (options.native_f16 && GetHostNativeHalf()) {
+		b.Text("native_f16");
+	}
+	if (options.f32_flush_host) {
+		b.Text("f32_flush_host");
+		// The self-test's op classes ("nvidia"); absent with all of them (=1), as before.
+		if (options.f32_flush_host_classes != F32FlushClassAll) {
+			b.Text("f32_flush_host_classes");
+			b.U8(options.f32_flush_host_classes);
+		}
+	}
+	if (options.coherent_glc_only != 0u) {
+		b.Text("coherent_glc_only");
+		b.U8(options.coherent_glc_only);
+	}
 	if (options.readfirstlane_exec_zero) {
 		b.Text("readfirstlane_exec_zero");
 	}
@@ -141,9 +418,76 @@ std::vector<uint8_t> CodegenFingerprint() {
 	if (options.float_profile == FloatProfile::Relaxed) {
 		b.Text("float_profile_relaxed");
 	}
+	if (options.flat_aperture_bvh) {
+		b.Text("flat_aperture_bvh");
+	}
+	if (options.storage_length_zero) {
+		b.Text("storage_length_zero_or");
+	}
+	if (options.vs_lane_wrap32 && options.wave32_clusters == Wave32Clusters::Off) {
+		b.Text("vs_lane_wrap32");
+	}
 	if (options.lane_local) {
 		b.Text("lane_local");
 		b.U8(GetHostComputeSubgroups32() ? 1u : 0u);
+		if (const char* nops = std::getenv("KYTY_LANE_LOCAL_NOPS"); nops != nullptr && nops[0] == '1') {
+			b.Text("lane_local_nops");
+		}
+	}
+	// Bindless images (ir/BindlessBindings.h): resource tracking may turn an indirect image the
+	// enumeration cannot cover into a bindless one.
+	if (IR::BindlessImagesEnabled()) {
+		b.Text("bindless_images");
+	}
+	if (options.lds_slots) {
+		b.Text("lds_slots");
+	}
+	if (options.float_store_clamp) {
+		b.Text("float_store_clamp");
+	}
+	if (options.vte_cntl) {
+		b.Text("vte_cntl");
+	}
+	if (options.snapshot_written_guard) {
+		b.Text("snapshot_written_guard");
+	}
+	if (options.tess_indexed) {
+		b.Text("tess_indexed");
+	}
+	if (options.robust_buffer_stores) {
+		b.Text("robust_buffer_stores");
+	}
+	if (options.relaxed_float) {
+		b.Text("relaxed_float");
+	}
+	if (options.tess_single_cp) {
+		b.Text("tess_single_cp");
+	}
+	if (options.int_mrt_outputs) {
+		b.Text("int_mrt_outputs");
+	}
+	if (options.ufloat_store_rtz) {
+		b.Text("ufloat_store_rtz");
+	}
+	if (options.fract_clamp) {
+		b.Text("fract_clamp");
+	}
+	if (options.ps_exec_words) {
+		b.Text("ps_exec_words");
+	}
+	if (options.denorm_flush_skip != 0u) {
+		b.Text("denorm_flush_skip");
+		b.U8(options.denorm_flush_skip);
+	}
+	if (options.call_loop_cap != 0u) {
+		b.Text("call_loop_cap");
+		b.U32(options.call_loop_cap);
+	}
+	if (!options.call_loops) {
+		b.Text("call_loops_off");
+	}
+	if (options.call_waterfall_clear) {
+		b.Text("call_waterfall_clear");
 	}
 
 	// Host device state the emitter reads (set once by the device layer).
@@ -161,6 +505,9 @@ std::vector<uint8_t> CodegenFingerprint() {
 	const auto shader_clock = Spirv::GetHostShaderClock();
 	b.U8(static_cast<uint8_t>(shader_clock.scope));
 	b.U32(static_cast<uint32_t>(shader_clock.shift));
+	if (shader_clock.divisor > 1u) {
+		b.U32(shader_clock.divisor); // KYTY_MEMREALTIME_EXACT (absent otherwise: fingerprints unchanged)
+	}
 	const auto wave_clusters = Spirv::GetHostWaveClusters();
 	b.U8(wave_clusters.vertex ? 1u : 0u);
 	b.U8(wave_clusters.pixel ? 1u : 0u);
@@ -171,6 +518,7 @@ std::vector<uint8_t> CodegenFingerprint() {
 	b.U8(Common::RendererBatchEnabled() ? 1u : 0u);
 	b.U64(BufferCache::CACHING_PAGEBITS);
 	b.U64(BufferCache::CACHING_PAGESIZE);
+	b.U64(BufferCache::BDA_STORE_LOG_ENTRIES); // LogBdaStore compares the log's count with it
 
 	b.U32(static_cast<uint32_t>(kSwitchCount));
 	for (size_t i = 0; i < kSwitchCount; ++i) {

@@ -607,6 +607,98 @@ void CheckShortF32Helpers(VulkanHarness *vulkan) {
               nan_tests(legacy_run.spirv), nan_tests(short_run.spirv));
 }
 
+// KYTY_SHORT_F32_HELPERS with NaN inputs through every path that takes its NaN test: the legacy
+// min3/max3/med3, the emitter's float-to-int layer (KYTY_SINGLE_F2I_SATURATION=0) and buffer float
+// atomics (the compare-and-swap replacement). Every triple of special values (quiet, signaling and
+// negative NaNs included); the min/max results must also equal the CPU model, the atomics their
+// fixed expected memory and return values.
+void CheckShortF32HelpersNanPaths(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenShortF32HelpersNan";
+  using O = ShaderOpcode;
+  const auto &special = SpecialF32();
+  std::vector<std::vector<u32>> inputs(3);
+  for (const auto a : special) {
+    for (const auto b : special) {
+      for (const auto c : special) {
+        inputs[0].push_back(a);
+        inputs[1].push_back(b);
+        inputs[2].push_back(c);
+      }
+    }
+  }
+  const auto bulk = MakeBulkCase(
+      name, 3, 6, inputs,
+      [](std::vector<u32> *code) {
+        AppendVop3(code, 0x151, 10, Vgpr(2), Vgpr(3), Vgpr(4)); // v_min3_f32
+        AppendVop3(code, 0x154, 11, Vgpr(2), Vgpr(3), Vgpr(4)); // v_max3_f32
+        AppendVop3(code, 0x157, 12, Vgpr(2), Vgpr(3), Vgpr(4)); // v_med3_f32
+        AppendVop3(code, 0x157, 13, Vgpr(4), Vgpr(2), Vgpr(3)); // v_med3_f32 (rotated)
+        code->push_back(EncodeVop1(0x08, 14, Vgpr(2)));         // v_cvt_i32_f32
+        code->push_back(EncodeVop1(0x07, 15, Vgpr(3)));         // v_cvt_u32_f32
+      },
+      {O::V_MIN3_F32, O::V_MAX3_F32, O::V_MED3_F32, O::V_CVT_I32_F32, O::V_CVT_U32_F32});
+  CodegenOptions legacy = GetCodegenOptions();
+  legacy.fast_float_min_max = false;
+  legacy.single_f2i_saturation = false;
+  legacy.short_f32_helpers = false;
+  CodegenOptions shorter = legacy;
+  shorter.short_f32_helpers = true;
+  const auto short_run = RunBulk(vulkan, bulk, shorter);
+  const auto legacy_run = RunBulk(vulkan, bulk, legacy);
+  const auto nan = [](u32 bits) { return (bits & 0x7fffffffu) > 0x7f800000u; };
+  const auto cvt = [&](u32 bits, bool is_signed) -> u32 {
+    if (nan(bits)) {
+      return 0u;
+    }
+    const double f = std::bit_cast<float>(bits);
+    if (is_signed) {
+      return f <= -2147483648.0  ? 0x80000000u
+             : f >= 2147483648.0 ? 0x7fffffffu
+                                 : static_cast<u32>(static_cast<int32_t>(std::trunc(f)));
+    }
+    return f <= 0.0 ? 0u : f >= 4294967296.0 ? 0xffffffffu : static_cast<u32>(std::trunc(f));
+  };
+  static const char *const names[] = {"min3", "max3", "med3", "med3(c,a,b)", "cvt_i32",
+                                      "cvt_u32"};
+  CompareBulk(name, bulk, short_run, legacy_run,
+              [&](u32 o, u32 e) -> u32 {
+                const auto a = inputs[0][e], b = inputs[1][e], c = inputs[2][e];
+                switch (o) {
+                case 0: return RefMinMaxF32(RefMinMaxF32(a, b, false), c, false);
+                case 1: return RefMinMaxF32(RefMinMaxF32(a, b, true), c, true);
+                case 2: return RefMedTriF32(a, b, c);
+                case 3: return RefMedTriF32(c, a, b);
+                case 4: return cvt(a, true);
+                default: return cvt(b, false);
+                }
+              },
+              names);
+  const auto nan_tests = [](const std::vector<u32> &spirv) { return CountSpirv(spirv, "OpIsNan"); };
+  Require(name, "OpIsNan count (ALU)", nan_tests(short_run.spirv) > nan_tests(legacy_run.spirv),
+          "KYTY_SHORT_F32_HELPERS did not classify the min/max/med3/cvt NaNs with OpIsNan");
+
+  // Buffer float atomics: old and incoming NaNs (quiet and signaling), infinities, signed zeros.
+  size_t atomic_short_nan = 0;
+  size_t atomic_legacy_nan = 0;
+  for (const auto &test : {BufferAtomicFMinSpecialValues(), BufferAtomicFMaxSpecialValues()}) {
+    for (const bool use_short : {true, false}) {
+      CodegenOptions options = GetCodegenOptions();
+      options.short_f32_helpers = use_short;
+      ScopedCodegenOptions scope(options);
+      std::vector<u32> spirv;
+      const auto words = RunCollect(vulkan, test, test.expected.size(), &spirv);
+      RequireEqualWords(name, use_short ? "atomic readback (short)" : "atomic readback (legacy)",
+                        test.expected, words);
+      (use_short ? atomic_short_nan : atomic_legacy_nan) += nan_tests(spirv);
+    }
+  }
+  Require(name, "OpIsNan count (atomics)", atomic_short_nan > atomic_legacy_nan,
+          "KYTY_SHORT_F32_HELPERS did not classify the atomic NaNs with OpIsNan");
+  std::printf("[codegen] %-32s ok (%u triples, OpIsNan %zu -> %zu; atomics OpIsNan %zu -> %zu)\n",
+              name, bulk.count, nan_tests(legacy_run.spirv), nan_tests(short_run.spirv),
+              atomic_legacy_nan, atomic_short_nan);
+}
+
 // med3/min/max with constant operands (the clamp idiom): x from the special set and random bits.
 void CheckFloatClampConstants(VulkanHarness *vulkan) {
   constexpr const char *name = "CodegenFloatClampConstants";
@@ -1259,8 +1351,312 @@ void CheckMadModes(VulkanHarness *vulkan) {
       }
     }
   }
+  {
+    // KYTY_MAD_FLUSH on normal operands: still round(round(a*b)+c), a denormal sum flushed.
+    CodegenOptions options = GetCodegenOptions();
+    options.mad_mode = ShaderRecompiler::MadMode::Exact;
+    options.mad_flush = true;
+    const auto run = RunBulk(vulkan, bulk, options);
+    for (u32 o = 0; o < 4u; o++) {
+      const auto out = BulkOutput(bulk, run.words, o);
+      for (u32 e = 0; e < bulk.count; e++) {
+        auto expected = reference(o, e, false);
+        if ((expected & 0x7f800000u) == 0u) {
+          expected &= 0x80000000u;
+        }
+        if (out[e] != expected) {
+          Fail(name, names[o], "KYTY_MAD_FLUSH element " + std::to_string(e) + ": got " +
+                                   Hex(out[e]) + ", expected " + Hex(expected));
+        }
+      }
+    }
+  }
   std::printf("[codegen] %-32s ok (%u elements, %zu where fused and unfused differ)\n", name,
               bulk.count, differing);
+}
+
+// KYTY_WAVE64_HIGH_LANES: a wave64 vertex shader (32-wide host subgroups, no link between them)
+// spills an SGPR to v13 lane 40 and reads it back, and reads lane 41 that nothing wrote. With the
+// switch both reads are resolved at compile time (the spilled value, and 0), so no subgroup
+// shuffle of a lane >= 32 remains; without it the reads stay shuffles.
+void CheckWave64HighLanes() {
+  constexpr const char *name = "CodegenWave64HighLanes";
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 10, 0x40490fdbu);
+  AppendVop3(&code, 0x361, 13, 10, InlineU32(40));   // v_writelane_b32 v13, s10, 40
+  AppendVop3(&code, 0x360, 11, Vgpr(13), InlineU32(40)); // v_readlane_b32 s11, v13, 40
+  AppendVop3(&code, 0x360, 12, Vgpr(13), InlineU32(41)); // v_readlane_b32 s12, v13, 41
+  code.push_back(EncodeVop1(0x01, 4, 11));            // v_mov_b32 v4, s11
+  code.push_back(EncodeVop1(0x01, 5, 12));            // v_mov_b32 v5, s12
+  code.push_back(EncodeExp0(12, 0xf, true));          // exp pos0 v4, v5, v4, v5 done
+  code.push_back(EncodeExp1(4, 5, 4, 5));
+  AppendEnd(&code);
+  const auto compile = [&](bool enabled) {
+    CodegenOptions options = GetCodegenOptions();
+    options.wave64_high_lanes = enabled;
+    ScopedCodegenOptions scope(options);
+    std::array<u32, 16> user_data{};
+    ShaderVertexInputInfo vertex;
+    ShaderRecompiler::CompileOptions compile_options;
+    compile_options.stage = ShaderType::Vertex;
+    compile_options.wave_size = 64;
+    compile_options.user_data = user_data;
+    compile_options.input_info.vertex = &vertex;
+    auto translated = ShaderRecompiler::TranslateProgram(code, compile_options);
+    auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = compile_options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(code.data()),
+    };
+    Require(name, "resource materialization",
+            ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources,
+                                                       specialization),
+            "vertex resources could not be materialized");
+    auto result = ShaderRecompiler::CompileProgram(std::move(translated), compile_options,
+                                                   specialization);
+    ValidateSpirv(name, result.spirv);
+    return result.spirv;
+  };
+  const auto on = compile(true);
+  const auto off = compile(false);
+  const auto on_shuffles = CountSpirv(on, "OpGroupNonUniformShuffle ");
+  const auto off_shuffles = CountSpirv(off, "OpGroupNonUniformShuffle ");
+  Require(name, "high-lane reads resolved", on_shuffles == 0u,
+          "KYTY_WAVE64_HIGH_LANES left " + std::to_string(on_shuffles) + " shuffles");
+  std::printf("[codegen] %-32s ok (switch off: %zu shuffles)\n", name, off_shuffles);
+}
+
+// The f16 bits of s + e (|e| <= ulp(s) / 2, both exact), rounded once to nearest even; f16
+// subnormals kept, overflow to INF. Reference for KYTY_F16_EXACT_ROUND.
+u32 RoundPairToF16(double s, double e) {
+  if (std::isnan(s)) {
+    return 0x7e00u;
+  }
+  const u32 sign = std::signbit(s) ? 0x8000u : 0u;
+  if (std::isinf(s)) {
+    return sign | 0x7c00u;
+  }
+  if (sign != 0u) {
+    s = -s;
+    e = -e;
+  }
+  if (s == 0.0) {
+    return sign;
+  }
+  int exponent = 0;
+  (void)std::frexp(s, &exponent); // s in [2^(exponent-1), 2^exponent)
+  const int ulp_exp = s < std::ldexp(1.0, -14) ? -24 : exponent - 11;
+  const double ulp = std::ldexp(1.0, ulp_exp);
+  const double low = std::floor(s / ulp) * ulp;
+  const double d = (s - low) - ulp / 2.0;
+  const int side = d != 0.0 ? (d > 0.0 ? 1 : -1) : (e > 0.0 ? 1 : (e < 0.0 ? -1 : 0));
+  auto units = static_cast<uint64_t>(low / ulp);
+  if (side > 0 || (side == 0 && (units & 1u) != 0u)) {
+    units++;
+  }
+  const double value = static_cast<double>(units) * ulp;
+  if (value >= 65536.0) {
+    return sign | 0x7c00u;
+  }
+  if (value == 0.0) {
+    return sign;
+  }
+  if (value < std::ldexp(1.0, -14)) {
+    return sign | static_cast<u32>(units);
+  }
+  int vexp = 0;
+  const double mant = std::frexp(value, &vexp); // [0.5, 1)
+  const auto fraction = static_cast<u32>((mant * 2.0 - 1.0) * 1024.0);
+  return sign | (static_cast<u32>(vexp - 1 + 15) << 10u) | fraction;
+}
+
+u32 F16BitsToF32Bits(u32 h) {
+  const u32 sign = (h & 0x8000u) << 16u;
+  const u32 exp = (h >> 10u) & 0x1fu;
+  const u32 frac = h & 0x3ffu;
+  if (exp == 0x1fu) {
+    return sign | 0x7f800000u | (frac << 13u) | (frac != 0u ? 0x400000u : 0u);
+  }
+  if (exp == 0u) {
+    const float magnitude = std::ldexp(static_cast<float>(frac), -24);
+    return sign | std::bit_cast<u32>(magnitude);
+  }
+  return sign | ((exp + 112u) << 23u) | (frac << 13u);
+}
+
+// KYTY_F16_EXACT_ROUND: V_CVT_F16_F32 rounds to nearest even (ties, subnormals, overflow to INF);
+// V_CVT_F16_F32 then V_CVT_F32_F16 quantises (a host that folds the pair keeps f32 precision);
+// V_FMA_MIXLO_F16 with f32 sources rounds a*b+c once (every fourth element is built to land next
+// to an f16 tie, where an f32 Fma rounded again to f16 can differ).
+void CheckF16ExactRound(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenF16ExactRound";
+  using O = ShaderOpcode;
+  std::vector<std::vector<u32>> inputs(3);
+  uint64_t seed = 0x2718281828459045ull;
+  const auto next = [&]() {
+    seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+    return static_cast<u32>(seed >> 32u);
+  };
+  while (inputs[0].size() < 16384u) {
+    const float a = std::bit_cast<float>(F16BitsToF32Bits(0x3c00u + next() % 0x0800u));
+    const float b = std::bit_cast<float>(F16BitsToF32Bits(0x3800u + next() % 0x0800u)) *
+                    (1.0f + std::ldexp(static_cast<float>(next() % 4096u), -23));
+    inputs[1].push_back(std::bit_cast<u32>(a));
+    inputs[2].push_back(std::bit_cast<u32>(b));
+    if (inputs[0].size() % 4u == 3u) {
+      // c = f32(tie - a*b): the exact sum sits next to an f16 tie.
+      const double tie = static_cast<double>(std::bit_cast<float>(
+                             F16BitsToF32Bits(0x3c00u + next() % 0x0400u))) +
+                         std::ldexp(1.0, -11);
+      const float c = static_cast<float>(tie - static_cast<double>(a) * static_cast<double>(b));
+      inputs[0].push_back(std::bit_cast<u32>(c));
+      continue;
+    }
+    // A random finite f16 h, then a value at, next to or past the tie above it, as f32.
+    const u32 h = next() % 0x7c00u;
+    const u32 base = F16BitsToF32Bits(h);
+    const u32 tie_step = h >= 0x400u ? 0x1000u : 0u;
+    u32 x = base;
+    switch (next() % 6u) {
+    case 0: x = base + tie_step; break;
+    case 1: x = base + tie_step + 1u; break;
+    case 2: x = base + (tie_step != 0u ? tie_step - 1u : 0u); break;
+    case 3: x = next() & 0x7fffffffu; break;
+    case 4: x = 0x477fe000u + (next() & 0x3fffu); break;
+    default: x = (next() & 0x00ffffffu) | 0x33000000u; break;
+    }
+    if ((next() & 1u) != 0u) {
+      x |= 0x80000000u;
+    }
+    inputs[0].push_back(x);
+  }
+  const auto bulk = MakeBulkCase(
+      name, 3, 3, inputs,
+      [](std::vector<u32> *code) {
+        AppendVMovU32(code, 10, 0u);
+        code->push_back(EncodeVop1(0x0a, 10, Vgpr(2)));         // v_cvt_f16_f32 v10, v2
+        code->push_back(EncodeVop1(0x0a, 11, Vgpr(2)));         // v_cvt_f16_f32 v11, v2
+        code->push_back(EncodeVop1(0x0b, 11, Vgpr(11)));        // v_cvt_f32_f16 v11, v11
+        AppendVMovU32(code, 12, 0u);
+        AppendVop3p(code, 0x21, 12, Vgpr(3), Vgpr(4), Vgpr(2)); // v_fma_mixlo_f16 v12, v3, v4, v2
+      },
+      {O::V_MOV_B32, O::V_CVT_F16_F32, O::V_CVT_F32_F16, O::V_MAD_MIXLO_F16});
+  CodegenOptions options = GetCodegenOptions();
+  options.f16_exact_round = true;
+  options.native_f16 = false;
+  const auto run = RunBulk(vulkan, bulk, options);
+  options.f16_exact_round = false;
+  const auto legacy = RunBulk(vulkan, bulk, options);
+  const auto out_cvt = BulkOutput(bulk, run.words, 0);
+  const auto out_rt = BulkOutput(bulk, run.words, 1);
+  const auto out_mix = BulkOutput(bulk, run.words, 2);
+  const auto old_cvt = BulkOutput(bulk, legacy.words, 0);
+  const auto old_rt = BulkOutput(bulk, legacy.words, 1);
+  const auto old_mix = BulkOutput(bulk, legacy.words, 2);
+  size_t legacy_cvt = 0;
+  size_t legacy_round_trip = 0;
+  size_t legacy_mix = 0;
+  size_t mix_checked = 0;
+  for (u32 e = 0; e < bulk.count; e++) {
+    const u32 x = inputs[0][e];
+    const float xf = std::bit_cast<float>(x);
+    const bool denormal = (x & 0x7f800000u) == 0u;
+    const bool nan = std::isnan(xf);
+    const u32 half =
+        nan ? 0x7e00u | ((x >> 13u) & 0x3ffu) | ((x >> 16u) & 0x8000u)
+            : RoundPairToF16(denormal ? (std::signbit(xf) ? -0.0 : 0.0) : static_cast<double>(xf),
+                             0.0);
+    const u32 trip = F16BitsToF32Bits(half);
+    const auto cvt = out_cvt[e];
+    const auto rt = out_rt[e];
+    if (cvt != half) {
+      Fail(name, "v_cvt_f16_f32",
+           "element " + std::to_string(e) + " (" + Hex(x) + "): got " + Hex(cvt) +
+               ", expected " + Hex(half));
+    }
+    if (!nan && rt != trip) {
+      Fail(name, "cvt round trip",
+           "element " + std::to_string(e) + " (" + Hex(x) + "): got " + Hex(rt) +
+               ", expected " + Hex(trip));
+    }
+    legacy_cvt += old_cvt[e] != half ? 1u : 0u;
+    legacy_round_trip += !nan && old_rt[e] != trip ? 1u : 0u;
+    if (nan || std::isinf(xf) || denormal) {
+      continue;
+    }
+    const double a = std::bit_cast<float>(inputs[1][e]);
+    const double b = std::bit_cast<float>(inputs[2][e]);
+    const double c = xf;
+    const double p = a * b; // exact: two 24-bit significands
+    const double s2 = p + c;
+    const double bb = s2 - p;
+    const double err = (p - (s2 - bb)) + (c - bb);
+    const u32 mix = RoundPairToF16(s2, err);
+    const auto got = out_mix[e];
+    mix_checked++;
+    if ((got & 0xffffu) != mix) {
+      Fail(name, "v_fma_mixlo_f16",
+           "element " + std::to_string(e) + ": got " + Hex(got) + ", expected " + Hex(mix));
+    }
+    legacy_mix += (old_mix[e] & 0xffffu) != mix ? 1u : 0u;
+  }
+  std::printf("[codegen] %-32s ok (%u elements, %zu mix; switch off differs: cvt %zu, round trip "
+              "%zu, mix %zu)\n",
+              name, bulk.count, mix_checked, legacy_cvt, legacy_round_trip, legacy_mix);
+}
+
+// RDNA2 ISA check small items, each with its switch on and off: S_BFM_B32 with offset + count > 32
+// (KYTY_BFM_DEFINED), OMOD of a -0 result (KYTY_OMOD_ZERO), V_CVT_F32_F64 overflow
+// (KYTY_CVT_F32_F64_INF), and V_MOVRELS/V_MOVRELD with M0 = 257 (KYTY_MOVREL_FULL_M0: out of range,
+// so the source reads v0 and the destination is not written; the legacy M0[7:0] = 1).
+void CheckIsaSmallFixes(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenIsaSmallFixes";
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  code.push_back(EncodeSop2(0x24, 10, InlineU32(20), InlineU32(16))); // s_bfm_b32 s10, 20, 16
+  AppendVop3(&code, 0x108, 14, 128, 243, 0, 0, 0, false, 1);        // v_mul_f32 v14, 0, -1.0 mul:2
+  AppendVMovU32(&code, 16, 0u);
+  AppendVMovU32(&code, 17, 0x7e300000u);                             // v[16:17] = 2^996
+  code.push_back(EncodeVop1(0x0f, 15, Vgpr(16)));                    // v_cvt_f32_f64 v15, v[16:17]
+  AppendVMovU32(&code, 2, 0x22u);
+  AppendVMovU32(&code, 3, 0x33u);
+  AppendVMovU32(&code, 4, 0x44u);
+  AppendVMovU32(&code, 5, 0x55u);
+  AppendVMovU32(&code, 6, 0x66u);
+  AppendSMovLiteral(&code, 124, 257u);                                // s_mov_b32 m0, 257
+  code.push_back(EncodeVop1(0x43, 20, Vgpr(2)));                     // v_movrels_b32 v20, v2
+  code.push_back(EncodeVop1(0x42, 4, Vgpr(6)));                      // v_movreld_b32 v4, v6
+  AppendStoreSgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 14, 1);
+  AppendStoreVgpr(&code, 15, 2);
+  AppendStoreVgpr(&code, 20, 3);
+  AppendStoreVgpr(&code, 5, 4);
+  AppendEnd(&code);
+  test.initial.assign(5, 0xdeadbeefu);
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  const auto run = [&](bool enabled) {
+    CodegenOptions options = GetCodegenOptions();
+    options.bfm_defined = enabled;
+    options.omod_zero = enabled;
+    options.cvt_f32_f64_inf = enabled;
+    options.movrel_full_m0 = enabled;
+    ScopedCodegenOptions scope(options);
+    return RunCollect(vulkan, test, test.initial.size());
+  };
+  const auto on = run(true);
+  const auto off = run(false);
+  const std::vector<u32> expected = {0xffff0000u, 0x00000000u, 0x7f800000u, 0x00000000u, 0x55u};
+  RequireEqualWords(name, "switches on", expected, on);
+  std::printf("[codegen] %-32s ok (off: bfm %08x, omod %08x, cvt %08x, movrels %08x, movreld "
+              "%08x)\n",
+              name, off[0], off[1], off[2], off[3], off[4]);
 }
 
 // A vertex shader with one MAD feeding the position and one feeding a parameter: which of them
@@ -1412,6 +1808,108 @@ void CheckInterpolationModes() {
   std::printf("[codegen] %-32s ok\n", name);
 }
 
+// KYTY_LDS_SLOTS: a pixel shader whose LDS accesses are all dwords at (LaneId << 2) + c (the
+// guest compiler's per-lane VGPR spill) keeps one Function variable per element offset instead of
+// the dynamically indexed function-scope array; any other access keeps the array.
+void CheckLdsSlots() {
+  constexpr const char *name = "CodegenLdsSlots";
+  const auto build = [](bool foreign_address) {
+    std::vector<u32> code;
+    code.push_back(EncodeVop1(0x01, 4, InlineU32(0)));       // v_mov_b32 v4, 0
+    code.push_back(EncodeVop2(0x23, 5, 193u, 4));            // v_mbcnt_lo_u32_b32 v5, -1, v4
+    code.push_back(EncodeVop2(0x24, 6, 193u, 5));            // v_mbcnt_hi_u32_b32 v6, -1, v5
+    code.push_back(EncodeVop2(0x1a, 7, InlineU32(2), 6));    // v_lshlrev_b32 v7, 2, v6
+    code.push_back(EncodeDs0(0x0d, 0));                      // ds_write_b32 v7, v0
+    code.push_back(EncodeDs1(0, 0, 7));
+    code.push_back(EncodeDs0(0x0d, 256));                    // ds_write_b32 v7, v1 offset:256
+    code.push_back(EncodeDs1(0, 1, 7));
+    if (foreign_address) {
+      // An address that is not the lane's own: ds_write_b32 v4(=0), v1.
+      code.push_back(EncodeDs0(0x0d, 0));
+      code.push_back(EncodeDs1(0, 1, 4));
+    }
+    code.push_back(EncodeVop2(0x03, 0, Vgpr(0), 1));         // v_add_f32 v0, v0, v1
+    code.push_back(EncodeDs0(0x36, 256));                    // ds_read_b32 v10, v7 offset:256
+    code.push_back(EncodeDs1(10, 0, 7));
+    code.push_back(EncodeDs0(0x36, 0));                      // ds_read_b32 v11, v7
+    code.push_back(EncodeDs1(11, 0, 7));
+    code.push_back(EncodeVop1(0x01, 12, InlineU32(0)));
+    code.push_back(EncodeVop1(0x01, 13, InlineU32(0)));
+    code.push_back(EncodeExp0(0, 0xf, true, false, true));
+    code.push_back(EncodeExp1(10, 11, 12, 13));
+    AppendEnd(&code);
+    return code;
+  };
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 1;
+  pixel.interpolator_settings[0] = 0;
+  pixel.ps_perspective_center_vgpr = 0;
+  pixel.ps_system_input_base = 2;
+  pixel.lds_size_dwords = 1024;
+  struct Counts {
+    size_t slots, array;
+  };
+  const auto compile = [&](bool slots, bool foreign) {
+    CodegenOptions options = GetCodegenOptions();
+    options.lds_slots = slots;
+    ScopedCodegenOptions scope(options);
+    const auto spirv = CompilePixelShader(name, build(foreign), pixel);
+    return Counts{CountSpirv(spirv, "\"lds_slot_"), CountSpirv(spirv, "\"lds_dwords\"")};
+  };
+  const auto on = compile(true, false);
+  const auto off = compile(false, false);
+  const auto foreign = compile(true, true);
+  Require(name, "own-lane accesses take the slots", on.slots == 2u && on.array == 0u,
+          "slots " + std::to_string(on.slots) + ", array " + std::to_string(on.array));
+  Require(name, "switch off keeps the array", off.slots == 0u && off.array == 1u,
+          "slots " + std::to_string(off.slots) + ", array " + std::to_string(off.array));
+  Require(name, "a foreign address keeps the array", foreign.slots == 0u && foreign.array == 1u,
+          "slots " + std::to_string(foreign.slots) + ", array " + std::to_string(foreign.array));
+  std::printf("[codegen] %-32s ok\n", name);
+}
+
+// KYTY_PS_FLUSH=off: a pixel shader's transcendental inputs are not flushed in the shader (no
+// flush sequence emitted); the default keeps them.
+void CheckDenormFlushSkip() {
+  constexpr const char *name = "CodegenDenormFlushSkip";
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x2a, 10, Vgpr(0)));             // v_rcp_f32 v10, v0
+  code.push_back(EncodeVop1(0x2e, 11, Vgpr(0)));             // v_rsq_f32 v11, v0
+  code.push_back(EncodeVop1(0x01, 12, InlineU32(0)));
+  code.push_back(EncodeVop1(0x01, 13, InlineU32(0)));
+  code.push_back(EncodeExp0(0, 0xf, true, false, true));
+  code.push_back(EncodeExp1(10, 11, 12, 13));
+  AppendEnd(&code);
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 1;
+  pixel.interpolator_settings[0] = 0;
+  pixel.ps_perspective_center_vgpr = 0;
+  pixel.ps_system_input_base = 2;
+  const auto saved = ShaderRecompiler::Spirv::GetHostFloatControls();
+  auto controls = saved;
+  controls.denorm_flush_f32 = false;
+  ShaderRecompiler::Spirv::SetHostFloatControls(controls);
+  const auto flushes = [&](uint8_t skip) {
+    CodegenOptions options = GetCodegenOptions();
+    options.denorm_flush_skip = skip;
+    options.host_ftz_inputs = false;
+    ScopedCodegenOptions scope(options);
+    const auto before = ShaderRecompiler::Spirv::EmittedDenormFlushes(0);
+    (void)CompilePixelShader(name, code, pixel);
+    return ShaderRecompiler::Spirv::EmittedDenormFlushes(0) - before;
+  };
+  const auto exact = flushes(0);
+  const auto skipped = flushes(ShaderRecompiler::DenormFlushSkipPixel);
+  const auto compute_only = flushes(ShaderRecompiler::DenormFlushSkipCompute);
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved);
+  Require(name, "default flushes", exact >= 2u, "flushes " + std::to_string(exact));
+  Require(name, "KYTY_PS_FLUSH=off", skipped == 0u, "flushes " + std::to_string(skipped));
+  Require(name, "KYTY_CS_FLUSH=off leaves pixel shaders", compute_only == exact,
+          "flushes " + std::to_string(compute_only) + " vs " + std::to_string(exact));
+  std::printf("[codegen] %-32s ok (%llu flushes by default)\n", name,
+              static_cast<unsigned long long>(exact));
+}
+
 // V_RCP/RSQ/SQRT/EXP/LOG_F32 flush denormal inputs to zeros of the same sign ("denormals are
 // flushed"; rcp(-0) = -INF, sqrt(-0) = -0). With DenormFlushToZero 32 declared, the shader-side
 // flush is left to the host (KYTY_HOST_FTZ_INPUTS); both variants must agree bit for bit, and
@@ -1479,6 +1977,378 @@ void CheckTranscendentalDenormInputs(VulkanHarness *vulkan) {
   std::printf("[codegen] %-32s ok (%u elements, %zu denormal, host FTZ %s, OpULessThan %zu -> %zu)\n",
               name, bulk.count, checked, controls.denorm_flush_f32 ? "declared" : "unavailable",
               flushes(slow.spirv), flushes(fast.spirv));
+}
+
+// KYTY_F32_FLUSH_HOST=nvidia start-up self-test (recompiler/F32FlushSelfTest.h,
+// presentation/window/f32FlushSelfTest.cpp) on this device: no module with the switch off; the
+// module validates, has the float modes the emitter declares here and the host-flush forms; the
+// shader's reference equals the IEEE model; on an NVIDIA device the job passes, and the forced
+// mismatch (KYTY_F32_FLUSH_SELFTEST=fail) fails it with that one result.
+void CheckF32FlushSelfTest(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenF32FlushSelfTest";
+  namespace F = ShaderRecompiler::FlushSelfTest;
+  const auto saved = ShaderRecompiler::Spirv::GetHostFloatControls();
+  const auto controls = vulkan->DeviceFloatControls();
+  ShaderRecompiler::Spirv::SetHostFloatControls(controls);
+  CodegenOptions off = GetCodegenOptions();
+  off.f32_flush_host = false;
+  {
+    ScopedCodegenOptions scope(off);
+    std::string error;
+    const auto none = F::EmitModule(&error);
+    Require(name, "no module with the switch off", none.empty() && !error.empty(), error);
+  }
+  CodegenOptions on = off;
+  on.f32_flush_host = true;
+  on.f32_flush_host_classes = ShaderRecompiler::F32FlushClassAll;
+  // The emitter's own flush switches must not change the module (its reference flush is its own).
+  on.denorm_flush_skip = ShaderRecompiler::DenormFlushSkipCompute;
+  ScopedCodegenOptions scope(on);
+  std::string error;
+  const auto module = F::EmitModule(&error);
+  Require(name, "module", !module.empty(), error);
+  {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string messages;
+    tools.SetMessageConsumer([&](spv_message_level_t, const char *, const spv_position_t &,
+                                 const char *message) { messages += message; });
+    Require(name, "module validates", tools.Validate(module), messages);
+  }
+  const auto count = [&](const char *needle) { return CountSpirv(module, needle); };
+  Require(name, "SignedZeroInfNanPreserve 32", count("SignedZeroInfNanPreserve 32") == 1u,
+          std::to_string(count("SignedZeroInfNanPreserve 32")));
+  Require(name, "DenormFlushToZero 32 as the device declares it",
+          count("DenormFlushToZero 32") == (controls.denorm_flush_f32 ? 1u : 0u),
+          std::to_string(count("DenormFlushToZero 32")));
+  Require(name, "a program without f64", count("Float64") == 0u, "");
+  Require(name, "rcp/rsq/exp/log forms",
+          count("OpFDiv") == 2u && count("InverseSqrt") == 2u && count("Exp2") == 2u &&
+              count("Log2") == 2u,
+          "");
+  const auto compares = size_t{2} * 2u * F::OperandCount;
+  for (const char *opcode : {"OpFOrdEqual ", "OpFUnordEqual ", "OpFOrdNotEqual ", "OpFUnordNotEqual ",
+                             "OpFOrdLessThan ", "OpFUnordLessThan ", "OpFOrdGreaterThan ",
+                             "OpFUnordGreaterThan ", "OpFOrdLessThanEqual ", "OpFUnordLessThanEqual ",
+                             "OpFOrdGreaterThanEqual ", "OpFUnordGreaterThanEqual "}) {
+    Require(name, opcode, count(opcode) == compares, std::to_string(count(opcode)));
+  }
+  const auto properties = vulkan->DeviceProperties();
+  const auto memory = vulkan->MemoryProperties();
+  const auto run = RunF32FlushSelfTest(vulkan->Device(), memory, vulkan->Queue(),
+                                       vulkan->QueueFamily(), false);
+  Require(name, "the job ran", run.ran, run.error);
+  Require(name, "the shader's reference is the IEEE model", run.reference.Passed(),
+          run.reference.first);
+  std::printf("[codegen] %-32s self-test: %llu of %llu results differ (%s), first %s\n", name,
+              static_cast<unsigned long long>(run.verdict.mismatches),
+              static_cast<unsigned long long>(run.verdict.checked), run.verdict.ByOpText().c_str(),
+              run.verdict.first.c_str());
+  // Diagnostic: the same job with no denormal modes declared (KYTY_SHADER_FLOAT_CONTROLS=0).
+  {
+    ShaderRecompiler::Spirv::SetHostFloatControls({});
+    const auto bare = RunF32FlushSelfTest(vulkan->Device(), memory, vulkan->Queue(),
+                                          vulkan->QueueFamily(), false);
+    ShaderRecompiler::Spirv::SetHostFloatControls(controls);
+    std::printf("[codegen] %-32s self-test without denormal modes: %llu mismatches (%s)\n", name,
+                static_cast<unsigned long long>(bare.verdict.mismatches), bare.verdict.ByOpText().c_str());
+  }
+  // The same inputs through a translated guest program (V_RCP/RSQ/SQRT/EXP/LOG_F32 and
+  // V_CMP_LT/EQ_F32 on two VGPRs, KYTY_F32_FLUSH_HOST on): the self-test must agree with it.
+  {
+    using O = ShaderOpcode;
+    const auto inputs = F::Inputs();
+    const auto operands = F::Operands();
+    std::vector<std::vector<u32>> values(2);
+    values[0] = inputs;
+    for (u32 i = 0; i < F::InputCount; i++) {
+      values[1].push_back(operands[i % F::OperandCount]);
+    }
+    const auto body = [](std::vector<u32> *code) {
+      code->push_back(EncodeVop1(0x2a, 10, Vgpr(2)));           // v_rcp_f32
+      code->push_back(EncodeVop1(0x2e, 11, Vgpr(2)));           // v_rsq_f32
+      code->push_back(EncodeVop1(0x33, 12, Vgpr(2)));           // v_sqrt_f32
+      code->push_back(EncodeVop1(0x25, 13, Vgpr(2)));           // v_exp_f32
+      code->push_back(EncodeVop1(0x27, 14, Vgpr(2)));           // v_log_f32
+      code->push_back(EncodeVop1(0x01, 20, InlineU32(1)));      // v_mov_b32 v20, 1
+      code->push_back(EncodeVopc(0x01, Vgpr(2), 3));            // v_cmp_lt_f32 vcc, v2, v3
+      code->push_back(EncodeVop2(0x01, 15, InlineU32(0), 20));  // v_cndmask_b32 v15, 0, v20
+      code->push_back(EncodeVopc(0x02, Vgpr(2), 3));            // v_cmp_eq_f32 vcc, v2, v3
+      code->push_back(EncodeVop2(0x01, 16, InlineU32(0), 20));  // v_cndmask_b32 v16, 0, v20
+    };
+    const auto bulk = MakeBulkCase("CodegenF32FlushGuest", 2, 7, values, body,
+                                   {O::V_RCP_F32, O::V_RSQ_F32, O::V_SQRT_F32, O::V_EXP_F32,
+                                    O::V_LOG_F32, O::V_MOV_B32, O::V_CMP_LT_F32, O::V_CMP_EQ_F32,
+                                    O::V_CNDMASK_B32});
+    const auto run_guest = [&](uint8_t classes) {
+      CodegenOptions guest = on;
+      guest.host_ftz_inputs = false;
+      guest.denorm_flush_skip = 0;
+      guest.f32_flush_host_classes = classes;
+      const auto result = RunBulk(vulkan, bulk, guest);
+      std::array<u32, 7> counts{};
+      for (u32 e = 0; e < bulk.count; e++) {
+        const auto x = values[0][e];
+        const auto y = values[1][e];
+        for (u32 o = 0; o < 7; o++) {
+          const auto got = result.words[static_cast<size_t>(2 + o) * bulk.count + e];
+          const auto expected =
+              o < 5 ? F::ExpectedUnary(static_cast<F::UnaryOp>(o), x)
+                    : (F::ExpectedCompare(o == 5 ? F::CompareOp::OrdLessThan : F::CompareOp::OrdEqual, x, y)
+                           ? 1u : 0u);
+          counts[o] += F::ResultsEqual(got, expected) ? 0u : 1u;
+        }
+      }
+      std::printf("[codegen] %-32s guest program, host flush for %s: differing results rcp %u rsq %u "
+                  "sqrt %u exp %u log %u lt %u eq %u of %u\n",
+                  name, F::ClassesText(classes).c_str(), counts[0], counts[1], counts[2], counts[3],
+                  counts[4], counts[5], counts[6], bulk.count);
+      return counts;
+    };
+    const auto differ = run_guest(F::ClassAll);
+    // KYTY_F32_FLUSH_HOST=nvidia's per-class mode: the classes the self-test passes give exactly
+    // the flushed results; the others keep the shader-side flush.
+    const auto passing = F::PassingClasses(run.verdict);
+    const auto exact = run_guest(passing);
+    for (u32 o = 0; o < 7; o++) {
+      Require(name, "the per-class mode gives the flushed results", exact[o] == 0u,
+              "output " + std::to_string(o) + ": " + std::to_string(exact[o]) + " differ");
+    }
+    for (u32 o = 0; o < 5; o++) {
+      Require(name, "guest program and self-test agree on the unary op",
+              (differ[o] == 0u) == (run.verdict.by_op[o] == 0u),
+              F::UnaryName(static_cast<F::UnaryOp>(o)));
+    }
+  }
+  const bool nvidia = properties.vendorID == 0x10deu;
+  if (nvidia && std::getenv("KYTY_TEST_F32_FLUSH_REQUIRE") != nullptr) {
+    Require(name, "this NVIDIA device flushes", run.Passed(),
+            std::to_string(run.verdict.mismatches) + " mismatches, first " + run.verdict.first);
+  }
+  const auto forced = RunF32FlushSelfTest(vulkan->Device(), memory, vulkan->Queue(),
+                                          vulkan->QueueFamily(), true);
+  Require(name, "the forced mismatch fails", forced.ran && !forced.Passed(), forced.verdict.first);
+  if (run.Passed()) {
+    Require(name, "the forced mismatch is that one result",
+            forced.verdict.mismatches == 1u &&
+                forced.verdict.first == "rsq(0x80000001) = 0x7fc00000, expected 0xff800000",
+            forced.verdict.first);
+  }
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved);
+  std::printf("[codegen] %-32s ok (%s: %llu results, %llu mismatches%s%s; %.1f ms, %zu words)\n",
+              name, properties.deviceName.data(),
+              static_cast<unsigned long long>(run.verdict.checked),
+              static_cast<unsigned long long>(run.verdict.mismatches),
+              run.verdict.first.empty() ? "" : ", first ", run.verdict.first.c_str(),
+              run.milliseconds, module.size());
+}
+
+// KYTY_F32_FLUSH_HOST=nvidia stage B (F32FlushSelfTest.h): the f16 module validates and carries
+// the float modes; the f32 job and the f16 block run with the device's modes minus
+// DenormPreserve 16 (and the f16 block also with them); the decision those runs give. Prints the
+// verdicts; KYTY_TEST_F32_FLUSH_REQUIRE=1 makes "stage B passes" a requirement on NVIDIA.
+void CheckF32FlushStageB(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenF32FlushStageB";
+  namespace F = ShaderRecompiler::FlushSelfTest;
+  const auto saved = ShaderRecompiler::Spirv::GetHostFloatControls();
+  const auto declared = vulkan->DeviceFloatControls();
+  auto without = declared;
+  without.denorm_preserve_f16 = false;
+  CodegenOptions on = GetCodegenOptions();
+  on.f32_flush_host = true;
+  on.f32_flush_host_classes = ShaderRecompiler::F32FlushClassAll;
+  ScopedCodegenOptions scope(on);
+  const auto memory = vulkan->MemoryProperties();
+  const auto device = vulkan->Device();
+  {
+    ShaderRecompiler::Spirv::SetHostFloatControls(without);
+    const auto module = F::EmitF16Module();
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string messages;
+    tools.SetMessageConsumer([&](spv_message_level_t, const char *, const spv_position_t &,
+                                 const char *message) { messages += message; });
+    Require(name, "f16 module validates", tools.Validate(module), messages);
+    Require(name, "f16 module forms",
+            CountSpirv(module, "UnpackHalf2x16") == 2u && CountSpirv(module, "PackHalf2x16") == 1u &&
+                CountSpirv(module, "DenormPreserve 16") == 0u &&
+                CountSpirv(module, "SignedZeroInfNanPreserve 32") == 1u,
+            "");
+  }
+  const auto f32_a = [&] {
+    ShaderRecompiler::Spirv::SetHostFloatControls(declared);
+    return RunF32FlushSelfTest(device, memory, vulkan->Queue(), vulkan->QueueFamily(), false);
+  }();
+  ShaderRecompiler::Spirv::SetHostFloatControls(without);
+  const auto f32_b = RunF32FlushSelfTest(device, memory, vulkan->Queue(), vulkan->QueueFamily(), false);
+  const auto f16_b = RunF16SelfTest(device, memory, vulkan->Queue(), vulkan->QueueFamily());
+  ShaderRecompiler::Spirv::SetHostFloatControls(declared);
+  const auto f16_a = RunF16SelfTest(device, memory, vulkan->Queue(), vulkan->QueueFamily());
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved);
+  Require(name, "the jobs ran", f32_a.ran && f32_b.ran && f16_a.ran && f16_b.ran,
+          f32_a.error + f32_b.error + f16_a.error + f16_b.error);
+  const auto line = [&](const char *what, const F32FlushSelfTestRun &run) {
+    std::printf("[codegen] %-32s %s: %llu of %llu differ%s%s%s%s (%.1f ms)\n", name, what,
+                static_cast<unsigned long long>(run.verdict.mismatches),
+                static_cast<unsigned long long>(run.verdict.checked),
+                run.verdict.mismatches != 0 ? " (" : "", run.verdict.ByOpText().c_str(),
+                run.verdict.mismatches != 0 ? "), first " : "", run.verdict.first.c_str(), run.milliseconds);
+  };
+  line("stage A f32 job (declared modes)", f32_a);
+  line("stage B f32 job (no DenormPreserve 16)", f32_b);
+  line("f16 block, no DenormPreserve 16", f16_b);
+  line("f16 block, declared modes", f16_a);
+  F::DecisionInput in;
+  in.stage_a_classes = F::PassingClasses(f32_a.verdict);
+  in.preserve16_declared = declared.denorm_preserve_f16;
+  in.native_f16_active = ShaderRecompiler::NativeHalfActive();
+  in.stage_b_ran = true;
+  in.stage_b_classes = F::PassingClasses(f32_b.verdict);
+  in.f16_passed = f16_b.verdict.Passed();
+  const auto outcome = F::Decide(in);
+  std::printf("[codegen] %-32s decision on this device: %s (stage A classes %s, stage B classes %s, f16 %s)\n",
+              name,
+              outcome == F::Outcome::AllDeclared ? "all classes, modes as declared"
+              : outcome == F::Outcome::PerClass  ? "per class, modes as declared"
+                                                 : "all classes, no DenormPreserve 16",
+              F::ClassesText(in.stage_a_classes).c_str(), F::ClassesText(in.stage_b_classes).c_str(),
+              in.f16_passed ? "pass" : "fail");
+  if (vulkan->DeviceProperties().vendorID == 0x10deu && std::getenv("KYTY_TEST_F32_FLUSH_REQUIRE") != nullptr) {
+    Require(name, "stage B passes on this NVIDIA device", outcome != F::Outcome::PerClass,
+            f32_b.verdict.first + " / " + f16_b.verdict.first);
+  }
+  // A guest program in the stage B outcome (no DenormPreserve 16, every class on) gives the
+  // flushed results of rcp/rsq/sqrt/exp/log and v_cmp_lt/eq when stage B passed.
+  if (in.stage_b_classes == F::ClassAll) {
+    using O = ShaderOpcode;
+    const auto inputs = F::Inputs();
+    const auto operands = F::Operands();
+    std::vector<std::vector<u32>> values(2);
+    values[0] = inputs;
+    for (u32 i = 0; i < F::InputCount; i++) {
+      values[1].push_back(operands[i % F::OperandCount]);
+    }
+    const auto body = [](std::vector<u32> *code) {
+      code->push_back(EncodeVop1(0x2a, 10, Vgpr(2)));
+      code->push_back(EncodeVop1(0x2e, 11, Vgpr(2)));
+      code->push_back(EncodeVop1(0x33, 12, Vgpr(2)));
+      code->push_back(EncodeVop1(0x25, 13, Vgpr(2)));
+      code->push_back(EncodeVop1(0x27, 14, Vgpr(2)));
+      code->push_back(EncodeVop1(0x01, 20, InlineU32(1)));
+      code->push_back(EncodeVopc(0x01, Vgpr(2), 3));
+      code->push_back(EncodeVop2(0x01, 15, InlineU32(0), 20));
+      code->push_back(EncodeVopc(0x02, Vgpr(2), 3));
+      code->push_back(EncodeVop2(0x01, 16, InlineU32(0), 20));
+    };
+    const auto bulk = MakeBulkCase("CodegenF32FlushStageBGuest", 2, 7, values, body,
+                                   {O::V_RCP_F32, O::V_RSQ_F32, O::V_SQRT_F32, O::V_EXP_F32,
+                                    O::V_LOG_F32, O::V_MOV_B32, O::V_CMP_LT_F32, O::V_CMP_EQ_F32,
+                                    O::V_CNDMASK_B32});
+    CodegenOptions guest = on;
+    guest.host_ftz_inputs = false;
+    guest.denorm_flush_skip = 0;
+    guest.f32_flush_host_classes = F::ClassAll | F::ClassNoPreserve16;
+    ShaderRecompiler::Spirv::SetHostFloatControls(without);
+    const auto result = RunBulk(vulkan, bulk, guest);
+    ShaderRecompiler::Spirv::SetHostFloatControls(saved);
+    u32 differ = 0;
+    for (u32 e = 0; e < bulk.count; e++) {
+      for (u32 o = 0; o < 7; o++) {
+        const auto got = result.words[static_cast<size_t>(2 + o) * bulk.count + e];
+        const auto x = values[0][e];
+        const auto y = values[1][e];
+        const auto expected =
+            o < 5 ? F::ExpectedUnary(static_cast<F::UnaryOp>(o), x)
+                  : (F::ExpectedCompare(o == 5 ? F::CompareOp::OrdLessThan : F::CompareOp::OrdEqual, x, y)
+                         ? 1u : 0u);
+        differ += F::ResultsEqual(got, expected) ? 0u : 1u;
+      }
+    }
+    std::printf("[codegen] %-32s guest program in the stage B outcome: %u of %u results differ\n", name,
+                differ, bulk.count * 7u);
+    Require(name, "the stage B outcome gives the flushed results", differ == 0u, std::to_string(differ));
+  }
+}
+
+// Diagnostic for DenormPreserve 16 (declared where the device takes it): V_CVT_F32_F16 of every
+// f16 denormal and V_CVT_F16_F32 of f32 values that round to f16 denormals (exact ones and ties),
+// with the device's float controls and with DenormPreserve 16 left out, bit-exact against the CPU
+// (f16 denormals kept, round to nearest even). Prints the differing counts; fails nothing.
+void CheckF16DenormConversions(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenF16DenormConversions";
+  using O = ShaderOpcode;
+  std::vector<std::vector<u32>> values(1);
+  std::vector<u32> expect_f32;  // V_CVT_F32_F16 of input (low half)
+  std::vector<u32> expect_f16;  // V_CVT_F16_F32 of the f32 bits in the input
+  std::vector<u32> f32_inputs;
+  for (u32 sign = 0; sign < 2; sign++) {
+    for (u32 m = 1; m < 1024u; m++) {
+      const u32 h = (sign << 15u) | m;
+      values[0].push_back(h);
+      const float v = static_cast<float>(m) * 0x1p-24f;  // exact
+      expect_f32.push_back(std::bit_cast<u32>(v) | (sign << 31u));
+      // Exact f16 denormal as f32, and the tie above it (k + 0.5) * 2^-24 -> even.
+      const u32 tie = (m % 2u) == 0u ? m : m + 1u;
+      f32_inputs.push_back(std::bit_cast<u32>(v) | (sign << 31u));
+      expect_f16.push_back(h);
+      const float t = (static_cast<float>(m) + 0.5f) * 0x1p-24f;
+      f32_inputs.push_back(std::bit_cast<u32>(t) | (sign << 31u));
+      expect_f16.push_back((sign << 15u) | tie);
+    }
+  }
+  while (values[0].size() % 64u != 0u) {
+    values[0].push_back(0u);
+    expect_f32.push_back(0u);
+  }
+  while (f32_inputs.size() % 64u != 0u) {
+    f32_inputs.push_back(0u);
+    expect_f16.push_back(0u);
+  }
+  const auto to_f32 = MakeBulkCase(name, 1, 1, values,
+                                   [](std::vector<u32> *code) {
+                                     code->push_back(EncodeVop1(0x0b, 10, Vgpr(2)));  // v_cvt_f32_f16
+                                   },
+                                   {O::V_CVT_F32_F16});
+  std::vector<std::vector<u32>> f32_values(1, f32_inputs);
+  const auto to_f16 = MakeBulkCase(name, 1, 1, f32_values,
+                                   [](std::vector<u32> *code) {
+                                     code->push_back(EncodeVop1(0x0a, 10, Vgpr(2)));  // v_cvt_f16_f32
+                                   },
+                                   {O::V_CVT_F16_F32});
+  const auto saved = ShaderRecompiler::Spirv::GetHostFloatControls();
+  const auto device = vulkan->DeviceFloatControls();
+  for (const bool preserve16 : {true, false}) {
+    auto controls = device;
+    controls.denorm_preserve_f16 = preserve16 && device.denorm_preserve_f16;
+    if (!preserve16 && !device.denorm_preserve_f16) {
+      continue;
+    }
+    ShaderRecompiler::Spirv::SetHostFloatControls(controls);
+    const auto a = RunBulk(vulkan, to_f32, GetCodegenOptions());
+    const auto b = RunBulk(vulkan, to_f16, GetCodegenOptions());
+    u32 bad_f32 = 0;
+    u32 bad_f16 = 0;
+    std::string first;
+    for (u32 e = 0; e < to_f32.count; e++) {
+      const auto got = a.words[static_cast<size_t>(to_f32.count) + e];
+      if (got != expect_f32[e]) {
+        if (bad_f32++ == 0u) {
+          first = "f32(f16 " + Hex(values[0][e]) + ") = " + Hex(got) + ", expected " + Hex(expect_f32[e]);
+        }
+      }
+    }
+    for (u32 e = 0; e < to_f16.count; e++) {
+      const auto got = b.words[static_cast<size_t>(to_f16.count) + e] & 0xffffu;
+      if (got != expect_f16[e]) {
+        if (bad_f16++ == 0u && first.empty()) {
+          first = "f16(f32 " + Hex(f32_inputs[e]) + ") = " + Hex(got) + ", expected " + Hex(expect_f16[e]);
+        }
+      }
+    }
+    std::printf("[codegen] %-32s DenormPreserve 16 %s: v_cvt_f32_f16 %u of %u differ, v_cvt_f16_f32 %u of "
+                "%u differ%s%s\n",
+                name, controls.denorm_preserve_f16 ? "declared" : "left out", bad_f32, to_f32.count, bad_f16,
+                to_f16.count, first.empty() ? "" : ", first ", first.c_str());
+  }
+  ShaderRecompiler::Spirv::SetHostFloatControls(saved);
 }
 
 // A compressed export to a SNORM16_ABGR target (SPI_SHADER_COL_FORMAT 6) carries
@@ -2096,11 +2966,468 @@ void CheckRealtimeClock(VulkanHarness *vulkan) {
               host.shift, clock_words[2], clock_words[1]);
 }
 
+// KYTY_LANE2_SHARE: a wave64 program (two lanes per host invocation on a 32-wide host) with a
+// scalar inner loop whose counter and running sum are the same in both halves, feeding per-lane
+// VALU work and a uniform output. Results must match with and without the sharing and the CPU
+// reference, and the shared module must be smaller.
+void CheckLane2Share(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenLane2Share";
+  using O = ShaderOpcode;
+  constexpr u32 Count = 2048;
+  constexpr u32 Seed = 0x9e3779b9u;
+  std::vector<std::vector<u32>> inputs(2);
+  uint64_t state = 0x1a2e5aa5u;
+  for (u32 e = 0; e < Count; e++) {
+    inputs[0].push_back(NextRandom(state));
+    inputs[1].push_back(NextRandom(state));
+  }
+  const auto body = [&](std::vector<u32> *code) {
+    code->push_back(EncodeVop1(0x01, 10, Vgpr(2)));     // v_mov_b32 v10, v2
+    code->push_back(EncodeSMovB32(70, InlineU32(3)));   // s_mov_b32 s70, 3
+    code->push_back(EncodeSMovB32(71, 255));            // s_mov_b32 s71, lit
+    code->push_back(Seed);
+    const auto inner = static_cast<u32>(code->size());
+    code->push_back(EncodeSop2(0x00, 71, 71, 70));      // s_add_u32 s71, s71, s70
+    code->push_back(EncodeVop2(0x25, 10, 71, 10));      // v_add_nc_u32 v10, s71, v10
+    code->push_back(EncodeVop2(0x1d, 10, Vgpr(10), 3)); // v_xor_b32 v10, v10, v3
+    code->push_back(EncodeSop2(0x01, 70, 70, InlineU32(1))); // s_sub_u32 s70, s70, 1
+    code->push_back(EncodeSopc(0x07, 70, InlineU32(0)));      // s_cmp_lg_u32 s70, 0
+    const auto branch = static_cast<int32_t>(inner) - static_cast<int32_t>(code->size()) - 1;
+    code->push_back(EncodeSopp(0x05, static_cast<u32>(branch) & 0xffffu)); // s_cbranch_scc1
+    code->push_back(EncodeVop1(0x01, 11, 71));          // v_mov_b32 v11, s71
+  };
+  auto bulk = MakeBulkCase(name, 2, 2, inputs, body,
+                           {O::V_MOV_B32, O::S_SUB_U32, O::S_CMP_LG_U32, O::V_ADD_NC_U32,
+                            O::V_XOR_B32});
+  CodegenOptions shared = GetCodegenOptions();
+  shared.lane2_share = true;
+  shared.wave64_warps = false;
+  shared.lane_local = false;
+  CodegenOptions legacy = shared;
+  legacy.lane2_share = false;
+  const auto fast = RunBulk(vulkan, bulk, shared);
+  const auto slow = RunBulk(vulkan, bulk, legacy);
+  const auto reference = [&](u32 output, u32 e) -> u32 {
+    u32 sum = Seed;
+    u32 value = inputs[0][e];
+    for (u32 counter = 3; counter != 0; counter--) {
+      sum += counter;
+      value = (value + sum) ^ inputs[1][e];
+    }
+    return output == 0 ? value : sum;
+  };
+  static const char *const names[] = {"per-lane v10", "uniform v11"};
+  CompareBulk(name, bulk, fast, slow, reference, names);
+  const bool host32 = vulkan->SubgroupSize() == 32u;
+  if (host32) {
+    Require(name, "module size", fast.spirv.size() < slow.spirv.size(),
+            "SPIR-V " + std::to_string(slow.spirv.size()) + " -> " +
+                std::to_string(fast.spirv.size()) + " words");
+  }
+  std::printf("[codegen] %-32s ok (SPIR-V %zu -> %zu words, OpPhi %zu -> %zu)\n", name,
+              slow.spirv.size(), fast.spirv.size(), CountSpirv(slow.spirv, "OpPhi"),
+              CountSpirv(fast.spirv, "OpPhi"));
+}
+
+// KYTY_KNOWN_BITS_MASKS: v_and_b32 0xffff of a value shifted right by 16, and v_bfe_u32 0, 8 of a
+// value already masked to 0xff, are their sources. Same results, fewer masks.
+void CheckKnownBitsMasks(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenKnownBitsMasks";
+  using O = ShaderOpcode;
+  constexpr u32 Count = 1024;
+  std::vector<std::vector<u32>> inputs(2);
+  uint64_t state = 0x6b17b175u;
+  for (u32 e = 0; e < Count; e++) {
+    inputs[0].push_back(NextRandom(state));
+    inputs[1].push_back(NextRandom(state));
+  }
+  const auto body = [&](std::vector<u32> *code) {
+    code->push_back(EncodeVop2(0x16, 20, InlineU32(16), 2)); // v_lshrrev_b32 v20, 16, v2
+    code->push_back(EncodeVop2(0x1b, 10, 255, 20));          // v_and_b32 v10, lit, v20
+    code->push_back(0xffffu);
+    code->push_back(EncodeVop2(0x1b, 21, 255, 3));           // v_and_b32 v21, lit, v3
+    code->push_back(0xffu);
+    AppendVop3(code, 0x148, 11, Vgpr(21), InlineU32(0), InlineU32(8)); // v_bfe_u32 v11, v21, 0, 8
+  };
+  auto bulk = MakeBulkCase(name, 2, 2, inputs, body,
+                           {O::V_LSHRREV_B32, O::V_AND_B32, O::V_BFE_U32});
+  for (const u32 wave : {64u, 32u}) {
+    bulk.test.compute_info.wave_size = wave;
+    CodegenOptions merged = GetCodegenOptions();
+    merged.movrel_range = true;
+    merged.known_bits_masks = true;
+    CodegenOptions legacy = merged;
+    legacy.known_bits_masks = false;
+    const auto fast = RunBulk(vulkan, bulk, merged);
+    const auto slow = RunBulk(vulkan, bulk, legacy);
+    const auto reference = [&](u32 output, u32 e) -> u32 {
+      return output == 0 ? inputs[0][e] >> 16u : inputs[1][e] & 0xffu;
+    };
+    static const char *const names[] = {"and of shift v10", "bfe of and v11"};
+    CompareBulk(name, bulk, fast, slow, reference, names);
+    const auto masks_fast = CountSpirv(fast.spirv, "OpBitwiseAnd") +
+                            CountSpirv(fast.spirv, "OpBitFieldUExtract");
+    const auto masks_slow = CountSpirv(slow.spirv, "OpBitwiseAnd") +
+                            CountSpirv(slow.spirv, "OpBitFieldUExtract");
+    Require(name, "mask count", masks_fast + 2u <= masks_slow,
+            "wave" + std::to_string(wave) + ": masks " + std::to_string(masks_slow) + " -> " +
+                std::to_string(masks_fast));
+    std::printf("[codegen] %-32s ok (wave%u, AND+BFE %zu -> %zu)\n", name, wave, masks_slow,
+                masks_fast);
+  }
+}
+
+// KYTY_GDS_M0_BASE: ds_write_b32/ds_read_b32 on GDS with M0 = {base 16 bytes, size 0x1000} address
+// GDS word 4 + lane; without the switch the base is ignored (word lane).
+void CheckGdsM0Base(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  for (const bool enabled : {true, false}) {
+    for (const u32 wave_size : {32u, 64u}) {
+      TestCase test;
+      test.name = enabled ? "CodegenGdsM0Base" : "CodegenGdsM0BaseOff";
+      auto &code = test.code;
+      code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0)); // v_lshlrev_b32 v1, 2, v0
+      code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 0)); // v_add_nc_u32 v2, 1, v0
+      AppendSMovLiteral(&code, 124, 0x00101000u);           // s_mov_b32 m0, base 16, size 4096
+      code.insert(code.end(), {EncodeDs0(0x0d, 0, true), EncodeDs1(0, 2, 1),   // ds_write_b32 gds
+                               EncodeDs0(0x36, 0, true), EncodeDs1(5, 0, 1)}); // ds_read_b32 gds
+      AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 0);
+      AppendEnd(&code);
+      test.initial.assign(wave_size, 0xdeadbeefu);
+      test.expected.resize(wave_size);
+      std::iota(test.expected.begin(), test.expected.end(), 1u);
+      test.compute_info.threads_num[0] = wave_size;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+      test.compute_info.thread_ids_num = 1;
+      test.compute_info.wave_size = wave_size;
+      test.has_compute_info = true;
+      const u32 base_words = enabled ? 4u : 0u;
+      test.gds_initial.assign(wave_size + 4u, 0u);
+      test.expected_gds.assign(wave_size + 4u, 0u);
+      for (u32 lane = 0; lane < wave_size; lane++) {
+        test.expected_gds[base_words + lane] = lane + 1u;
+      }
+      test.opcodes = {O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::DS_WRITE_B32,
+                      O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+      CodegenOptions options = GetCodegenOptions();
+      options.gds_m0_base = enabled;
+      ScopedCodegenOptions scope(options);
+      RunCase(vulkan, test);
+    }
+  }
+}
+
+// KYTY_LDS_ATOMIC_ORDER: every lane of one wave does ds_add_rtn_u32 (lane + 1) and ds_sub_rtn_u32
+// (lane + 1) on one LDS dword; the returned old values follow lane order (lane L sees the sum of the
+// lanes below it), in wave32 and in wave64 (two lanes per host invocation).
+void CheckLdsAtomicOrder(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  for (const u32 wave_size : {64u, 32u}) {
+    TestCase test;
+    test.name = wave_size == 64u ? "CodegenLdsAtomicOrder64" : "CodegenLdsAtomicOrder32";
+    auto &code = test.code;
+    AppendVMovU32(&code, 1, 0);                           // v1 = 0 (LDS address)
+    AppendVMovU32(&code, 4, 0);                           // v4 = 0
+    code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 0)); // v_add_nc_u32 v2, 1, v0
+    code.insert(code.end(), {EncodeDs0(0x0d), EncodeDs1(0, 4, 1)});     // ds_write_b32 v1, v4
+    code.insert(code.end(), {EncodeDs0(0x0d, 4), EncodeDs1(0, 4, 1)});  // ds_write_b32 v1, v4 offset:4
+    code.insert(code.end(), {EncodeDs0(0x20), EncodeDs1(3, 2, 1)});     // ds_add_rtn_u32 v3, v1, v2
+    code.insert(code.end(), {EncodeDs0(0x21, 4), EncodeDs1(5, 2, 1)});  // ds_sub_rtn_u32 v5, v1, v2 offset:4
+    AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+    AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, wave_size);
+    AppendEnd(&code);
+    test.initial.assign(wave_size * 2u, 0xdeadbeefu);
+    test.expected.resize(wave_size * 2u);
+    for (u32 lane = 0; lane < wave_size; lane++) {
+      const u32 below = lane * (lane + 1u) / 2u;
+      test.expected[lane] = below;
+      test.expected[wave_size + lane] = 0u - below;
+    }
+    test.compute_info.threads_num[0] = wave_size;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.wave_size = wave_size;
+    test.compute_info.lds_size_dwords = 2;
+    test.has_compute_info = true;
+    test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::DS_WRITE_B32, O::DS_ADD_RTN_U32,
+                    O::DS_SUB_RTN_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    test.required_spirv = {"OpGroupNonUniformIAdd"};
+    CodegenOptions options = GetCodegenOptions();
+    options.lds_atomic_order = true;
+    options.wave64_warps = false;
+    options.lds_slots = false;
+    ScopedCodegenOptions scope(options);
+    RunCase(vulkan, test);
+  }
+}
+
+// KYTY_SPLIT_LDS_WRITE_SYNC: a split wave64 (KYTY_WAVE64_WARPS, one 64-thread workgroup) writes its
+// lane id to LDS, reads the mirrored lane (the other host subgroup) twice, overwrites its dword after
+// those reads and reads the mirrored lane again: every read must see the other half's write in guest
+// order, with and without the switch.
+void CheckSplitLdsWriteSync(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  for (const bool enabled : {true, false}) {
+    TestCase test;
+    test.name = enabled ? "CodegenSplitLdsWriteSync" : "CodegenSplitLdsWriteSyncOff";
+    auto &code = test.code;
+    code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0));       // v_lshlrev_b32 v1, 2, v0
+    code.push_back(EncodeVop2(0x26, 2, 255, 0));                // v_sub_nc_u32 v2, 63, v0
+    code.push_back(63u);
+    code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 2));       // v_lshlrev_b32 v2, 2, v2
+    code.insert(code.end(), {EncodeDs0(0x0d), EncodeDs1(0, 0, 1)});   // ds_write_b32 v1, v0
+    code.insert(code.end(), {EncodeDs0(0x36), EncodeDs1(3, 0, 2)});   // ds_read_b32 v3, v2
+    code.insert(code.end(), {EncodeDs0(0x36), EncodeDs1(4, 0, 2)});   // ds_read_b32 v4, v2
+    code.push_back(EncodeVop2(0x25, 5, 255, 0));                // v_add_nc_u32 v5, 100, v0
+    code.push_back(100u);
+    code.insert(code.end(), {EncodeDs0(0x0d), EncodeDs1(0, 5, 1)});   // ds_write_b32 v1, v5
+    code.insert(code.end(), {EncodeDs0(0x36), EncodeDs1(6, 0, 2)});   // ds_read_b32 v6, v2
+    code.push_back(EncodeVop2(0x25, 3, Vgpr(3), 4));            // v_add_nc_u32 v3, v3, v4
+    AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+    AppendStoreVgprAtLaneDwordOffset(&code, 6, 0, 64);
+    AppendEnd(&code);
+    test.initial.assign(128, 0xdeadbeefu);
+    test.expected.resize(128);
+    for (u32 lane = 0; lane < 64; lane++) {
+      test.expected[lane] = 2u * (63u - lane);
+      test.expected[64 + lane] = 100u + 63u - lane;
+    }
+    test.compute_info.threads_num[0] = 64;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.wave_size = 64;
+    test.compute_info.lds_size_dwords = 64;
+    test.has_compute_info = true;
+    test.opcodes = {O::V_LSHLREV_B32, O::V_SUB_NC_U32, O::V_ADD_NC_U32, O::DS_WRITE_B32,
+                    O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    CodegenOptions options = GetCodegenOptions();
+    options.wave64_warps = true;
+    options.split_lds_write_sync = enabled;
+    options.lds_slots = false;
+    options.lane_local = false;
+    ScopedCodegenOptions scope(options);
+    RunCase(vulkan, test);
+  }
+}
+
+// KYTY_SPLIT_DPP_LANE: a split wave64 (KYTY_WAVE64_WARPS, one 64-thread workgroup) runs DPP16
+// row_shr:1,2,4,8 scans (BC=0, FI=0, every lane enabled) with v_add_nc_u32, v_add_f32, v_min_f32 and
+// v_max_f32: each lane must get the inclusive scan of its row of 16, in both host subgroups. Before
+// the fix the upper subgroup tested bits 32-63 of its 32-lane ballot and never wrote.
+void CheckSplitDppScan(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenSplitDppScan";
+  // VOP2 opcode, then how the guest combines two lanes (D = src0(shifted) op src1(own)).
+  struct Op {
+    u32 opcode;
+    u32 (*apply)(u32, u32);
+  };
+  const Op ops[] = {
+      {0x25, [](u32 a, u32 b) { return a + b; }},
+      {0x03, [](u32 a, u32 b) { return std::bit_cast<u32>(std::bit_cast<float>(a) + std::bit_cast<float>(b)); }},
+      {0x0f, [](u32 a, u32 b) { return std::bit_cast<u32>(std::min(std::bit_cast<float>(a), std::bit_cast<float>(b))); }},
+      {0x10, [](u32 a, u32 b) { return std::bit_cast<u32>(std::max(std::bit_cast<float>(a), std::bit_cast<float>(b))); }},
+  };
+  constexpr u32 Wave = 64;
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0)); // v_lshlrev_b32 v3, 2, v0
+  AppendBufferLoadDword(&code, 1, 3);                  // v1 = data[lane] (integer op input)
+  code.push_back(EncodeVop2(0x25, 3, 255, 3));          // v3 += 256 (float inputs at 64..127)
+  code.push_back(256u);
+  AppendBufferLoadDword(&code, 2, 3);                  // v2 = data[64 + lane]
+  code.push_back(EncodeSopp(0x0c, 0));                 // s_waitcnt 0
+  for (u32 i = 0; i < 4; i++) {
+    const u32 reg = 4u + i;
+    code.push_back(EncodeVop1(0x01, reg, Vgpr(i == 0 ? 1u : 2u))); // v_mov_b32 v(4+i), input
+    for (const u32 shift : {1u, 2u, 4u, 8u}) {
+      code.push_back(EncodeVop2(ops[i].opcode, reg, 250, reg)); // op v, v row_shr:n, v
+      code.push_back(EncodeVop2Dpp(reg, 0x110u + shift));
+    }
+  }
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgprAtLaneDwordOffset(&code, 4u + i, 0, 128u + i * Wave);
+  }
+  AppendEnd(&code);
+  test.initial.resize(128u + 4u * Wave, 0xdeadbeefu);
+  for (u32 lane = 0; lane < Wave; lane++) {
+    test.initial[lane] = (lane * 2654435761u) >> 4u;
+    test.initial[Wave + lane] =
+        std::bit_cast<u32>((static_cast<float>((lane * 37u) % 101u) - 50.0f) * 0.371f);
+  }
+  test.expected = test.initial;
+  for (u32 i = 0; i < 4; i++) {
+    std::vector<u32> v(test.initial.begin() + (i == 0 ? 0 : Wave),
+                       test.initial.begin() + (i == 0 ? Wave : 2u * Wave));
+    for (const u32 shift : {1u, 2u, 4u, 8u}) {
+      auto next = v;
+      for (u32 lane = 0; lane < Wave; lane++) {
+        if ((lane & 15u) >= shift) {
+          next[lane] = ops[i].apply(v[lane - shift], v[lane]);
+        }
+      }
+      v = next;
+    }
+    std::copy(v.begin(), v.end(), test.expected.begin() + 128 + i * Wave);
+  }
+  test.compute_info.threads_num[0] = Wave;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = Wave;
+  test.has_compute_info = true;
+  std::vector<u32> fixed_words;
+  std::vector<u32> legacy_words;
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.wave64_warps = true;
+    options.split_dpp_lane = true;
+    options.dpp_skip_inactive = true;
+    options.lane_reductions = false;
+    options.lane_local = false;
+    options.lds_slots = false;
+    ScopedCodegenOptions scope(options);
+    fixed_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.wave64_warps = true;
+    options.split_dpp_lane = false;
+    options.dpp_skip_inactive = true;
+    options.lane_reductions = false;
+    options.lane_local = false;
+    options.lds_slots = false;
+    ScopedCodegenOptions scope(options);
+    legacy_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  RequireEqualWords(name, "split wave64 row_shr scans", test.expected, fixed_words);
+  u32 wrong = 0;
+  for (size_t i = 128; i < test.expected.size(); i++) {
+    wrong += legacy_words[i] != test.expected[i] ? 1u : 0u;
+  }
+  std::printf("[codegen] %-32s ok (KYTY_SPLIT_DPP_LANE=0: %u of %u scan results differ)\n", name,
+              wrong, 4u * Wave);
+}
+
+// KYTY_MOV_INT_MODS: V_MOV_B32 and V_CNDMASK_B32 neg/abs flip or clear the sign bit (ISA p.137,
+// p.131), bit exact for f32 denormals, which a host flushing f32 denormals in OpFNegate/OpFAbs
+// would turn into signed zeros.
+void CheckMovIntMods(VulkanHarness *vulkan) {
+  constexpr const char *name = "CodegenMovIntMods";
+  TestCase test;
+  test.name = name;
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 0x00000001u);
+  AppendVMovU32(&code, 2, 0x80000005u);
+  AppendVMovU32(&code, 3, 0x00400000u);
+  AppendVMovU32(&code, 4, 0x3f800000u);
+  AppendVop3(&code, 0x181, 10, Vgpr(1), 0, 0, 0, 0, false, 0, 1); // v_mov_b32 v10, -v1
+  AppendVop3(&code, 0x181, 11, Vgpr(2), 0, 0, 1);                 // v_mov_b32 v11, |v2|
+  AppendVop3(&code, 0x181, 12, Vgpr(2), 0, 0, 1, 0, false, 0, 1); // v_mov_b32 v12, -|v2|
+  AppendVop3(&code, 0x181, 13, Vgpr(4), 0, 0, 0, 0, false, 0, 1); // v_mov_b32 v13, -v4 (-1.0)
+  code.push_back(EncodeSMovB32(20, 193));                         // s_mov_b32 s20, -1
+  code.push_back(EncodeSMovB32(21, 128));                         // s_mov_b32 s21, 0
+  AppendVop3(&code, 0x101, 14, Vgpr(1), Vgpr(3), 20, 0, 0, false, 0, 2); // v_cndmask v14, v1, -v3, s20
+  AppendVop3(&code, 0x101, 15, Vgpr(2), Vgpr(3), 21, 1);                 // v_cndmask v15, |v2|, v3, s21
+  for (u32 i = 0; i < 6; i++) {
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendEnd(&code);
+  test.initial.assign(6, 0xdeadbeefu);
+  test.expected = {0x80000001u, 0x00000005u, 0x80000005u, 0xbf800000u, 0x80400000u, 0x00000005u};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  std::vector<u32> on_words;
+  std::vector<u32> off_words;
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.mov_int_mods = true;
+    options.mov_no_float_mods = false;
+    ScopedCodegenOptions scope(options);
+    on_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  {
+    CodegenOptions options = GetCodegenOptions();
+    options.mov_int_mods = false;
+    options.mov_no_float_mods = false;
+    ScopedCodegenOptions scope(options);
+    off_words = RunCollect(vulkan, test, test.expected.size());
+  }
+  RequireEqualWords(name, "integer sign modifiers", test.expected, on_words);
+  std::printf("[codegen] %-32s ok (float path: -denormal %08x, cndmask -denormal %08x)\n", name,
+              off_words[0], off_words[4]);
+}
+
+// KYTY_SCALAR_LOAD_GROUPS: S_LOAD_DWORDX4 through a scalar address, once inside one BDA page
+// (one page lookup for the four dwords) and once straddling a page boundary (per-dword path); the
+// results match the memory with and without the switch.
+void CheckScalarLoadGroups(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 Page = static_cast<u32>(BufferCache::CACHING_PAGESIZE);
+  constexpr u32 Inside = 256u;
+  constexpr u32 Straddle = Page - 8u;
+  for (const bool enabled : {true, false}) {
+    TestCase test;
+    test.name = enabled ? "CodegenScalarLoadGroups" : "CodegenScalarLoadGroupsOff";
+    test.initial.assign((2u * Page) / 4u, 0u);
+    for (u32 word = 0; word < 4; word++) {
+      test.initial[Inside / 4 + word] = 0x11110000u + word;
+      test.initial[Straddle / 4 + word] = 0x22220000u + word;
+    }
+    auto &code = test.code;
+    AppendSMovLiteral(&code, 2, static_cast<u32>(GuestBase));
+    AppendSMovLiteral(&code, 3, static_cast<u32>(GuestBase >> 32u));
+    code.push_back(EncodeSmem0(0x02, 8, 1));   // s_load_dwordx4 s[8:11], s[2:3], Inside
+    code.push_back(EncodeSmem1(Inside));
+    code.push_back(EncodeSmem0(0x02, 12, 1));  // s_load_dwordx4 s[12:15], s[2:3], Straddle
+    code.push_back(EncodeSmem1(Straddle));
+    code.push_back(EncodeSopp(0x0c, 0));       // s_waitcnt 0
+    for (u32 i = 0; i < 8; i++) {
+      code.push_back(EncodeVop1(0x01, 20 + i, 8 + i)); // v_mov_b32 v(20+i), s(8+i)
+      AppendStoreVgpr(&code, 20 + i, i);
+    }
+    AppendEnd(&code);
+    test.expected = {0x11110000u, 0x11110001u, 0x11110002u, 0x11110003u,
+                     0x22220000u, 0x22220001u, 0x22220002u, 0x22220003u};
+    test.bda_mappings = {{GuestBase, 0}};
+    test.opcodes = {O::S_MOV_B32, O::S_LOAD_DWORDX4, O::S_WAITCNT, O::V_MOV_B32,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+    CodegenOptions options = GetCodegenOptions();
+    options.scalar_load_groups = enabled;
+    ScopedCodegenOptions scope(options);
+    RunCase(vulkan, test);
+    // S_BUFFER_LOAD_DWORDXn through GPU-selected V#s (the indirect scalar group form) and the
+    // scalar load variants.
+    RunCase(vulkan, BufferLoadsGpuSelectedDescriptors());
+    RunCase(vulkan, ScalarMemoryLoadVariants());
+  }
+}
+
 void RunAll(VulkanHarness *vulkan) {
+  CheckScalarLoadGroups(vulkan);
+  CheckSplitLdsWriteSync(vulkan);
+  CheckSplitDppScan(vulkan);
+  CheckMovIntMods(vulkan);
+  CheckWave64HighLanes();
+  CheckF16ExactRound(vulkan);
+  CheckIsaSmallFixes(vulkan);
+  CheckLdsAtomicOrder(vulkan);
+  CheckGdsM0Base(vulkan);
+  CheckKnownBitsMasks(vulkan);
+  CheckLane2Share(vulkan);
   CheckCompressedSnormExport();
   CheckTranscendentalDenormInputs(vulkan);
+  CheckF32FlushSelfTest(vulkan);
+  CheckF16DenormConversions(vulkan);
+  CheckF32FlushStageB(vulkan);
   CheckExecSelects(vulkan);
   CheckInterpolationModes();
+  CheckLdsSlots();
+  CheckDenormFlushSkip();
   CheckMadPositionSlice();
   CheckMadModes(vulkan);
   CheckLodStatsGate();
@@ -2111,6 +3438,7 @@ void RunAll(VulkanHarness *vulkan) {
   CheckUniformLaneReads(vulkan);
   CheckFloatMinMax(vulkan);
   CheckShortF32Helpers(vulkan);
+  CheckShortF32HelpersNanPaths(vulkan);
   CheckFloatClampConstants(vulkan);
   CheckPackRtzExhaustive();
   CheckPackRtz(vulkan);

@@ -20,6 +20,9 @@ public:
 		Frame* frame;
 		int    bus;
 		bool   premultiplied_alpha;
+		// KYTY_HOLD_SKIPPED_DRAWS: the bus keeps the frame it shows, and this one is released
+		// unshown.
+		bool hold = false;
 	};
 
 	explicit Presenter(WindowContext& window);
@@ -34,7 +37,6 @@ public:
 	// Built-in FSR frame generation (Linux, macOS): at a vblank tick without a new game frame, the
 	// game frame kept after its generated frame was shown; false when none was waiting.
 	[[nodiscard]] bool           PresentPendingFrame();
-	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           IsHdrSupported() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;

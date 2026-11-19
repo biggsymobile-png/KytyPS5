@@ -2,6 +2,7 @@
 
 #include "common/stringUtils.h"
 
+#include <algorithm>
 #include <cstring>
 #include <fmt/format.h>
 #include <fstream>
@@ -13,8 +14,22 @@ namespace Common::U59Preset {
 
 bool Parse(std::string_view text, std::vector<Entry>& entries, std::string& error) {
 	entries.clear();
-	const auto document = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
-	if (document.is_discarded() || !document.is_object()) {
+	// Hand-edited presets (issue #85: two keys added, then the whole file was not applied and the
+	// game ran on the code defaults): a trailing comma and // comments are accepted, and any other
+	// syntax error names its line and column.
+	nlohmann::json document;
+	try {
+		document = nlohmann::json::parse(text.begin(), text.end(), nullptr, true,
+		                                 /*ignore_comments=*/true, /*ignore_trailing_commas=*/true);
+	} catch (const nlohmann::json::parse_error& e) {
+		std::string_view what = e.what();
+		if (const auto at = what.find("] "); what.starts_with("[json.exception") && at != what.npos) {
+			what.remove_prefix(at + 2);
+		}
+		error = fmt::format("not valid JSON ({}); check for a missing comma or quote", what);
+		return false;
+	}
+	if (!document.is_object()) {
 		error = "not a JSON object";
 		return false;
 	}
@@ -34,11 +49,11 @@ bool Parse(std::string_view text, std::vector<Entry>& entries, std::string& erro
 	return true;
 }
 
-LoadResult Load(const std::vector<std::filesystem::path>& dirs) {
+static LoadResult LoadNamed(const std::vector<std::filesystem::path>& dirs, std::string_view name) {
 	LoadResult result;
 	for (const auto& dir: dirs) {
 		result.searched.push_back(dir);
-		const auto      path = dir / FileName;
+		const auto      path = dir / std::filesystem::path(std::string(name));
 		std::error_code ec;
 		if (!std::filesystem::exists(path, ec)) {
 			continue;
@@ -61,6 +76,48 @@ LoadResult Load(const std::vector<std::filesystem::path>& dirs) {
 	}
 	result.status = Status::Missing;
 	return result;
+}
+
+LoadResult Load(const std::vector<std::filesystem::path>& dirs) {
+	return LoadNamed(dirs, FileName);
+}
+
+std::string TitleFileName(std::string_view title_id) {
+	return fmt::format("u59-preset.{}.json", title_id);
+}
+
+LoadResult LoadTitle(const std::vector<std::filesystem::path>& dirs, std::string_view title_id) {
+	const bool valid = title_id.size() == 9 &&
+	                   std::all_of(title_id.begin(), title_id.end(), [](char ch) {
+		                   return (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+	                   });
+	if (!valid) {
+		return {};
+	}
+	return LoadNamed(dirs, TitleFileName(title_id));
+}
+
+std::string TitleIdFromParamJson(std::string_view text) {
+	const auto document = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
+	if (document.is_discarded() || !document.is_object()) {
+		return {};
+	}
+	if (const auto it = document.find("titleId"); it != document.end() && it->is_string()) {
+		if (auto id = it->get<std::string>(); !id.empty()) {
+			return id;
+		}
+	}
+	if (const auto it = document.find("contentId"); it != document.end() && it->is_string()) {
+		const auto& content_id = it->get_ref<const std::string&>();
+		if (content_id.size() == 36 && content_id[6] == '-' && content_id[16] == '_') {
+			return content_id.substr(7, 9);
+		}
+	}
+	return {};
+}
+
+bool EmulatorTitleFallbackWanted(const char* title_preset_env) {
+	return title_preset_env == nullptr || title_preset_env[0] == '\0';
 }
 
 std::string Describe(const LoadResult& result) {

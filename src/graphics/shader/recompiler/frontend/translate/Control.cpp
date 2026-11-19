@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/CallSplit.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
@@ -95,8 +96,28 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 	if (negate_result) {
 		result = ir.LogicalNot(result);
 	}
+	// KYTY_PS_EXEC_WORDS: the EXEC words combine bitwise (as the hardware's), the per-lane EXEC
+	// combines the per-lane masks, so helper lanes stay enabled per lane.
+	std::array<IR::U32, 2> mask {};
+	if (ExecWordsExcludeHelpers()) {
+		const std::array old_words {ir.GetExecLo(), ir.GetExecHi()};
+		const auto       src_words = ReadU32Pair(inst.src0);
+		for (size_t half = 0; half < 2; half++) {
+			const auto lhs_word = negate_exec ? ir.BitwiseNot(old_words[half]) : old_words[half];
+			const auto rhs_word = negate_source ? ir.BitwiseNot(src_words[half]) : src_words[half];
+			auto word = operation == IR::ValueOpcode::LogicalAnd  ? ir.BitwiseAnd(lhs_word, rhs_word)
+			            : operation == IR::ValueOpcode::LogicalOr ? ir.BitwiseOr(lhs_word, rhs_word)
+			                                                      : ir.BitwiseXor(lhs_word, rhs_word);
+			if (negate_result) {
+				word = ir.BitwiseNot(word);
+			}
+			mask[half] = program.wave_size == 64u || half == 0 ? word : IR::U32(IR::Value(0u));
+		}
+	}
 	WriteMask(inst.dst, old, true);
-	const auto mask = BallotMask(result);
+	if (!ExecWordsExcludeHelpers()) {
+		mask = BallotMask(result);
+	}
 	ir.SetExec(result);
 	ir.SetExecLo(mask[0]);
 	ir.SetExecHi(mask[1]);
@@ -275,9 +296,15 @@ void Translator::S_INST_PREFETCH() {
 }
 
 void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
+	// In a call-split program the guest code sits behind the split header: the guest pc is the
+	// program pc minus that prefix (CallSplit::Translation::guest_pc_offset).
+	// The native ray tracing patch moves guest instructions: guest_pc is where this one was.
+	uint64_t pc = inst.guest_pc != UINT32_MAX ? inst.guest_pc : inst.pc;
+	if (const auto* split = CallSplit::Current(); split != nullptr && pc >= split->guest_pc_offset) {
+		pc -= split->guest_pc_offset;
+	}
 	const auto base    = IR::U64(ir.Emit(IR::ValueOpcode::GetShaderBase));
-	const auto address = IR::U64(
-	    ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(static_cast<uint64_t>(inst.pc) + 4u)}));
+	const auto address = IR::U64(ir.Emit(IR::ValueOpcode::IAdd64, {base, IR::Value(pc + 4u)}));
 	if (inst.dst.kind == Decoder::OperandKind::Null) {
 		return;
 	}
@@ -336,6 +363,22 @@ void Translator::ScalarSelect64(const Decoder::Instruction& inst,
 }
 
 void Translator::MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers) {
+	if (apply_float_modifiers && GetCodegenOptions().mov_no_float_mods &&
+	    (inst.src0.negate || inst.src0.absolute)) {
+		// KYTY_MOV_NO_FLOAT_MODS (Erlou93/KytyPS5-Yotei): the bits move unchanged.
+		auto source     = inst.src0;
+		source.negate   = false;
+		source.absolute = false;
+		WriteOperand(DestinationOperand(inst), ReadOperand(source, IR::Type::U32));
+		return;
+	}
+	if (apply_float_modifiers && (inst.src0.negate || inst.src0.absolute) &&
+	    GetCodegenOptions().mov_int_mods) {
+		// KYTY_MOV_INT_MODS (ISA p.137: D.u = S0.u, the modifiers act on the sign bit): a U32 read
+		// applies abs/neg as AND 0x7fffffff / XOR 0x80000000, bit exact under host flush-to-zero.
+		WriteOperand(DestinationOperand(inst), ReadOperand(inst.src0, IR::Type::U32));
+		return;
+	}
 	if (apply_float_modifiers && (inst.src0.negate || inst.src0.absolute)) {
 		WriteOperand(DestinationOperand(inst), ReadOperand(inst.src0, IR::Type::F32));
 	} else {
@@ -476,8 +519,10 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 		EXIT("V_MOVRELS_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
 	const auto base     = inst.src0.reg;
-	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                    IR::U32(IR::Value(0xffu)));
+	// KYTY_MOVREL_FULL_M0 (ISA 3.7): M0 is a 32-bit index; the legacy mask keeps M0[7:0].
+	const bool full_m0  = GetCodegenOptions().movrel_full_m0;
+	const auto m0_value = ReadU32(ConditionOperand(Decoder::OperandKind::M0));
+	const auto m0       = full_m0 ? m0_value : ir.BitwiseAnd(m0_value, IR::U32(IR::Value(0xffu)));
 	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
 	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
@@ -486,7 +531,7 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	// RDNA2 3.6.1: an out-of-range source VGPR reads VGPR0. VGPRs at or above the highest one the
 	// program names are never written, so reading VGPR0 there is as valid as any value. Constant
 	// propagation drops this select when the M0 value set stays below the limit.
-	if (GetCodegenOptions().movrel_range && base != 0u && base < current_vector_limit) {
+	if ((GetCodegenOptions().movrel_range || full_m0) && base != 0u && base < current_vector_limit) {
 		const auto in_range = ir.ULessThan(m0, IR::U32(IR::Value(current_vector_limit - base)));
 		selected = ir.Select(in_range, selected, ir.GetVectorReg(static_cast<IR::VectorReg>(0)));
 	}
@@ -504,9 +549,19 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	}
 	const auto base  = inst.dst.reg;
 	const auto value = ReadU32(inst.src0);
-	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                 IR::U32(IR::Value(0xffu)));
+	// KYTY_MOVREL_FULL_M0: an index past the last VGPR (any M0 bit) writes nothing.
+	const auto m0_value = ReadU32(ConditionOperand(Decoder::OperandKind::M0));
+	const auto m0       = GetCodegenOptions().movrel_full_m0
+	                          ? m0_value
+	                          : ir.BitwiseAnd(m0_value, IR::U32(IR::Value(0xffu)));
+	// Between its first lane write and last lane read a VGPR holds spilled SGPRs, which no
+	// indexed register tuple overlaps, so the first such VGPR above the base ends the tuple
+	// (upstream ca2fd3141).
 	for (uint32_t index = base; index < current_vector_limit; index++) {
+		const auto [first_write, last_read] = lane_spills[index];
+		if (index != base && first_write < current_pc && current_pc < last_read) {
+			break;
+		}
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);
@@ -542,9 +597,13 @@ void Translator::V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16) {
 	    .fetch_inactive = inst.dst.op_sel,
 	    .bound_control  = inst.dst.op_sel_hi,
 	};
-	const auto result =
-	    ir.Emit(IR::ValueOpcode::Permlane16U32,
-	            {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2), ir.GetExec()}, flags);
+	// An EXEC-disabled source lane without FI disables the write unless BOUND_CTRL reads zero.
+	const auto inactive = flags.fetch_inactive || flags.bound_control
+	                          ? IR::U32(IR::Value(0u))
+	                          : ir.GetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg));
+	const auto result   = ir.Emit(
+	    IR::ValueOpcode::Permlane16U32,
+	    {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2), ir.GetExec(), inactive}, flags);
 	auto dst      = DestinationOperand(inst);
 	dst.op_sel    = false;
 	dst.op_sel_hi = false;

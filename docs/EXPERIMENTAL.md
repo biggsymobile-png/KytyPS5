@@ -4,6 +4,110 @@ This release builds on the U59 renderer of the previous U59 releases.
 
 ## New in this update
 
+### int22: launcher and package
+
+- **Shader lists in the package.** `PipelineLists/PPSA21567.kyplst` (Astro Bot) and `PipelineLists/PPSA01325.kyplst`
+  (Astro's Playroom) sit next to the emulator, where the game list's **Precompile** button and the emulator look for a
+  game's list: Precompile builds the listed shaders and pipelines before the first start instead of while you play.
+  Thanks to the players on Discord who sent shader lists. The Astro Bot list is stamped for version 01.018.000 and
+  holds the lists received for 01.018 and 01.019 (the 01.019 list was matched to the 01.018 executable by shader hash);
+  the Astro Bot title preset sets `KYTY_PIPELINE_LIST_CROSS=1`, so other versions use it as well, each shader still
+  matched to the game's own executable by its hash. Astro Bot: 1,203 shaders, 1,377 permutations, 5,922 pipelines;
+  Astro's Playroom (01.905.000): 324 shaders, 373 permutations, 732 pipelines. Both pass `kyty_pipeline_list check`
+  against the game and `verify` (no shader code in the file). A list you install yourself with "Choose shader
+  list..." (`PipelineLists/<title>_<version>.kyplst`) is used before the shipped one.
+- **Shader lists for six other games** are in `PipelineLists` as well, one per title id. Each was recorded with this
+  build in one play session on one PC: it covers what that session reached, and it is used only with the game
+  version it was recorded on (`kyty_pipeline_list info <file>` shows the version). A first Precompile compiles in
+  the GPU driver, which takes time and memory: in the runs measured here from a few seconds up to 24 minutes and
+  35 GB of memory for the largest game with an empty driver cache.
+- **Export list** (below Precompile in the game list, and "Export shader list..." in the row's menu): makes a shader
+  list of what your own sessions of that game recorded (`_PipelineCache/<title>.shaders.journal` and
+  `.pipelines.journal`), checks that it holds no shader code, and saves it as
+  `ShaderListExports/<title>-<version>-shaderlist.kyplst` next to the emulator; the window names the file and opens
+  its folder. Send that one file, never the `_PipelineCache` folder, journals or game files. It runs
+  `kyty_pipeline_list.exe` (now in the package) export and verify, like the separate `kyty_shaderlist_export` window;
+  nothing is kept when either step fails. It is off while the game runs or is being precompiled, and says so when
+  nothing has been recorded yet. Scripts: `kyty_launcher --export-list <game folder or .zar> [--export-list-out
+  <file>]`. Windows only for now (the button is hidden when `kyty_pipeline_list` is not next to the launcher).
+  The emulator records only what it did not get from an installed list, so the export takes in the list the game
+  ran with (`PipelineLists/<title>.kyplst`, or the file `KYTY_PIPELINE_LIST` names): the saved file holds that list
+  and what your sessions added, and the window says how much is new. A list of the int21 release (the two Astro
+  lists here) gives its shaders and permutations, converted the way the emulator converts them; its pipelines were
+  recorded with the older layout and are left out, the ones your sessions recorded go in. Pipelines whose first
+  stage's identity depends on the GPU cannot be listed yet (40 of 1,192 in one Astro Bot recording). Shaders that
+  are not in the game's executable are searched for in its data files, the installed list's files and their
+  folders first; for a large game that has no list yet this first search can take tens of minutes (the window shows
+  how far it is and can cancel).
+- **Faster GPU synchronisation (experimental)**, a per-game checkbox in the game configuration (Graphics), default
+  off: starts the game with `KYTY_GPU_HAZARD=3`, `KYTY_INDIRECT_ARGS_RANGES=1`, `KYTY_GUEST_BARRIER_SCOPE=rel=drop` and
+  `KYTY_DMA_BARRIER_BATCH=1`, which trim redundant GPU barriers (about 1 fps in heavy Astro Bot scenes). Turn it off
+  if graphics glitch. A variable that `u59-preset.json` or a title preset already sets keeps that value. Saved per
+  game (`fast_gpu_sync`) and in exported game configs.
+- **Recommended settings per game.** The launcher holds the launcher settings each of the other games was tested
+  with: "Enable readback" and "Enable tessellation support" for Gran Turismo 7, Ghost of Yotei, Spider-Man: Miles
+  Morales, Ratchet & Clank: Rift Apart, Demon's Souls and Beyond Good & Evil 20th Anniversary; "Accurate occlusion
+  queries" on top for the Insomniac games; "Enable tiled readback" on top for Ratchet & Clank (players report the
+  game needs it; it was not part of the boot checks). A game that has no
+  config of its own starts with them over the global settings. In a game's configuration, **Reset** returns to
+  them and the new **Recommended** button sets them and keeps your other choices (its tooltip lists them); a config
+  you saved before this version keeps your values until you press one of the two. Astro Bot and Astro's Playroom
+  were measured with the default settings and have no entry.
+- **Default window size 1920x1080** (was 1280x720) for a new settings file and for **Reset**. A settings file from
+  an earlier version keeps the size saved in it (Global settings, Screen resolution).
+- **CPU check at start-up.** The release is compiled for x86-64-v3 (AVX, AVX2, BMI1, BMI2, FMA, F16C, LZCNT, MOVBE).
+  On an older CPU `kyty_launcher` and `kyty_emulator` now say "This build needs a CPU with AVX2, BMI2 and FMA (Intel
+  Core 4th generation / AMD Ryzen or newer)", name what the CPU lacks and exit (exit code 3) instead of crashing with
+  an illegal instruction. The check is compiled for the x86-64 baseline and runs from the C run-time's C initializer
+  table, before any other code of the program. `KYTY_TEST_CPU_CHECK=fail` shows the message on any CPU.
+
+### int22: Astro Bot and Astro's Playroom
+
+- **Title presets.** Beside `u59-preset.json` the package has one preset per game, `u59-preset.<title id>.json`
+  (`u59-preset.PPSA21567.json` for Astro Bot and the same content as `u59-preset.PPSA21564.json` for the game's
+  other title id, `u59-preset.PPSA01325.json` for Astro's Playroom, and nine more). The
+  launcher applies a game's title preset over `u59-preset.json` when it starts that game; the emulator does it
+  itself when it is started without the launcher. `u59-preset.json` is the same as in int21: everything new for a
+  game is in its title preset, so keep all the preset files next to the launcher. A switch that only one game has
+  been tested with is on for that game only.
+- **Less work on the commit thread**, the one thread that hands the game's draws to Vulkan in the game's order and
+  that limits the frame rate where the GPU has time to spare. On in both title presets, each one a live switch that
+  was compared inside one boot and checked with its verify mode: draw runs that continue the previous draw's state
+  (`KYTY_CONT_KERNEL`, `KYTY_CONT_KERNEL_INPLACE`, `KYTY_BK_HANDOVER`, `KYTY_BK_ADOPT`, `KYTY_BK_RECORD`,
+  `KYTY_BK_LEAN`), buffers that shaders read through computed addresses synchronised only as far as the shader can
+  reach (`KYTY_BDA_REACH`), image look-ups reused across draws (`KYTY_IMG_MEMO2`, `KYTY_IMG_INPLACE`,
+  `KYTY_IMG_PARTNER`, `KYTY_IMG_DEPTHALIAS`), and smaller per-draw costs (`KYTY_LAZY_FIND_BUFFER`,
+  `KYTY_SKIP_TARGETS_MEMO`, `KYTY_REBIND_LEAN`, `KYTY_POP_READY_FAST=2`, `KYTY_IDLE_FLUSH_REFRESH_US=100`,
+  `KYTY_CERT_PREFETCH`, `KYTY_CERT_COUNT_LAZY`). `KYTY_STATIC_ONCE_FAST` is on by default for every game (0 turns it
+  off). Astro's Playroom also sets `KYTY_BDA_LIVE_PAGES=1` (pages the game rewrites every frame are read from the
+  game's memory instead of being uploaded each frame) and `KYTY_HANDOFF_LEAN=1`.
+- **Shader code for NVIDIA GPUs**: `KYTY_F32_FLUSH_HOST=nvidia`, `KYTY_LDS_SLOTS=nvidia` and
+  `KYTY_VS_FULL_WAVE=nvidia` are on only when the GPU is an NVIDIA one (they were measured on an RTX 3090 only, and
+  the first relies on NVIDIA's default float mode, which a self-test checks at start-up). Astro Bot also sets
+  `KYTY_BRANCHLESS_LOADS=1` and `KYTY_LANE_LOCAL=1`. These change the generated shaders: the first start after the
+  update rebuilds the program cache once.
+- **Astro Bot, sponge level**: `KYTY_READBACK_EAGER_WRITES=1` with `KYTY_READBACK_EAGER_PAGES=256`. The level's
+  fluid job writes memory on the GPU that the game's threads write again a frame later; those pages are now copied
+  back when the GPU work is recorded, so the game's threads no longer wait for the GPU at every such write.
+- **CPUs with fewer than 16 logical processors**: `KYTY_SMALL_CPU_RULE=1` sets `KYTY_GUEST_PRIORITY_FLAT=1` (the
+  game's spinning job workers no longer hold every processor while the threads they wait for cannot run; on 4 cores
+  / 8 threads and on 6 cores without SMT this removed 2.5-second stalls) and, from 10 logical processors up,
+  `KYTY_SPIN_BUDGET=1`. One "Kyty small-CPU rule" console line says what it chose. It does nothing on larger CPUs.
+- **Off by default**: the "Faster GPU synchronisation" launcher option described above. (The code of an unfinished
+  change, `KYTY_EMIT_SPLIT`, is in this build but must stay off: switched on from the start it froze a level load.)
+
+### int22: other games
+
+- **Fixed (GPU device loss during a level load, another title):** a compute dispatch that writes through addresses it
+  computes itself, into memory the emulator had not yet given a GPU buffer, kept only its first 4,096 stores; the
+  rest were dropped, and a later dispatch that read the half-written array could hang the GPU. Whether the load hit
+  it depended on timing, and the fastest builds hit it most. The log of such stores now holds 262,144 per dispatch
+  (the part past the first 4,096 is fetched only when a dispatch needs it). Atomic operations and formatted stores
+  into such memory are still dropped until the memory has its buffer (a frame later).
+- Per-title presets for Gran Turismo 7, Ghost of Yotei (02.002), Spider-Man: Miles Morales, Ratchet & Clank: Rift
+  Apart, Demon's Souls and Beyond Good & Evil 20th Anniversary hold the switches collected for these games. They are
+  experimental: on the test PC each of them starts and reaches its menu or the game with this build.
+
 Pre-release int16.1: int16 plus one fix.
 
 - Reverted the upstream libFont commits "font: fix glyph metrics and raster sizes" (32e9fa30) and "font: add scaled
@@ -288,16 +392,26 @@ From int5 (`u59-windows-20261003-int5`):
 
 ## Measured
 
-Astro Bot (PPSA21567); RTX 3090, Ryzen 9 7950X3D; 1920x1080 output at a 120 Hz vblank; warm program caches; the
-bundled preset. This release was checked with single timed runs, not with an alternating comparison:
+Astro Bot (PPSA21567, 01.018) and Astro's Playroom (PPSA01325); RTX 3090, Ryzen 9 7950X3D; 1920x1080 output at a
+120 Hz vblank; warm caches; the release presets; int21 and this build booted in turn, one boot each per scene, with
+the desktop in use (a browser playing video costs 5-10 fps here), so read the pairs, not the absolute numbers:
 
-- Sky Garden start view: 35.2 fps with a local build of this release (int7: 33-35 fps in earlier runs).
-- Creamy Canyon start view: 21.3 fps with a local build before the last compatibility merge (int7: 21.7-22.2 fps).
-  The RTX 50 fix costs about 2% there (21.7 vs 22.2 fps when it was compared alone against int7, alternating
-  launches); that scene is limited by the command processor.
-- With the AMD CPU patch (`--amd-cpu`), Sky Garden: 31.6 fps (int7 with the patch: 18.9 fps).
-- Demon's Souls boots to its menu with the preset (Language Select at 60 fps).
-- With int5, batched occlusion queries took the Creamy Canyon start view from 8.3 to 22.0 fps.
+| Scene | int21 | int22 |
+|---|---|---|
+| Astro Bot, Sky Garden, no game patches | 50.5 fps | 55.2 fps (+9%) |
+| Astro Bot, pirate island, no game patches | 51.9 fps | 53.3 fps (+3%) |
+| Astro Bot, sponge, no game patches | 40.8 fps | 53.0 fps (+30%) |
+| Astro Bot, Sky Garden, three patch mods | 55.9 fps | 64.0 fps (+15%) |
+| Astro Bot, pirate island, three patch mods | 53.2 fps | 55.8 fps (+5%) |
+| Astro Bot, sponge, three patch mods | 42.7 fps | 57.4 fps (+34%) |
+| Astro's Playroom, CPU Plaza | 71.8 fps | 76.7 fps (+7%) |
+| Astro's Playroom, GPU Jungle | 71.9 fps | 71.0 fps (-1%) |
+
+The three patch mods are our own test patches (non-tiled renderer, GI probes off, fixed 1080p); no game patches are
+part of the release for Astro Bot or Astro's Playroom. Other games were only checked for starting: Gran Turismo 7
+reaches its title menu (44 fps), Spider-Man: Miles Morales the game (2-5 fps while its ray-tracing shaders compile),
+Demon's Souls its first screen (60 fps), Ratchet & Clank: Rift Apart its title screen (19-20 fps), Beyond Good & Evil
+20th Anniversary its main menu (60 fps), and Ghost of Yotei loads a save into the first village.
 
 ## Launching
 
@@ -349,7 +463,7 @@ also use the second CCD (`KYTY_VCACHE_GUEST=all`, default; `hot` keeps them on t
   Windows 11). The limits at which the windows grow come from that PC, a simulation of slow faults on it and one
   Linux user's log. `"KYTY_OCCLUSION_BATCH": "0"` and `"KYTY_FAULT_AHEAD_ADAPT": "0"` in `u59-preset.json` restore
   the previous behaviour.
-- The PGO profile comes from Astro Bot only. Other games run with code laid out for Astro Bot.
+- The PGO profile comes from Astro Bot and Astro's Playroom only. Other games run with code laid out for these two.
 - Microsoft Defender flagged the int7 `launcher.exe` as `Trojan:Win32/Bearfoos.A!ml` on the test PC. The `!ml` marks a
   machine-learning verdict, not the signature of known malware. The launcher is built by the GitHub Actions workflow
   `.github/workflows/u59-windows-release.yml` from `src/launcher` in this repository. Since upsync 5 it is named
@@ -367,13 +481,15 @@ Release with Ninja in an x64 Visual Studio developer shell, as in `.github/workf
 - Configure from `C:\kyty-src19`, a directory junction to the checkout (`mklink /J C:\kyty-src19 <checkout>`, then
   `cmake -S C:\kyty-src19 -B <new build directory>`). clang-cl names functions in anonymous namespaces after a hash
   of the source path, so a build from any other path loses their part of the profile.
-- Add `-DKYTY_EMULATOR_IPO=ON` and `-DKYTY_PGO_USE=C:/kyty-src19/tools/pgo/u59-int21-1.profdata`. Without
+- Add `-DKYTY_EMULATOR_IPO=ON` and `-DKYTY_PGO_USE=C:/kyty-src19/tools/pgo/u59-int22-1.profdata`. Without
   `KYTY_PGO_USE` the build works, but without the profile's speedup.
 - Add `-DKYTY_CP_DIAGNOSTICS=OFF`, as the release does: it compiles out the command processor's per-draw
   developer statistics (`KYTY_CP_COMMIT_STATS`, `KYTY_BUFFER_LOOKUP_STATS`, which are then ignored). The hang
   watchdog, crash context and hang trace are unaffected. Keep the default `ON` to use those statistics.
-- Build `launcher` and `kyty_emulator`, install to `_Build/windows/install`, and copy `tools/u59-preset.json` beside
-  `kyty_launcher.exe`.
+- Add `-DKYTY_MARCH=x86-64-v3`, as the release does (host code for CPUs with AVX2, BMI2 and FMA, with the start-up
+  CPU check). Leave it out for a build that runs on any x86-64 CPU.
+- Build `launcher` and `kyty_emulator`, install to `_Build/windows/install`, and copy `tools/u59-preset.json` and
+  the title presets `tools/u59-preset.*.json` beside `kyty_launcher.exe`.
 
 The Windows release is produced by a tagged GitHub Actions build. Original licenses and credits remain intact.
 Personal handoffs, local editor configuration, captures, saves and caches are excluded. Historical results and their

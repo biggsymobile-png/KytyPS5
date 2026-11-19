@@ -36,7 +36,16 @@ struct HostFormatInfo {
 HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
                                  Prospero::ChannelOrder order) {
 	if (guest_format == Prospero::BufferFormat::k10_11_11Float) {
+		// KYTY_10_11_11_RED: red in red, no mapping (the transfers convert the bits).
+		if (Red10_11_11InRed()) {
+			return {vk::Format::eB10G11R11UfloatPack32, {}};
+		}
 		return {vk::Format::eB10G11R11UfloatPack32, Prospero::ColorMappingBgra};
+	}
+	// KYTY_2_10_10_10_ROTATE (upstream 963aaeb3b): the transfers rotate the 2-bit component to the
+	// top (ColorTransform::Rotate2_10_10_10), so the host image keeps the guest's bit fields.
+	if (guest_format == Prospero::BufferFormat::k2_10_10_10UNorm && Rotate2_10_10_10Enabled()) {
+		return {vk::Format::eA2R10G10B10UnormPack32, Prospero::ColorMappingAbgr};
 	}
 	if (order == Prospero::ChannelOrder::kAlt) {
 		switch (guest_format) {
@@ -56,6 +65,13 @@ HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
 		case Prospero::BufferFormat::k5_5_5_1UNorm: return {format, Prospero::ColorMappingBgra};
 		case Prospero::BufferFormat::k1_5_5_5UNorm:
 		case Prospero::BufferFormat::k4_4_4_4UNorm: return {format, Prospero::ColorMappingAbgr};
+		// The 2-bit component (the first, at the bottom) in the host's alpha, the 10-bit ones in
+		// its red, green and blue: the precision matches, the bit layout does not (A2B10G10R10 has
+		// alpha at the top), so guest bytes read or written by the CPU come out shuffled. GT7
+		// renders to one when a race is left.
+		case Prospero::BufferFormat::k2_10_10_10UNorm:
+		case Prospero::BufferFormat::k2_10_10_10UInt:
+			return {format, Prospero::ColorComponentMapping {0x39u}}; // 1, 2, 3, 0
 		default: return {format, {}};
 	}
 }
@@ -127,7 +143,11 @@ bool FitsBufferRange(uint64_t offset, uint64_t size, uint64_t capacity) {
 RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order) {
-	const auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
+	auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
+	if (encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm && Prospero::Fmt30AsFloat()) {
+		// KYTY_FMT30_UFLOAT: scene targets programmed as COLOR_11_11_10 UNORM store packed unsigned floats.
+		encoding.buffer_format = Prospero::BufferFormat::k11_11_10Float;
+	}
 	if (encoding.IsValid() && encoding.SupportsOrder(order)) {
 		const auto host_format = ResolveHostFormat(encoding.buffer_format, order);
 		const auto bytes       = Prospero::RenderTargetBytesPerElement(encoding.buffer_format);
@@ -166,6 +186,9 @@ vk::ComponentMapping TextureGetComponentMapping(uint32_t                        
 }
 
 SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
+	if (format == Prospero::BufferFormat::k11_11_10UNorm && Prospero::Fmt30AsFloat()) {
+		format = Prospero::BufferFormat::k11_11_10Float; // KYTY_FMT30_UFLOAT
+	}
 	const auto backing_format = Prospero::RemapTextureFormat(format);
 	const auto host_format = ResolveHostFormat(backing_format, Prospero::ChannelOrder::kStandard);
 	const auto conversion_format =
@@ -177,6 +200,9 @@ SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
 }
 
 bool TextureSurfaceFormatKnown(Prospero::BufferFormat format) {
+	if (format == Prospero::BufferFormat::k11_11_10UNorm && Prospero::Fmt30AsFloat()) {
+		format = Prospero::BufferFormat::k11_11_10Float; // KYTY_FMT30_UFLOAT
+	}
 	return ResolveHostFormat(Prospero::RemapTextureFormat(format), Prospero::ChannelOrder::kStandard)
 	           .format != vk::Format::eUndefined;
 }

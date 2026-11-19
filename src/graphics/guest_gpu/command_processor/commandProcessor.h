@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/cpOps.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -139,11 +140,26 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            BufferFlushAndWait();
+	// The flush at the end of a queue's slice that made progress (complete: the submission ended;
+	// otherwise it stopped at a wait or yielded).
+	void            SliceEndFlush(bool complete);
+	// KYTY_FLUSH_DEFER: a held slice-end flush submitted once the GPU is down to its last
+	// submission (checked every 16 units of weight: a draw 1, a dispatch 4); true when submitted.
+	bool            MaybeReleaseHeldFlush(uint32_t weight);
+	// KYTY_FLUSH_DEFER: the held flush, if any, before the GPU thread waits for work.
+	void            ReleaseHeldFlush();
 	static uint32_t EopFlushPacketLimit();
 	void            BufferWait();
 	// Early submit when the GPU ran out of submitted work (KYTY_IDLE_FLUSH_DRAWS). Call after
 	// recording a draw or dispatch, at a packet boundary.
-	void            MaybeFlushIdleGpu();
+	// After each recorded draw (dispatch: a dispatch): an early submit when the GPU is idle
+	// (KYTY_IDLE_FLUSH_DRAWS) or every KYTY_DRAW_FLUSH_INTERVAL draws / KYTY_DISPATCH_FLUSH_INTERVAL
+	// dispatches of one recording.
+	void            MaybeFlushIdleGpu(bool dispatch = false);
+	void            MaybeFlushBatched(uint32_t every); // KYTY_SUBMIT_EVERY
+	// The periodic part (KYTY_DRAW_FLUSH_INTERVAL / KYTY_DISPATCH_FLUSH_INTERVAL): true when it
+	// submitted.
+	bool            MaybeFlushPeriodic(bool dispatch);
 	// Graphics queue: after KYTY_GFX_SLICE_DRAWS draws in a slice, end the slice after the
 	// current packet when another queue has runnable work. Call after recording a draw.
 	void            MaybeYieldSlice();
@@ -165,8 +181,10 @@ public:
 	void DrawIndexAuto(DrawAutoArgs args);
 	// GET_LOD_STATS: the packet's 4 body dwords (the report, or its KYTY_LOD_STATS_MODE fallback).
 	void GetLodStats(const uint32_t* body);
+	// `records` > 1: a KYTY_INDIRECT_RUNS run, that many packets drawing consecutive records from
+	// data_offset (one op, one draw-prep slot, one host multi-draw where the native path takes it).
 	void DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
-	                  uint32_t draw_initiator, bool indexed);
+	                  uint32_t draw_initiator, bool indexed, uint32_t records = 1);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
 	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed,
@@ -192,7 +210,11 @@ public:
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
+	// R_PSSR (experimental Pro mode): a linear PSSR upscale, recorded as an op.
+	void ProcessPssr(const Pssr::Request& request);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
+	// KYTY_PM4_BARRIERS=guest: the full barrier at the start of a queue's slice (executor thread).
+	void SliceStartBarrier() { EmitGlobalBarrier(GuestBarrierKind::Pm4Sync); }
 	// COND_EXEC: whether the condition dword at `address` is non-zero (read in order).
 	[[nodiscard]] bool CondExec(uint64_t address);
 	// Conditional INDIRECT_BUFFER: whether the then-buffer is taken (the 64-bit value at
@@ -219,6 +241,9 @@ public:
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
+	// MEM_SEMAPHORE (async compute, upstream 1b7093805): a signal bumps (or sets) the counter, a
+	// wait suspends the packet while it is zero and decrements it otherwise. Direct front only.
+	void MemSemaphore(uint64_t* counter, bool signal, bool write);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
@@ -233,6 +258,8 @@ public:
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
 
 	void SetFlip(const FlipInfo& flip) { m_flip = flip; }
+	// KYTY_FLIP_WATERMARK: flip requests from this id on are newer than the buffer being processed.
+	void SetFlipWatermark(uint64_t watermark) { m_flip_watermark = watermark; }
 
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
@@ -294,6 +321,29 @@ private:
 	[[nodiscard]] bool AwaitPendingWrites(uint64_t begin, uint64_t end);
 	// Sequencer thread: reads guest bytes the resolver may have to read in order (lockstep).
 	[[nodiscard]] bool ReadGuestForFront(uint64_t address, uint64_t size, void* dst);
+	[[nodiscard]] bool ReadGuestForFrontSerial(uint64_t address, uint64_t size, void* dst);
+	// KYTY_CP_DECISION_MEMORY (graphicsRun.cpp). Resolver: a decision read of guest bytes (the
+	// journal of known CP-write values, else ReadGuestForCp); returns its stats class.
+	uint32_t ReadDecision(uint32_t site, uint64_t vaddr, uint64_t size, void* dst);
+	// Sequencer: the CP writes emitted since the front's last wait or stop, with their values when
+	// known (WRITE_DATA; plain label data marked as a label).
+	struct FrontValue {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		bool     known = false;
+		bool     label = false;
+		uint8_t  value[64] {};
+	};
+	std::vector<FrontValue> m_front_values;
+	void NoteFrontValue(CpSeq::OpKind kind, const void* payload, const void* data, uint32_t data_size,
+	                    uint64_t begin, uint64_t end);
+	// All of [address, address + size) has known values (labels only with `allow_labels`);
+	// `pending`: some CP write emitted since overlaps the bytes.
+	[[nodiscard]] bool FrontKnown(uint64_t address, uint64_t size, void* dst, bool allow_labels,
+	                              bool* pending) const;
+	// Resolver: the first failed evaluation of the current WAIT_REG_MEM (stats).
+	uint64_t m_decide_fail_ns    = 0;
+	uint32_t m_decide_fail_class = 0;
 	// Sequencer thread: a snapshot of the front registers for an op; its index.
 	[[nodiscard]] uint32_t TakeSnapshot();
 	// Sequencer thread: waits for a free draw-prep window slot. False: stopping.
@@ -357,6 +407,7 @@ private:
 	void          ExecReferenceClock(const CpSeq::ReferenceClockOp& op);
 	void          ExecDmaData(const CpSeq::DmaDataOp& op);
 	void          ExecLodStats(const CpSeq::LodStatsOp& op);
+	void          ExecPssr(const CpSeq::PssrOp& op);
 	void          ExecFlip(const CpSeq::FlipOp& op);
 	CpSeq::Result ExecWaitRegMem(const CpSeq::WaitRegMemOp& op);
 	template <typename T>
@@ -377,7 +428,7 @@ private:
 	// A back-only helper: GET_LOD_STATS with KYTY_LOD_STATS_MODE=gpu.
 	void ReportLodStats(uint64_t destination, uint32_t size, uint32_t control);
 	// Back-only helpers of RELEASE_MEM and EVENT_WRITE.
-	void EmitGlobalBarrier();
+	void EmitGlobalBarrier(GuestBarrierKind kind);
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	// Flush requested by an end-of-pipe interrupt. Interrupts fire when their tick completes, so
 	// only every KYTY_EOP_FLUSH_BATCH-th request flushes (default 8; 1 = flush every time); a
@@ -433,6 +484,9 @@ private:
 	[[nodiscard]] bool  TryDrawIndirectNative(DrawIndirectSource source);
 	void                ValidateIndirectSource(const DrawIndirectSource& source);
 	[[nodiscard]] uint32_t NumInstances();
+	// KYTY_GPU_INSTANCE_COUNT: the guest address of the instance count NumInstances would read
+	// when the newest pending native indirect draw decides it alone (no count buffer), else 0.
+	[[nodiscard]] uint64_t GpuInstanceCountAddress() const;
 	// Draw-prep (drawPrep.h): the engine of the graphics processor, created on first use when
 	// KYTY_DRAW_PREP (or the S0 histogram) is enabled; null otherwise.
 	[[nodiscard]] DrawPrep::Engine* DrawPrepEngine();
@@ -490,6 +544,7 @@ private:
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;
+	uint64_t  m_flip_watermark              = UINT64_MAX;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
 	uint32_t  m_deferred_eop_flushes        = 0;
@@ -501,6 +556,16 @@ private:
 	// MaybeFlushIdleGpu: recording tick being counted and its draws/dispatches so far.
 	uint64_t  m_idle_flush_tick             = 0;
 	uint32_t  m_idle_flush_draws            = 0;
+	uint64_t  m_idle_flush_refresh_ns       = 0; // KYTY_IDLE_FLUSH_REFRESH_US: the last timeline query
+	uint32_t  m_held_flush_checks           = 0; // KYTY_FLUSH_DEFER (MaybeReleaseHeldFlush)
+	// KYTY_SUBMIT_EVERY: the recording's idle-early submit is armed (its first command after a
+	// non-batch submit found the GPU idle), and the tick our last batch submit opened.
+	bool      m_idle_flush_armed            = false;
+	uint64_t  m_batch_flush_tick            = 0;
+	// MaybeFlushIdleGpu's periodic submits: recording tick being counted, its draws and dispatches.
+	uint64_t  m_periodic_flush_tick         = 0;
+	uint32_t  m_periodic_flush_draws        = 0;
+	uint32_t  m_periodic_flush_dispatches   = 0;
 	// Draws recorded in the current graphics slice (MaybeYieldSlice).
 	uint32_t  m_slice_draws                 = 0;
 
@@ -584,6 +649,9 @@ private:
 	uint64_t       m_retry_op         = 0;
 	// Process(): the draw-prep packet hook runs for this slice's packets (decided per slice).
 	bool m_packet_hook = false;
+	// KYTY_DRAW_PREP_FENCE_OVERLAP (drawPrep.h): the packet hook left the window open for this
+	// packet; its handler (DrawIndirect / DispatchDirect) publishes, commits up to and executes it.
+	bool m_fence_overlap = false;
 };
 
 } // namespace Libs::Graphics

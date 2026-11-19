@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -21,6 +22,12 @@ struct HostFloatControls {
 void              SetHostFloatControls(const HostFloatControls& controls);
 HostFloatControls GetHostFloatControls();
 
+// Emitter statistics since process start (offline comparisons, --journal-compile): shader-side
+// f32 denormal flushes emitted by stage (0 pixel, 1 compute, 2 geometry), and non-compute
+// programs with function-scope LDS by KYTY_LDS_SLOTS verdict (0 slots, 1 array kept).
+uint64_t EmittedDenormFlushes(uint32_t stage_index);
+uint64_t LdsSlotVerdicts(uint32_t verdict);
+
 // Storage-buffer robustness the device guarantees. With robustBufferAccess2 enabled and
 // robustStorageBufferAccessSizeAlignment == 1, a 32-bit load from a storage-buffer descriptor
 // returns 0 exactly when some byte of it lies outside the descriptor range, which is the
@@ -36,6 +43,46 @@ struct HostBufferRobustness {
 
 void                 SetHostBufferRobustness(const HostBufferRobustness& robustness);
 HostBufferRobustness GetHostBufferRobustness();
+
+// KYTY_SRT_UNIFORM (CodegenOptions::srt_uniform) on a device with the uniform dword-load path: the
+// flattened SRT binding is a uniform buffer (emitter and descriptor layout agree through this).
+bool SrtUniformEnabled();
+
+// KYTY_BUFFER_PAIR_ATOMIC: the device has 64-bit atomics on storage buffers and physical storage
+// buffers (shaderBufferInt64Atomics) and starts every storage-buffer binding 8-byte aligned
+// (minStorageBufferOffsetAlignment a multiple of 8), so the u64 view's element i of a binding is the
+// guest qword at binding byte 8i. Off: DWORDX2 pairs through bound V#s keep the dword path (pairs
+// through BDA check the host address itself). The device layer sets this once.
+void SetHostBufferPairAtomics(bool supported);
+bool GetHostBufferPairAtomics();
+// KYTY_MESH_LAYER=drop|amd (default keep; GT7 fork 67d59fe29, issue 21 there): AMD's Windows driver
+// crashed making every pipeline whose mesh shader writes the per-primitive Layer output (RX 6950 XT,
+// drivers 26.5.1 and 26.10.1). With drop (on any GPU) or amd (on an AMD GPU) mesh shaders declare no
+// Layer output: a draw into a target of one layer draws the same, a layered target gets everything
+// in its first layer. The device layer sets this once, before any shader is compiled.
+void SetHostMeshLayerDrop(bool drop);
+bool GetHostMeshLayerDrop();
+// Coherent (GLC/DLC) buffer loads (GT7 fork 171338e72 + f9586d18c). Under the GLSL450 memory model a
+// Volatile load from a Coherent buffer is visible only together with barriers: NVIDIA (an RTX 3090)
+// reloads anyway, AMD's drivers keep serving the cached value (a workgroup polling for its
+// predecessor's published value never sees it), and an RTX 5090 did too (GT7 ray tracing mode's car
+// interiors blotchy, the wheels glowing white). How such a load is made:
+//   Plain   a volatile load (the default; nothing changes)
+//   Barrier a volatile load and a device-scope acquire-release barrier after it (costly on the GPU)
+//   Acquire one OpAtomicLoad at device scope with acquire semantics
+//   Relaxed one OpAtomicLoad at device scope, unordered
+// KYTY_COHERENT_LOAD_MODE=plain|barrier|acquire|relaxed picks one; without it
+// KYTY_COHERENT_LOAD_ACQUIRE=1 gives Barrier, =auto Barrier on every vendor but NVIDIA (the fork's
+// default), else Plain. Scalar coherent loads take the mode too unless it is Plain.
+enum class CoherentLoadMode : uint32_t { Plain = 0, Barrier = 1, Acquire = 2, Relaxed = 3 };
+// The device layer: whether the device's vendor wants the barrier (KYTY_COHERENT_LOAD_ACQUIRE=auto).
+void                      SetCoherentLoadVendorDefault(bool barrier);
+[[nodiscard]] CoherentLoadMode GetCoherentLoadMode();
+[[nodiscard]] const char* CoherentLoadModeName(CoherentLoadMode mode);
+// KYTY_INDIRECT_FORMAT_COUNT (CodegenOptions.h): device address of the per-format counters of the
+// DontInline full formatted-load decoder (0: off). The buffer cache sets it once.
+void     SetIndirectFormatCountAddress(uint64_t address);
+uint64_t IndirectFormatCountAddress();
 
 // Derivatives in compute shaders (IMAGE_GET_LOD: OpImageQueryLod under DerivativeGroupQuads). The
 // device layer enables VK_KHR_compute_shader_derivatives, else VK_NV_compute_shader_derivatives
@@ -54,6 +101,15 @@ struct HostImageFeatures {
 void              SetHostImageFeatures(const HostImageFeatures& features);
 HostImageFeatures GetHostImageFeatures();
 
+// KYTY_POPS_INTERLOCK: the device enabled VK_EXT_fragment_shader_interlock with
+// fragmentShaderPixelInterlock (set once by the device layer; false until then).
+void SetHostFragmentInterlock(bool supported);
+bool GetHostFragmentInterlock();
+// KYTY_IMPLICIT_LOD_STAGES: the device enabled computeDerivativeGroupLinear (with the compute
+// derivatives extension of HostImageFeatures::compute_derivatives).
+void SetHostComputeDerivativesLinear(bool supported);
+bool GetHostComputeDerivativesLinear();
+
 // The clock S_MEMREALTIME reads (VK_KHR_shader_clock, set once by the device layer). S_MEMREALTIME
 // is a free-running 64-bit counter at 100 MHz. The emitter reads OpReadClockKHR at this scope and
 // shifts the value toward 100 MHz: right by `shift` bits when it is positive, left when negative.
@@ -64,6 +120,8 @@ enum class HostClockScope : uint8_t { None, Subgroup, Device };
 struct HostShaderClock {
 	HostClockScope scope = HostClockScope::None;
 	int32_t        shift = 0;
+	// > 1: divide the clock by this instead of shifting (shift is then 0). See RealtimeClockDivisor.
+	uint32_t divisor = 1;
 };
 
 void            SetHostShaderClock(const HostShaderClock& clock);
@@ -108,12 +166,33 @@ HostWaveClusters GetHostWaveClusters();
 // its timestamp counter, so the shift is taken from timestampPeriod: the one that brings the rate
 // into [66.7, 133.3) MHz (3 at 1 GHz, 0 at 100 MHz, -2 at 19.2 MHz), between -8 and 8.
 [[nodiscard]] int32_t RealtimeClockShift(double timestamp_period_ns);
+// KYTY_MEMREALTIME_EXACT=1 (default off; TheCruZ/KytyPS5-GTA dcd6c059): the whole divisor nearest to
+// rate / 100 MHz (10 at 1 GHz, 8 at 800 MHz, 1 at 100 MHz and slower), 1..1024. The shift above
+// makes a 1 GHz clock 125 MHz (25% fast): guest timeouts and frame pacers that compare counter
+// differences with intervals in 100 MHz ticks expire early.
+[[nodiscard]] constexpr uint32_t RealtimeClockDivisor(uint32_t period_ps) {
+	if (period_ps == 0u) {
+		return 1u;
+	}
+	const uint32_t divisor = (10000u + period_ps / 2u) / period_ps;
+	return divisor < 1u ? 1u : (divisor > 1024u ? 1024u : divisor);
+}
+// The clock setting for a device clock with this timestamp period: the shift (RealtimeClockShift),
+// or with exact = true and a clock faster than 100 MHz the divisor (a power of two stays a shift).
+[[nodiscard]] HostShaderClock RealtimeClockScale(double timestamp_period_ns, bool exact);
 
 // mip_stats_records=false emits the plain variant of a GET_LOD_STATS-instrumented pixel shader:
 // the same bindings and code, without the per-sample feedback (and so without its storage-buffer
 // atomics, which force depth/stencil tests after the shader for a shader that can discard).
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info, bool mip_stats_records = true);
+
+// KYTY_HUGE_HELPER_OUTLINE: in a module of at least 100,000 words, each of `helpers` (function
+// ids, 0 = none, at most 4) with at least 16 call sites gets the DontInline function control.
+void OutlineHugeModuleHelpers(std::vector<uint32_t>& words, std::span<const uint32_t> helpers);
+
+// Why a mesh program cannot run in passes (ShaderMeshInputInfo::passes), or nullptr.
+[[nodiscard]] const char* MeshPassesUnsupported(const IR::Program& program);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

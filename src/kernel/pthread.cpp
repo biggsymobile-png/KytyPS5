@@ -1,11 +1,14 @@
+#include "common/hleWaitStats.h"
+#include "common/staticOnce.h"
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/condWaitUntil.h"
 #include "common/cpuPlacement.h"
-#include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/fpEnv.h"
+#include "common/gthreadStats.h"
 #include "common/hangWatchdog.h"
 #include "common/hostException.h"
 #include "common/liveSwitch.h"
@@ -15,12 +18,12 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/guestTsc.h"
 #include "kernel/memory.h"
 #include "kernel/pendingSignals.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
-#include "loader/timer.h"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +31,7 @@
 #include <bit>
 #include <cerrno>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -41,9 +45,6 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #if defined(_M_X64) || defined(__x86_64__)
 #include <intrin.h>
 #endif
@@ -143,7 +144,9 @@ static bool LowerCoreBoundThread(KernelCpumask affinity) {
 /// Host priority a guest thread runs at: the priority of its band, or one step below it (but not
 /// below the lowest band value) when the thread is pinned to a single core.
 static int GuestThreadHostPriority(int guest_priority, bool core_bound) {
-	const int host = GuestPriorityToHost(guest_priority);
+	// KYTY_GUEST_PRIORITY_FLAT (common/guestPriority.h, live) moves a band by one step.
+	const int host = Common::GuestPriority::BandHost(GuestPriorityToHost(guest_priority),
+	                                                 Common::GuestPriority::Mode());
 	return core_bound ? std::max(host - 1, -2) : host;
 }
 
@@ -198,52 +201,63 @@ static uint64_t GetHostThreadId() {
 }
 #endif
 
-static uint64_t KernelReadTscNative() {
+static constexpr uint64_t NANOS_PER_SEC = 1000000000;
+
+static uint64_t KernelHostTsc() {
 #if defined(_M_X64) || defined(__x86_64__)
 	return __rdtsc();
 #else
-	return Common::Timer::QueryPerformanceCounter();
+	return Common::SteadyNs();
 #endif
 }
 
-static uint64_t KernelGetTscFrequencyNative() {
+static uint64_t KernelHostTscFrequency() {
 	static const uint64_t frequency = [] {
 #if defined(_M_X64) || defined(__x86_64__)
-		const auto host_frequency = Common::Timer::QueryPerformanceFrequency();
-		if (host_frequency == 0) {
-			return uint64_t {1000000000};
-		}
-
-		KernelReadTscNative();
+		KernelHostTsc();
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		KernelReadTscNative();
+		KernelHostTsc();
 
-		const auto host_start = Common::Timer::QueryPerformanceCounter();
-		const auto tsc_start  = KernelReadTscNative();
+		const auto host_start = Common::SteadyNs();
+		const auto tsc_start  = KernelHostTsc();
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		const auto host_end = Common::Timer::QueryPerformanceCounter();
-		const auto tsc_end  = KernelReadTscNative();
+		const auto host_end = Common::SteadyNs();
+		const auto tsc_end  = KernelHostTsc();
 
-		const auto host_delta = host_end - host_start;
-		const auto tsc_delta  = tsc_end - tsc_start;
-		if (host_delta == 0 || tsc_delta == 0) {
-			return host_frequency;
-		}
-
-		auto freq = static_cast<uint64_t>(
-		    (static_cast<long double>(tsc_delta) * static_cast<long double>(host_frequency)) /
-		    static_cast<long double>(host_delta));
+		const auto freq = static_cast<uint64_t>(static_cast<long double>(tsc_end - tsc_start) *
+		                                        static_cast<long double>(NANOS_PER_SEC) /
+		                                        static_cast<long double>(host_end - host_start));
 		static constexpr uint64_t ROUND_TO = 100000;
-		const auto                mod      = freq % ROUND_TO;
-		freq = (mod >= ROUND_TO / 2 ? freq - mod + ROUND_TO : freq - mod);
-
-		return freq != 0 ? freq : host_frequency;
+		return (freq + ROUND_TO / 2) / ROUND_TO * ROUND_TO;
 #else
-		return Common::Timer::QueryPerformanceFrequency();
+		return NANOS_PER_SEC;
 #endif
 	}();
 
 	return frequency;
+}
+
+// The console counter runs at 1.6 GHz and some games hardcode that rate instead of calling
+// sceKernelGetTscFrequency(); --guest-tsc presents it on every host and the loader rewrites guest
+// RDTSC/RDTSCP to the same product.
+static constexpr uint64_t GUEST_TSC_FREQUENCY = 1600000000;
+
+uint64_t KernelGuestTscMultiplier() {
+	static const uint64_t multiplier =
+	    ((GUEST_TSC_FREQUENCY << 32u) + KernelHostTscFrequency() / 2) / KernelHostTscFrequency();
+	return multiplier;
+}
+
+static uint64_t KernelReadTscNative() {
+	if (!Config::GuestTscEnabled()) {
+		return KernelHostTsc();
+	}
+	return static_cast<uint64_t>(
+	    (static_cast<unsigned __int128>(KernelHostTsc()) * KernelGuestTscMultiplier()) >> 32u);
+}
+
+static uint64_t KernelGetTscFrequencyNative() {
+	return Config::GuestTscEnabled() ? GUEST_TSC_FREQUENCY : KernelHostTscFrequency();
 }
 
 static uint64_t KernelGetInitialTsc() {
@@ -257,15 +271,49 @@ static uint64_t KernelGetElapsedTsc() {
 	return current_tsc >= initial_tsc ? current_tsc - initial_tsc : 0;
 }
 
-static uint64_t KernelGetProcessTimeUsNative() {
-	const auto frequency = KernelGetTscFrequencyNative();
-	if (frequency == 0) {
-		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
-	}
+// The guest TSC domain (guestTsc.h): the host TSC capped at 2^32 Hz, anchored at the process start.
+// KYTY_HOST_TSC_SIMULATE=<Hz> (diagnostic): the guest clock behaves as on a host whose TSC runs at
+// that frequency (host ticks are scaled to it first), e.g. 4700000000 to reproduce #1910 on a CPU
+// below 2^32 Hz. Guest code executing RDTSC itself still sees the real host ticks.
+struct KernelGuestTscClock {
+	uint64_t        frequency = 0;
+	GuestTsc::Scale simulate;
+	GuestTsc::Scale scale;
 
-	const auto elapsed = KernelGetElapsedTsc();
-	return static_cast<uint64_t>((static_cast<long double>(elapsed) * 1000000.0L) /
-	                             static_cast<long double>(frequency));
+	[[nodiscard]] uint64_t ToGuest(uint64_t raw) const { return scale.ToGuest(simulate.ToGuest(raw)); }
+	[[nodiscard]] uint64_t Ticks(uint64_t elapsed) const { return scale.Ticks(simulate.Ticks(elapsed)); }
+};
+
+static const KernelGuestTscClock& KernelGetGuestTscClock() {
+	static constexpr auto clock_init = [] {
+		KernelGuestTscClock c;
+		auto                measured = KernelGetTscFrequencyNative();
+		if (const char* sim = std::getenv("KYTY_HOST_TSC_SIMULATE"); sim != nullptr && *sim != '\0') {
+			const auto value = std::strtoull(sim, nullptr, 10);
+			if (value >= GuestTsc::kMinGuestTscFrequency && measured != 0) {
+				c.simulate = GuestTsc::Scale(measured, value, KernelGetInitialTsc());
+				LOGF("Guest TSC: simulating a %" PRIu64 " Hz host TSC (measured %" PRIu64 " Hz)\n",
+				     value, measured);
+				measured = value;
+			}
+		}
+		c.frequency = GuestTsc::ChooseFrequency(measured, std::getenv("KYTY_GUEST_TSC_FREQUENCY"));
+		c.scale     = GuestTsc::Scale(measured, c.frequency, KernelGetInitialTsc());
+		if (!c.scale.Identity()) {
+			LOGF("Guest TSC: host %" PRIu64 " Hz, guest %" PRIu64
+			            " Hz (KYTY_GUEST_TSC_FREQUENCY=0 reports the host value)\n",
+			            measured, c.frequency);
+		}
+		return c;
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(clock_init())>> clock_once;
+	const KernelGuestTscClock& clock = clock_once.Get(clock_init);
+	return clock;
+}
+
+static uint64_t KernelGetProcessTimeUsNative() {
+	return static_cast<uint64_t>((static_cast<long double>(KernelGetElapsedTsc()) * 1000000.0L) /
+	                             static_cast<long double>(KernelGetTscFrequencyNative()));
 }
 
 static void KernelUsToTimespec(uint64_t us, KernelTimespec* tp) {
@@ -308,20 +356,6 @@ static bool KernelRealtimeToTimespec(bool precise, KernelTimespec* tp) {
 	return true;
 }
 
-static bool KernelMonotonicToTimespec(KernelTimespec* tp) {
-	EXIT_IF(tp == nullptr);
-
-	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	if (frequency == 0) {
-		return false;
-	}
-
-	const auto counter = Common::Timer::QueryPerformanceCounter();
-	tp->tv_sec         = static_cast<int64_t>(counter / frequency);
-	tp->tv_nsec        = static_cast<int64_t>(((counter % frequency) * 1000000000ull) / frequency);
-	return true;
-}
-
 static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp, int* error) {
 	EXIT_IF(tp == nullptr);
 	EXIT_IF(error == nullptr);
@@ -361,11 +395,12 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 		case KERNEL_CLOCK_EXT_NETWORK:
 		case KERNEL_CLOCK_EXT_DEBUG_NETWORK:
 		case KERNEL_CLOCK_EXT_AD_NETWORK:
-		case KERNEL_CLOCK_EXT_RAW_NETWORK:
-			if (!KernelMonotonicToTimespec(tp)) {
-				*error = KERNEL_ERROR_EFAULT;
-			}
+		case KERNEL_CLOCK_EXT_RAW_NETWORK: {
+			const auto ns = Common::SteadyNs();
+			tp->tv_sec    = static_cast<int64_t>(ns / NANOS_PER_SEC);
+			tp->tv_nsec   = static_cast<int64_t>(ns % NANOS_PER_SEC);
 			return true;
+		}
 		case KERNEL_CLOCK_THREAD_CPUTIME_ID:
 			if (!GetThreadTimes(GetCurrentThread(), &create_time, &exit_time, &kernel_time,
 			                    &user_time)) {
@@ -474,6 +509,10 @@ struct PthreadPrivate {
 	uint64_t              cond_sequence = 0;
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
+	// KYTY_TRACKER_SPARE: the stack of the game's memory this thread runs on, while it is a live
+	// stack (Memory::AddLiveThreadStack); zero for one of the emulator's.
+	uint64_t live_stack_addr = 0;
+	uint64_t live_stack_size = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -667,7 +706,7 @@ struct PthreadStaticObject {
 class PthreadStaticObjects {
 public:
 	PthreadStaticObjects() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~PthreadStaticObjects() { KYTY_NOT_IMPLEMENTED; }
+	virtual ~PthreadStaticObjects() { EXIT_NOT_IMPLEMENTED(true); }
 
 	KYTY_CLASS_NO_COPY(PthreadStaticObjects);
 
@@ -697,7 +736,7 @@ static thread_local std::unique_ptr<PthreadSpecificValue[]> g_pthread_specific;
 class PthreadPool {
 public:
 	PthreadPool() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~PthreadPool() { KYTY_NOT_IMPLEMENTED; }
+	virtual ~PthreadPool() { EXIT_NOT_IMPLEMENTED(true); }
 
 	KYTY_CLASS_NO_COPY(PthreadPool);
 
@@ -713,7 +752,7 @@ private:
 class PThreadContext {
 public:
 	PThreadContext() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~PThreadContext() { KYTY_NOT_IMPLEMENTED; }
+	virtual ~PThreadContext() { EXIT_NOT_IMPLEMENTED(true); }
 
 	KYTY_CLASS_NO_COPY(PThreadContext);
 
@@ -1276,8 +1315,7 @@ void Initialize() {
 
 	PRINT_NAME_ENABLE(true);
 
-	Common::Thread thread(FreeDetachedThreads, nullptr);
-	thread.Detach();
+	std::thread(FreeDetachedThreads, nullptr).detach();
 }
 
 static int PthreadAttrCopy(PthreadAttr* dst, const PthreadAttr* src) {
@@ -1429,14 +1467,14 @@ static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, 
 // that unlocks and re-locks in a loop (Wwise's audio thread does this with its global lock
 // when audio runs behind) then keeps the mutex for seconds and every other locker starves:
 // Ratchet & Clank froze with its main thread stuck in PthreadMutexLock. A waiter that has
-// waited longer than KYTY_MUTEX_HANDOFF_US (default 2000 us, 0 = off) joins the starving
+// waited longer than KYTY_MUTEX_HANDOFF_US (default 0 = off in this line; 2000 us in the PPSA01474/PPSA03671 title presets) joins the starving
 // queue; while that queue is not empty the mutex goes to its front thread only (direct
 // hand-off, like Go's sync.Mutex starvation mode). Short waits behave as before.
 static int64_t MutexHandoffMicros() {
 	static const int64_t value = [] {
 		const auto* env = std::getenv("KYTY_MUTEX_HANDOFF_US");
 		if (env == nullptr || env[0] == '\0') {
-			return static_cast<int64_t>(2000);
+			return static_cast<int64_t>(0);
 		}
 		return std::max<int64_t>(0, std::strtoll(env, nullptr, 10));
 	}();
@@ -2007,7 +2045,9 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
+	HleWait::Scope hle_wait_scope(HleWait::MutexLock); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	// Placement samples of guest threads (common/cpuPlacement.h), every 64th lock.
 	static thread_local uint32_t placement_locks = 0;
@@ -2243,12 +2283,6 @@ int KYTY_SYSV_ABI PthreadAttrGetinheritsched(const PthreadAttr* attr, int* inher
 
 	*inherit_sched = (*attr)->inherit_sched;
 
-	switch (*inherit_sched) {
-		case 0:
-		case 4: break;
-		default: EXIT("unknown inherit_sched: %d\n", *inherit_sched);
-	}
-
 	return OK;
 }
 
@@ -2402,10 +2436,9 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int pinherit_sched = PTHREAD_INHERIT_SCHED;
 	switch (inherit_sched) {
-		case 0: pinherit_sched = PTHREAD_EXPLICIT_SCHED; break;
-		case 4: pinherit_sched = PTHREAD_INHERIT_SCHED; break;
+		case 0:
+		case 4: break;
 		default: EXIT("unknown inherit_sched: %d\n", inherit_sched);
 	}
 
@@ -2413,7 +2446,6 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 	// behavior, and some guest attr flows can leave the native attr in a shape that crashes inside
 	// winpthreads.
 	attr_value->inherit_sched = inherit_sched;
-	(void)pinherit_sched;
 
 	return OK;
 }
@@ -2528,7 +2560,10 @@ int KYTY_SYSV_ABI PthreadRwlockDestroy(PthreadRwlock* rwlock) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
+	// SCE_PTHREAD_RWLOCK_INITIALIZER has no allocated resources until first use.
+	if (*rwlock == nullptr) {
+		return OK;
+	}
 
 	{
 		std::lock_guard lock((*rwlock)->m);
@@ -2687,6 +2722,7 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 }
 
 int KYTY_SYSV_ABI PthreadRwlockRdlock(PthreadRwlock* rwlock) {
+	HleWait::Scope hle_wait_scope(HleWait::RwRead); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// Hot path for some PS5 titles; per-call name logging can dominate runtime.
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2704,6 +2740,7 @@ int KYTY_SYSV_ABI PthreadRwlockRdlock(PthreadRwlock* rwlock) {
 }
 
 int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds usec) {
+	HleWait::Scope hle_wait_scope(HleWait::RwRead); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2721,6 +2758,7 @@ int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds
 }
 
 int KYTY_SYSV_ABI PthreadRwlockTimedwrlock(PthreadRwlock* rwlock, KernelUseconds usec) {
+	HleWait::Scope hle_wait_scope(HleWait::RwWrite); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2838,6 +2876,7 @@ int KYTY_SYSV_ABI PthreadRwlockUnlock(PthreadRwlock* rwlock) {
 }
 
 int KYTY_SYSV_ABI PthreadRwlockWrlock(PthreadRwlock* rwlock) {
+	HleWait::Scope hle_wait_scope(HleWait::RwWrite); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3077,6 +3116,7 @@ int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr
 
 int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 	// PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3115,7 +3155,9 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
+	HleWait::Scope hle_wait_scope(HleWait::CondTimed); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3182,6 +3224,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
+	HleWait::Scope hle_wait_scope(HleWait::CondTimed); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3246,7 +3289,9 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 }
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
+	HleWait::Scope hle_wait_scope(HleWait::CondWait); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
@@ -3358,6 +3403,10 @@ bool PthreadHasPendingSignal(Pthread thread, int signum) {
 	return (thread->pending_signal_mask.load(std::memory_order_acquire) & mask) != 0;
 }
 
+bool PthreadHasAnyPendingSignal(Pthread thread) {
+	return thread != nullptr && thread->pending_signal_mask.load(std::memory_order_acquire) != 0;
+}
+
 bool PthreadTakePendingSignal(Pthread thread, int signum) {
 	if (thread == nullptr || signum < 0 || signum >= 64) {
 		return false;
@@ -3435,7 +3484,31 @@ static void CleanupThread(void* arg) {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	rt->DeleteTlss(thread->unique_id);
 
+	// KYTY_TRACKER_SPARE: its stack may be protected by the page tracker again, unless this runs
+	// on it (a cancellation on the guest's stack): then it stays a live stack.
+	if (thread->live_stack_size != 0) {
+		uint64_t   marker = 0;
+		const auto here   = reinterpret_cast<uint64_t>(&marker);
+		if (here - thread->live_stack_addr >= thread->live_stack_size) {
+			Memory::RemoveLiveThreadStack(thread->live_stack_addr, thread->live_stack_size);
+		}
+		thread->live_stack_addr = 0;
+		thread->live_stack_size = 0;
+	}
+
 	thread->almost_done = true;
+}
+
+/// KYTY_GUEST_PRIORITY_FLAT (live): re-applies the calling guest thread's host priority after a change.
+static void ApplyGuestPriorityToSelf() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	auto* thread = g_pthread_self;
+	if (thread == nullptr || thread->attr == nullptr) {
+		return;
+	}
+	SetThreadPriority(GetCurrentThread(),
+	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
+#endif
 }
 
 /// Entry point of the host thread behind every guest thread: records its identity, applies the guest
@@ -3443,6 +3516,7 @@ static void CleanupThread(void* arg) {
 /// @param arg the Pthread that this host thread runs
 /// @return the value the guest entry function returned
 static void* RunThread(void* arg) {
+	Common::WriteFpEnv(Common::GuestFpEnv);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!Common::HostException::InitializeThreadSignalStack()) {
@@ -3457,6 +3531,7 @@ static void* RunThread(void* arg) {
 
 	g_pthread_self = thread;
 	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(thread), thread->name);
+	Common::NameCurrentThreadForOs(("G:" + thread->name).c_str());
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3482,14 +3557,27 @@ static void* RunThread(void* arg) {
 	thread->core_bound = LowerCoreBoundThread(thread->attr->affinity);
 	SetThreadPriority(GetCurrentThread(),
 	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
+	Common::GuestPriority::g_apply.store(&ApplyGuestPriorityToSelf, std::memory_order_release);
 #endif
 	Common::PlaceCurrentThreadGuest();
+	GThreadStats::MarkGuestThread();
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
 	     thread->name.c_str(), thread->unique_id, os_thread_id,
 	     reinterpret_cast<uint64_t>(thread->entry), reinterpret_cast<uint64_t>(thread->arg),
 	     reinterpret_cast<uint64_t>(thread->attr->stack_addr),
 	     static_cast<uint64_t>(thread->attr->stack_size));
+
+	// KYTY_TRACKER_SPARE: a stack of the game's own memory is left out of the page tracker's
+	// protections while the thread lives (Memory::AddLiveThreadStack; a no-op with it off).
+	thread->live_stack_addr = 0;
+	thread->live_stack_size = 0;
+	if (thread->attr->stack_user && thread->attr->stack_addr != nullptr &&
+	    thread->attr->stack_size != 0) {
+		thread->live_stack_addr = reinterpret_cast<uint64_t>(thread->attr->stack_addr);
+		thread->live_stack_size = thread->attr->stack_size;
+		Memory::AddLiveThreadStack(thread->live_stack_addr, thread->live_stack_size);
+	}
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
 	pthread_cleanup_push(CleanupThread, thread);
@@ -3889,6 +3977,7 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 }
 
 void KYTY_SYSV_ABI PthreadYield() {
+	HleWait::Scope hle_wait_scope(HleWait::Yield); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	// Placement samples of spinning guest threads (the fence poller), every 4096th yield.
 	static thread_local uint32_t placement_yields = 0;
 	if ((++placement_yields & 4095u) == 0u) {
@@ -3915,8 +4004,7 @@ int KYTY_SYSV_ABI KernelClockGetres(KernelClockid clock_id, KernelTimespec* tp) 
 		const auto frequency = KernelGetTscFrequencyNative();
 		tp->tv_sec           = 0;
 		tp->tv_nsec          = static_cast<int64_t>(
-		    frequency != 0 ? std::max<uint64_t>((1000000000 + (frequency >> 1)) / frequency, 1)
-		                   : 1);
+		    std::max<uint64_t>((NANOS_PER_SEC + (frequency >> 1)) / frequency, 1));
 		return OK;
 	}
 
@@ -4088,30 +4176,24 @@ int KYTY_SYSV_ABI KernelConvertUtcToLocaltime(int64_t utc_time, int64_t* local_t
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetTscFrequency() {
-	return KernelGetTscFrequencyNative();
+	return KernelGetGuestTscClock().frequency;
 }
 
 uint64_t KYTY_SYSV_ABI KernelReadTsc() {
-	return KernelReadTscNative();
+	return KernelGetGuestTscClock().ToGuest(KernelReadTscNative());
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
-	const auto frequency = KernelGetTscFrequencyNative();
-	if (frequency == 0) {
-		return static_cast<uint64_t>(Loader::Timer::GetTimeMs() * 1000.0);
-	}
-
-	const auto elapsed = KernelGetElapsedTsc();
-	return static_cast<uint64_t>((static_cast<long double>(elapsed) * 1000000.0L) /
-	                             static_cast<long double>(frequency));
+	return KernelGetProcessTimeUsNative();
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter() {
-	return KernelGetElapsedTsc();
+	// Equal to sceKernelReadTsc() minus its process-start value.
+	return KernelGetGuestTscClock().Ticks(KernelGetElapsedTsc());
 }
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounterFrequency() {
-	return KernelGetTscFrequencyNative();
+	return KernelGetGuestTscClock().frequency;
 }
 
 void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
@@ -4125,6 +4207,8 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	HleWait::Scope hle_wait_scope(HleWait::Usleep); // wholecp measurement (KYTY_HLE_WAIT_STATS)
+	GThreadStats::FpProbe();
 	// usleep(0) returns at once, as FreeBSD's nanosleep does for a zero time, after the pending
 	// signal check a system call return makes (SleepMicroWithSignalPoll).
 	SleepMicroWithSignalPoll(microseconds);
@@ -4137,6 +4221,7 @@ unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+	HleWait::Scope hle_wait_scope(HleWait::Nanosleep); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}

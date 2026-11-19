@@ -1,3 +1,88 @@
+// PS5 Pro (Trinity) DS_BVH_STACK_PUSH8_POP1_RTN_B32 (upstream bfd4c34b8): decode, translation into
+// LDS accesses, and the encodings the decoder refuses. The GPU semantics are TrinityStack
+// (ShaderRayTracingGpuTests.inc, --trinity-rt-only).
+void TestTrinityStackInstruction() {
+  namespace D = ShaderRecompiler::Decoder;
+  const std::array code{0xdb840008u, 0x01010a09u, 0xdb840010u, 0x02010a09u, EncodeSopp(0x01)};
+  D::Program decoded;
+  D::DecodeProgram(code, decoded);
+  const auto &first = decoded.instructions.front();
+  Check(first.opcode == D::Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32 && first.src_count == 3 &&
+            first.offset == 8 && first.dst.reg == 1 && first.src0.reg == 9 &&
+            first.src1.reg == 10 && first.src2.reg == 1,
+        "Trinity stack operands or capacity were not decoded");
+  Check(D::InstructionToString(first).find("DS_BVH_STACK_PUSH8_POP1_RTN_B32") != std::string::npos,
+        "Trinity stack text lost its opcode name");
+  ShaderComputeInputInfo compute{};
+  compute.lds_size_dwords = 1024;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  const auto result = RecompileForTest(code, options);
+  // Eight predicated pushes and one pop per instruction; unused results keep the LDS writes.
+  // (The registers start as zero here, so the pops fold to an empty stack; the pushes stay.)
+  Check(CountSourceOccurrences(result.ir_dump, "WriteSharedU32") >= 16u,
+        "Trinity stack did not become its LDS pushes");
+  CheckSpirvBinaryValidates(result.spirv);
+  compute.lds_storage = true;
+  CheckSpirvBinaryValidates(RecompileForTest(code, options).spirv);
+  CheckSpirvBinaryValidates(RecompileForTest(code, MakeCompileOptions(ShaderType::Pixel)).spirv);
+  for (const auto words : {std::array{0xdb860008u, 0x01010a09u},   // GDS
+                           std::array{0xdb840007u, 0x01010a09u},   // capacity 7
+                           std::array{0xdb840020u, 0x01010a09u},   // capacity 32
+                           std::array{0xdb840008u, 0x01f90a09u},   // children past v255
+                           std::array{0xdb840008u, 0x09010a09u}}) { // VDST == ADDR
+    const std::array invalid{words[0], words[1], EncodeSopp(0x01)};
+    D::DecodeProgram(invalid, decoded);
+    Check(decoded.instructions[0].opcode == D::Opcode::UNSUPPORTED,
+          "unsupported stack encoding was silently accepted");
+  }
+}
+
+// PS5 Pro (Trinity) IMAGE_BVH8_INTERSECT_RAY (upstream 5eab0ec73): the grouped NSA ray registers,
+// one Bvh8IntersectRay per instruction lowered through the module's BVH8 function, and the
+// encodings the decoder refuses. The GPU semantics are TrinityBvhCases (--trinity-rt-only).
+void TestTrinityBvhInstruction() {
+  namespace D = ShaderRecompiler::Decoder;
+  const std::array code{0xf1949f05u, 0x00010000u, 0x0a030201u, 0x0000040du,
+                        EncodeMubuf0(0x1e, 0, false), EncodeMubuf1(0, 0, 0),
+                        EncodeMubuf0(0x1e, 16, false), EncodeMubuf1(4, 0, 0),
+                        EncodeMubuf0(0x1d, 32, false), EncodeMubuf1(8, 0, 0),
+                        EncodeMubuf0(0x1e, 40, false), EncodeMubuf1(10, 0, 0),
+                        EncodeMubuf0(0x1d, 56, false), EncodeMubuf1(14, 0, 0), EncodeSopp(0x01)};
+  D::Program decoded;
+  D::DecodeProgram(code, decoded);
+  const auto &inst = decoded.instructions.front();
+  Check(inst.opcode == D::Opcode::IMAGE_BVH8_INTERSECT_RAY && inst.word_count == 4 &&
+            inst.data_dwords == 10 && inst.image_address_components == 11 &&
+            inst.image_nsa_addr[3] == 10 && inst.image_nsa_addr[5] == 12 &&
+            inst.image_nsa_addr[6] == 13 && inst.image_nsa_addr[8] == 15 &&
+            inst.image_nsa_addr[9] == 4 && inst.src1.reg == 4 && !decoded.has_bvh,
+        "Trinity BVH8 grouped ray registers were not decoded");
+  const auto result = RecompileForTest(code, MakeCompileOptions(ShaderType::Compute));
+  Check(result.program.info.uses_bvh && result.program.info.uses_dma &&
+            result.program.info.images.empty(),
+        "Trinity BVH8 did not read its nodes as raw memory");
+  Check(CountSourceOccurrences(result.ir_dump, " = Bvh8IntersectRay ") == 1,
+        "Trinity BVH8 result and ray writes duplicated the intersection");
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto spirv_text = DisassembleSpirvBinary(result.spirv);
+  Check(CountSourceOccurrences(spirv_text, "\"trinity_bvh_intersect\"") == 1u &&
+            CountSourceOccurrences(spirv_text, "\"trinity_box_slot\"") == 1u &&
+            SpirvInstructionOpcodeCount(result.spirv, 246u) >= 1u,
+        "Trinity BVH8 duplicated its module function or unrolled its four-child loop");
+  CheckSpirvBinaryValidates(RecompileForTest(code, MakeCompileOptions(ShaderType::Pixel)).spirv);
+  for (const auto words : {std::array{0xf1949f05u, 0x40010000u, 0x0a030201u, 0x0000040du},
+                           std::array{0xf1949f05u, 0x0001f700u, 0x0a030201u, 0x0000040du},
+                           std::array{0xf1949f05u, 0x00010000u, 0xfe030201u, 0x0000040du},
+                           std::array{0xf1949f05u, 0x00010700u, 0x0a030201u, 0x0000040du},
+                           std::array{0xf1949f05u, 0x00010000u, 0x0a030201u, 0x0000040bu}}) {
+    const std::array invalid{words[0], words[1], words[2], words[3], EncodeSopp(0x01)};
+    D::DecodeProgram(invalid, decoded);
+    Check(decoded.instructions[0].opcode == D::Opcode::UNSUPPORTED,
+          "Trinity BVH8 accepted truncated ray or destination registers");
+  }
+}
+
 void TestRayTracingDispatchDetection() {
   namespace D = ShaderRecompiler::Decoder;
   // The skip behaviour without a BVH mode (KYTY_RT_SOFTWARE=0, KYTY_RT_STUB=0); the software path is
@@ -581,12 +666,24 @@ int ValidateBvhShaderFiles(int argc, char **argv) {
         ShaderComputeInputInfo info{};
         info.wave_size = wave;
         info.host_subgroup_size = 32;
-        info.threads_num[0] = 64;
+        // KYTY_HARNESS_THREADS=<n>: the workgroup size (default 64).
+        const char *threads_text = std::getenv("KYTY_HARNESS_THREADS");
+        info.threads_num[0] =
+            threads_text != nullptr ? static_cast<uint32_t>(std::strtoul(threads_text, nullptr, 10)) : 64u;
         info.threads_num[1] = 1;
         info.threads_num[2] = 1;
+        // KYTY_HARNESS_LDS_DWORDS=<n>: the workgroup's LDS size (default none).
+        if (const char *lds = std::getenv("KYTY_HARNESS_LDS_DWORDS"); lds != nullptr) {
+          info.lds_size_dwords = static_cast<uint32_t>(std::strtoul(lds, nullptr, 10));
+        }
         info.thread_ids_num = 3;
         info.group_id[0] = info.group_id[1] = info.group_id[2] = true;
         info.workgroup_register = 16;
+        // KYTY_HARNESS_SCRATCH_DWORDS=<n>: the per-thread scratch size (programs with scratch
+        // or a FLAT traversal stack fail resource tracking without one). KYTY_HARNESS_SCRATCH (hwrt) is the same.
+        if (const char *scratch = std::getenv("KYTY_HARNESS_SCRATCH_DWORDS") != nullptr ? std::getenv("KYTY_HARNESS_SCRATCH_DWORDS") : std::getenv("KYTY_HARNESS_SCRATCH"); scratch != nullptr) {
+          info.scratch_size_dwords = static_cast<uint32_t>(std::strtoul(scratch, nullptr, 10));
+        }
         auto options = MakeCompileOptions(ShaderType::Compute);
         options.input_info.compute = &info;
         options.wave_size = wave;
@@ -621,6 +718,50 @@ int ValidateBvhShaderFiles(int argc, char **argv) {
             });
             if (tools.Validate(compiled.spirv)) {
               result = "valid (" + std::to_string(compiled.spirv.size()) + " words)";
+              // KYTY_HARNESS_SPV_STATS=1: the 24 most frequent SPIR-V opcodes (instruction
+              // count and words), to see what a large module is made of.
+              if (const char *stats = std::getenv("KYTY_HARNESS_SPV_STATS");
+                  stats != nullptr && stats[0] == '1') {
+                std::map<uint32_t, std::pair<uint64_t, uint64_t>> histogram;
+                for (size_t at = 5; at < compiled.spirv.size();) {
+                  const uint32_t count = compiled.spirv[at] >> 16u;
+                  auto &entry = histogram[compiled.spirv[at] & 0xffffu];
+                  entry.first++;
+                  entry.second += count;
+                  at += count == 0u ? 1u : count;
+                }
+                std::vector<std::pair<uint64_t, uint32_t>> order;
+                for (const auto &[op, entry] : histogram) order.emplace_back(entry.second, op);
+                std::sort(order.rbegin(), order.rend());
+                for (size_t i = 0; i < order.size() && i < 24u; ++i) {
+                  const auto &entry = histogram[order[i].second];
+                  std::printf("  spv op %u: %llu instructions, %llu words\n", order[i].second,
+                              static_cast<unsigned long long>(entry.first),
+                              static_cast<unsigned long long>(entry.second));
+                }
+                if (stats[1] == 'w') {
+                  // KYTY_HARNESS_SPV_STATS=1w also writes the valid module next to the input.
+                  const auto out_path = path + ".w" + wave_name + "." + mode + ".spv";
+                  if (std::FILE *out = std::fopen(out_path.c_str(), "wb"); out != nullptr) {
+                    std::fwrite(compiled.spirv.data(), sizeof(uint32_t), compiled.spirv.size(),
+                                out);
+                    std::fclose(out);
+                  }
+                }
+                ShaderRecompiler::Decoder::Program decoded;
+                ShaderRecompiler::Decoder::DecodeProgram(code, decoded, true);
+                std::map<std::string, uint32_t> guest;
+                for (const auto &inst : decoded.instructions) {
+                  guest[std::string(magic_enum::enum_name(inst.opcode))]++;
+                }
+                std::vector<std::pair<uint32_t, std::string>> guest_order;
+                for (const auto &[name, n] : guest) guest_order.emplace_back(n, name);
+                std::sort(guest_order.rbegin(), guest_order.rend());
+                for (size_t i = 0; i < guest_order.size() && i < 40u; ++i) {
+                  std::printf("  guest %s: %u\n", guest_order[i].second.c_str(),
+                              guest_order[i].first);
+                }
+              }
             } else {
               result = "INVALID";
               failures++;

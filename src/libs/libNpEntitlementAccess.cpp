@@ -9,11 +9,14 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
+#include <string>
 
 namespace Libs {
 
@@ -172,8 +175,9 @@ MakeAddcontInfo(const Loader::AddContentEntry& entry) {
 	NpEntitlementAccessAddcontEntitlementInfo info {};
 	std::memcpy(info.entitlement_label.data, entry.entitlement_label.data(),
 	            entry.entitlement_label.size());
-	info.package_type    = 2; // Additional content with extra data.
-	info.download_status = 4; // Installed.
+	const bool extra_data = !entry.mount_dir.empty();
+	info.package_type     = extra_data ? 2 : 3; // PSAC (with extra data) or PSAL (license only).
+	info.download_status  = extra_data ? 4 : 0; // INSTALLED or NO_EXTRA_DATA.
 	return info;
 }
 
@@ -454,6 +458,23 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 
 	memset(info, 0, sizeof(*info));
 
+	const std::string label(entitlement_label->data,
+	                        strnlen(entitlement_label->data, sizeof(entitlement_label->data)));
+	{
+		// Each label once: shows which entitlement a title checks before a "missing
+		// entitlement" message.
+		static std::mutex            printed_mutex;
+		static std::set<std::string> printed;
+		std::scoped_lock             lock(printed_mutex);
+		if (printed.size() < 256 && printed.insert(label).second) {
+			LOGF("NpEntitlementAccessGetAddcontEntitlementInfo: service_label=%u label='%s'%s\n",
+			     service_label, label.c_str(),
+			     Loader::AddContentFind(entitlement_label->data, sizeof(entitlement_label->data)) != nullptr
+			         ? " (installed)"
+			         : " (not installed)");
+		}
+	}
+
 	for (const auto& entitlement: NP_ENTITLEMENT_ACCESS_ADDON_LIST) {
 		if (strncmp(entitlement_label->data, entitlement.entitlement_label.data,
 		            sizeof(entitlement_label->data)) == 0) {
@@ -468,6 +489,7 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 		return 0;
 	}
 
+	// Only add-on content installed in the title's add-on folder is entitled (AddContentFind above).
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 
@@ -511,5 +533,27 @@ LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 }
 
 } // namespace LibNpEntitlementAccess
+
+namespace LibNpEntitlementAccessPft {
+
+LIB_VERSION("NpEntitlementAccessPft", 1, "NpEntitlementAccess", 1, 1);
+
+// Unknown function; return state 2 for the FC27 investigation.
+static int KYTY_SYSV_ABI NpEntitlementAccessPftUnknowneDXKe9FndlE(uint32_t* state) {
+	PRINT_NAME();
+
+	if (state == nullptr) {
+		return LibNpEntitlementAccess::NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	*state = 2;
+	return 0;
+}
+
+LIB_DEFINE(InitNet_1_NpEntitlementAccessPft) {
+	LIB_FUNC("eDXKe9FndlE", NpEntitlementAccessPftUnknowneDXKe9FndlE);
+}
+
+} // namespace LibNpEntitlementAccessPft
 
 } // namespace Libs

@@ -2,9 +2,12 @@
 // and (S6) the preparation window ring, worker parking and the producer's work stealing.
 // --measure-worker-gate [reps]: the parking/stealing configuration sweep (not a test).
 #include "graphics/host_gpu/coherenceLog.h"
+#include "graphics/host_gpu/renderer/drawPrep/adaptivePool.h"
+#include "graphics/host_gpu/renderer/drawPrep/codeDigestCache.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/drawPrep/segment.h"
 #include "graphics/host_gpu/renderer/drawPrep/window.h"
 #include "graphics/host_gpu/renderer/drawPrep/workerGate.h"
 
@@ -126,6 +129,58 @@ void TestLogHullMatchesSearch() {
 		Check(plain.result == hull.result && plain.conflict_source == hull.conflict_source,
 		      "the hull pre-test gives the plain search's outcome");
 	}
+}
+
+// KYTY_CERT_LOG_SUMMARY: whenever the summary calls an interval clean, the walk agrees; and it
+// does vouch for intervals far from every entry.
+void TestLogSummaryMatchesCheck() {
+	auto     log     = std::make_unique<Coherence::Log>();
+	auto     summary = std::make_unique<Coherence::Summary>(*log);
+	uint64_t state   = 0x243f6a8885a308d3ull;
+	auto     random  = [&] {
+		state ^= state << 13u;
+		state ^= state >> 7u;
+		state ^= state << 17u;
+		return state;
+	};
+	// Starting point: intervals beginning before the first query are never vouched for.
+	log->Append(Coherence::MakeRange(0x200000000ull, 0x100), Coherence::Source::BufferDirtyAdd);
+	std::vector<uint64_t> starts;
+	bool                  agree = true;
+	uint64_t              vouched = 0;
+	for (int round = 0; round < 4000; round++) {
+		starts.push_back(log->Generation());
+		const int entries = static_cast<int>(random() % 4u);
+		for (int i = 0; i < entries; i++) {
+			const auto kind  = random() % 64u;
+			const auto begin = 0x200000000ull + (random() % 256u) * 0x4000u;
+			const auto size  = kind == 0 ? UINT64_MAX : (random() % 8u) * 0x1000u;
+			log->Append(kind == 0 ? Coherence::Universe : Coherence::MakeRange(begin, size),
+			            Coherence::Source::BufferDirtyAdd);
+		}
+		std::vector<Coherence::Range> ranges;
+		uint64_t cursor = 0x200000000ull + (random() % 256u) * 0x4000u;
+		for (int i = 0, n = static_cast<int>(random() % 3u); i < n; i++) {
+			const auto size = 0x100u + (random() % 4u) * 0x800u;
+			ranges.push_back({cursor, cursor + size});
+			cursor += size + (random() % 16u) * 0x10000u;
+		}
+		const auto from  = starts[static_cast<size_t>(random() % starts.size())];
+		const auto to    = log->Generation();
+		const bool clean = summary->Clean(from, to, ranges);
+		const auto exact = log->Check(from, to, ranges);
+		if (clean) {
+			vouched++;
+			agree = agree && exact.result == Coherence::CheckResult::Clean;
+		}
+		if (starts.size() > 64) {
+			starts.erase(starts.begin());
+		}
+	}
+	Check(agree, "a summary-clean interval is clean for the walk");
+	Check(vouched > 100, "the summary vouches for intervals away from the entries");
+	Check(!summary->Clean(0, log->Generation(), std::array<Coherence::Range, 1> {{{0x200000000ull, 0x200001000ull}}}),
+	      "an interval from before the summary started is never vouched for");
 }
 
 void TestLogBumpWithoutReaders() {
@@ -720,6 +775,219 @@ void TestReadSetValidateInPlace() {
 	Check(same("restored memory") == DrawPrep::ValidateResult::Ok, "restored memory validates");
 }
 
+// KYTY_DRAW_PREP_LEAN read-set part: a lean read set (online merge while the reads come in order,
+// the plain path after the first read out of order) gives the plain read set's results for the
+// same reads: Finish's verdict and failure, the ranges and their bytes, the read and byte counts,
+// the record-time failures (limits) and BuildCertificate.
+void TestReadSetLeanMatchesPlain() {
+	std::mt19937_64    rng(0x1ea2026u);
+	constexpr uint64_t Base   = 0x200000;
+	constexpr uint64_t Window = 0x5000;
+	std::vector<uint8_t> memory(Window);
+	for (auto& byte: memory) {
+		byte = static_cast<uint8_t>(rng());
+	}
+	std::vector<Coherence::Range> built_plain;
+	std::vector<Coherence::Range> built_lean;
+	int  differences = 0;
+	int  online_finishes = 0;
+	int  offline_finishes = 0;
+	int  failures        = 0;
+	for (int iteration = 0; iteration < 20000; iteration++) {
+		DrawPrep::ReadSet plain;
+		DrawPrep::ReadSet lean;
+		const bool coalesce = (rng() & 1u) != 0;
+		plain.SetCoalesce(coalesce);
+		lean.SetCoalesce(coalesce);
+		lean.SetLean(true);
+		// Mostly ascending reads (as preparations read), contiguous runs, page-boundary meetings,
+		// repeated addresses, the odd out-of-order read and the odd disagreeing byte.
+		const auto reads   = 1u + rng() % 40u;
+		const auto shape   = rng() % 4u; // 0 random, 1 ascending, 2 ascending with rare jumps back, 3 contiguous
+		uint64_t   cursor  = rng() % 0x800u;
+		const bool corrupt = rng() % 8u == 0;
+		bool       ok_plain = true;
+		bool       ok_lean  = true;
+		for (uint32_t i = 0; i < reads; i++) {
+			uint64_t size   = 1u + rng() % 64u;
+			uint64_t offset = 0;
+			switch (shape) {
+				case 0: offset = rng() % (Window - 64u); break;
+				case 1: offset = std::min<uint64_t>(cursor + rng() % 96u, Window - 64u); break;
+				case 2:
+					offset = rng() % 10u == 0 ? rng() % (Window - 64u)
+					                          : std::min<uint64_t>(cursor + rng() % 64u, Window - 64u);
+					break;
+				default:
+					offset = std::min<uint64_t>(cursor, Window - 64u);
+					if (rng() % 6u == 0) {
+						offset = std::min<uint64_t>((offset | 0xfffu) + 1u - 8u, Window - 64u); // run up to a page end
+						size   = 8u;
+					}
+					break;
+			}
+			if (rng() % 16u == 0 && offset >= 4u) {
+				offset -= 4u; // overlap the previous read
+			}
+			cursor = offset + size;
+			std::vector<uint8_t> bytes(memory.begin() + static_cast<ptrdiff_t>(offset),
+			                           memory.begin() + static_cast<ptrdiff_t>(offset + size));
+			if (corrupt && rng() % 6u == 0) {
+				bytes[rng() % size] ^= 0x5au;
+			}
+			ok_plain = plain.Record(Base + offset, bytes.data(), size) && ok_plain;
+			ok_lean  = lean.Record(Base + offset, bytes.data(), size) && ok_lean;
+			if (rng() % 12u == 0) {
+				const auto dsize   = 1u + rng() % 0x400u;
+				const auto doffset = rng() % (Window - dsize);
+				const auto value   = rng();
+				ok_plain = plain.RecordDigest(Base + doffset, dsize, value) && ok_plain;
+				ok_lean  = lean.RecordDigest(Base + doffset, dsize, value) && ok_lean;
+			}
+		}
+		const bool online      = lean.LeanOnline();
+		const bool finish_plain = plain.Finish();
+		const bool finish_lean  = lean.Finish();
+		bool       same         = ok_plain == ok_lean && finish_plain == finish_lean &&
+		                plain.Failure() == lean.Failure() && plain.ReadCount() == lean.ReadCount() &&
+		                plain.ByteCount() == lean.ByteCount();
+		if (same && finish_plain) {
+			const auto a = plain.Ranges();
+			const auto b = lean.Ranges();
+			same = std::equal(a.begin(), a.end(), b.begin(), b.end());
+			for (size_t i = 0; same && i < a.size(); i++) {
+				const auto x = plain.RangeBytes(i);
+				const auto y = lean.RangeBytes(i);
+				same = std::equal(x.begin(), x.end(), y.begin(), y.end());
+			}
+			plain.BuildCertificate(built_plain);
+			lean.BuildCertificate(built_lean);
+			same = same && built_plain == built_lean && built_lean == ReferenceCertificateRanges(lean);
+		}
+		if (!same) {
+			if (differences++ < 4) {
+				std::fprintf(stderr, "lean read set differs: iteration %d shape %u coalesce %d online %d\n",
+				             iteration, static_cast<unsigned>(shape), coalesce ? 1 : 0, online ? 1 : 0);
+			}
+		}
+		online_finishes += finish_lean && online ? 1 : 0;
+		offline_finishes += finish_lean && !online ? 1 : 0;
+		failures += finish_lean ? 0 : 1;
+	}
+	Check(differences == 0, "a lean read set equals the plain one on random reads");
+	Check(online_finishes > 1000 && offline_finishes > 1000 && failures > 100,
+	      "the random reads cover online merges, the offline path and failures");
+
+	// The limits: the plain path's read count (coalesced reads count once) and byte count.
+	DrawPrep::ReadSet plain;
+	DrawPrep::ReadSet lean;
+	plain.SetCoalesce(true);
+	lean.SetCoalesce(true);
+	lean.SetLean(true);
+	const uint8_t one = 1;
+	bool          same_limits = true;
+	for (uint32_t i = 0; i < DrawPrep::ReadSet::MaxReads + 8u; i++) {
+		const uint64_t address = 0x1000 + uint64_t {i} * 2u; // touching pairs coalesce
+		same_limits &= plain.Record(address, &one, 1) == lean.Record(address, &one, 1);
+		same_limits &= plain.Failure() == lean.Failure() && plain.ReadCount() == lean.ReadCount();
+	}
+	Check(same_limits, "the lean read set refuses the same read as the plain one");
+}
+
+// KYTY_DRAW_PREP_LEAN digest part: a cached code digest is found only under the key it was stored
+// with; every key field (address, size, publication epoch, shader map generation, the two backing
+// mapping tags) invalidates it, epoch 0 never caches, and a colliding entry replaces the old one.
+void TestCodeDigestCache() {
+	DrawPrep::CodeDigestCache cache;
+	const DrawPrep::CodeDigestKey key {0x10000, 0x900, 5, 7, 11, 13};
+	uint64_t                      digest = 0;
+	Check(!cache.Lookup(key, digest), "an empty cache misses");
+	cache.Store(key, 0xabcdu);
+	Check(cache.Lookup(key, digest) && digest == 0xabcdu, "a stored digest hits under its key");
+	const auto changed = [&](auto mutate) {
+		auto other = key;
+		mutate(other);
+		uint64_t value = 0;
+		return !cache.Lookup(other, value);
+	};
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.address += 4; }), "another address misses");
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.size += 4; }), "another size misses");
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.epoch++; }), "a newer publication epoch misses");
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.map_generation++; }), "a newer shader map misses");
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.tag_begin++; }), "a remapped first region misses");
+	Check(changed([](DrawPrep::CodeDigestKey& k) { k.tag_end++; }), "a remapped last region misses");
+	auto zero  = key;
+	zero.epoch = 0;
+	cache.Store(zero, 1u);
+	Check(!cache.Lookup(zero, digest), "epoch 0 (speculative or inline) never caches");
+	// Re-stored under a newer epoch: the old key misses, the new one hits.
+	auto newer = key;
+	newer.epoch++;
+	cache.Store(newer, 0x1234u);
+	Check(!cache.Lookup(key, digest) && cache.Lookup(newer, digest) && digest == 0x1234u,
+	      "a re-stored entry replaces the older epoch's");
+	// Many shaders: each finds its own digest or misses, never another's.
+	DrawPrep::CodeDigestCache many;
+	bool                      exact = true;
+	for (uint64_t i = 0; i < 4096; i++) {
+		const DrawPrep::CodeDigestKey k {0x400000 + i * 0x340u, 0x300 + (i % 7u) * 16u, 9, 1, 2, 2};
+		many.Store(k, i * 31u + 1u);
+	}
+	for (uint64_t i = 0; i < 4096; i++) {
+		const DrawPrep::CodeDigestKey k {0x400000 + i * 0x340u, 0x300 + (i % 7u) * 16u, 9, 1, 2, 2};
+		uint64_t                      value = 0;
+		if (many.Lookup(k, value)) {
+			exact &= value == i * 31u + 1u;
+		}
+	}
+	Check(exact, "a lookup never returns another shader's digest");
+}
+
+// KYTY_DRAW_PREP_ADAPT: the active-worker cap formula.
+void TestAdaptiveCap() {
+	// ceil(1.3 x busy) + 1, bounded by the workers and by the affinity processors minus one.
+	Check(DrawPrep::AdaptiveCap(0.0, 6, 32, 1, 0) == 1, "idle: one worker");
+	Check(DrawPrep::AdaptiveCap(1.0, 6, 32, 1, 0) == 3, "1 busy core: ceil(1.3) + 1 = 3");
+	Check(DrawPrep::AdaptiveCap(2.4, 6, 32, 1, 0) == 5, "2.4 busy cores: ceil(3.12) + 1 = 5");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 32, 1, 0) == 6, "never more than the workers");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 12, 1, 0) == 6, "6-core mask (12 processors): the workers");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 16, 1, 0) == 6, "8-core mask (16 processors): the workers");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 4, 1, 0) == 3, "4 processors: 3 workers + the commit thread");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 1, 1, 0) == 1, "one processor still gets one worker");
+	// The bound never cuts the pool below the commit thread's demand (the busy term) while the
+	// workers and the commit thread fit on the processors: at 4, 6, 8, 12, 16 and 32 logical
+	// processors. The old bound (logical - 4) / 2 gave 1 / 1 / 2 / 4 / 6 / 14.
+	const uint32_t lps_list[] = {4, 6, 8, 12, 16, 32};
+	const double   busy_list[] = {0.0, 0.5, 1.0, 1.6, 2.4, 3.1, 5.0};
+	bool           demand_kept = true;
+	for (const auto lps: lps_list) {
+		for (const auto busy: busy_list) {
+			const auto demand = std::min(static_cast<uint32_t>(std::ceil(1.3 * busy)) + 1u, 6u);
+			const auto cap    = DrawPrep::AdaptiveCap(busy, 6, lps, 1, 0);
+			demand_kept &= cap == std::min(demand, lps - 1u);
+		}
+	}
+	Check(demand_kept, "cap = min(demand, workers, processors - 1) at 4, 6, 8, 12, 16, 32 processors");
+	Check(DrawPrep::AdaptiveProcessorBound(4) == 3 && DrawPrep::AdaptiveProcessorBound(6) == 5 &&
+	          DrawPrep::AdaptiveProcessorBound(8) == 7 && DrawPrep::AdaptiveProcessorBound(12) == 11 &&
+	          DrawPrep::AdaptiveProcessorBound(16) == 15 && DrawPrep::AdaptiveProcessorBound(32) == 31,
+	      "processor bound = logical processors - 1");
+	// 16 processors and more: the same caps as the old bound for six workers (it never bound there).
+	bool unchanged = true;
+	for (const auto lps: {16u, 32u}) {
+		for (const auto busy: busy_list) {
+			const auto old_bound = (lps - 4u) / 2u;
+			const auto old_cap   = std::min({static_cast<uint32_t>(std::ceil(1.3 * busy)) + 1u, old_bound, 6u});
+			unchanged &= DrawPrep::AdaptiveCap(busy, 6, lps, 1, 0) == old_cap;
+		}
+	}
+	Check(unchanged, "16 and 32 processors: caps unchanged for six workers");
+	Check(DrawPrep::AdaptiveCap(5.0, 6, 12, 1, 2) == 2, "KYTY_DRAW_PREP_ADAPT_MAX overrides the bound");
+	Check(DrawPrep::AdaptiveCap(0.0, 6, 32, 3, 0) == 3, "KYTY_DRAW_PREP_ADAPT_MIN raises the floor");
+	Check(DrawPrep::AdaptiveCap(0.0, 2, 32, 3, 0) == 2, "the floor never exceeds the workers");
+	Check(DrawPrep::AdaptiveCap(-1.0, 6, 32, 1, 0) == 1, "negative busy (counter skew) counts as idle");
+}
+
 void TestRecordScopeNests() {
 	DrawPrep::ReadSet  outer_set;
 	DrawPrep::ReadSet  inner_set;
@@ -804,23 +1072,41 @@ void TestWindowSingleThread() {
 	window.Retire();
 }
 
-void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items) {
+// batch > 1: the workers reserve up to `batch` slots per claim (KYTY_DRAW_PREP_LEAN claim part,
+// Window::TryReserve) and take each with ClaimReserved; the producer may take a reserved head.
+void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items, uint32_t batch = 1) {
 	DrawPrep::Window<Item> window(capacity);
 	std::atomic<bool>      stop {false};
 	std::vector<std::thread> threads;
 	for (uint32_t w = 0; w < workers; w++) {
 		threads.emplace_back([&, w] {
-			while (!stop.load(std::memory_order_acquire)) {
-				uint64_t seq  = 0;
-				auto*    item = window.TryClaim(seq);
-				if (item == nullptr) {
-					std::this_thread::yield();
-					continue;
-				}
+			const auto prepare = [&](Item* item, uint64_t seq) {
 				item->output      = Work(item->input);
 				item->prepared_by = w + 1u;
 				item->preparations++;
 				window.Complete(seq);
+			};
+			while (!stop.load(std::memory_order_acquire)) {
+				uint64_t seq = 0;
+				if (batch > 1u) {
+					uint32_t count = 0;
+					if (!window.TryReserve(seq, count, batch, 2)) {
+						std::this_thread::yield();
+						continue;
+					}
+					for (uint32_t i = 0; i < count; i++) {
+						if (auto* item = window.ClaimReserved(seq + i); item != nullptr) {
+							prepare(item, seq + i);
+						}
+					}
+					continue;
+				}
+				auto* item = window.TryClaim(seq);
+				if (item == nullptr) {
+					std::this_thread::yield();
+					continue;
+				}
+				prepare(item, seq);
 			}
 		});
 	}
@@ -875,8 +1161,186 @@ void TestWindowConcurrent(uint32_t capacity, uint32_t workers, uint64_t items) {
 	Check(result_ok, "every item is prepared exactly once with the right result");
 	Check(next_retire == items && self + by_workers == items, "every item retires once");
 	// How many items the workers (rather than the producer) prepared depends on scheduling.
-	std::printf("  window %u x %u workers: %llu of %llu prepared by workers\n", capacity, workers,
-	            static_cast<unsigned long long>(by_workers), static_cast<unsigned long long>(items));
+	std::printf("  window %u x %u workers (batch %u): %llu of %llu prepared by workers\n", capacity,
+	            workers, batch, static_cast<unsigned long long>(by_workers),
+	            static_cast<unsigned long long>(items));
+}
+
+// KYTY_SPIN_BUDGET: the head wake (Window::EnableHeadWake / ParkHead) with the production gate-pool
+// worker loop and its idle hooks. The producer parks on every head a worker holds instead of
+// spinning; the hooks give the workers no idle spin (every idle period parks). Every item retires
+// once, in order, with the right result; a lost head wake hangs the test (ctest times it out).
+void BusyNs(uint64_t ns);
+
+void TestHeadWakeAndWorkerHooks(uint32_t workers, uint64_t items) {
+	DrawPrep::Window<Item> window(32);
+	window.EnableHeadWake();
+	Check(window.HeadWakeEnabled(), "head wake enabled");
+	DrawPrep::WorkerGate gate(workers, workers, 2);
+	std::atomic<bool>    stop {false};
+	std::atomic<uint64_t> limits {0};
+	std::atomic<uint64_t> parked_periods {0};
+	struct Hooks {
+		std::atomic<uint64_t>* limits;
+		std::atomic<uint64_t>* parked;
+		[[nodiscard]] uint64_t SpinLimit(uint64_t /*wanted*/) const {
+			limits->fetch_add(1, std::memory_order_relaxed);
+			return 0; // a closed budget gate's shortest spin
+		}
+		void Spun(uint64_t /*tsc*/, bool parked_now) const {
+			if (parked_now) {
+				parked->fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	};
+	std::vector<std::thread> threads;
+	for (uint32_t w = 0; w < workers; w++) {
+		threads.emplace_back([&, w] {
+			DrawPrep::RunPreparationWorkerBatched(
+			    gate, window, w, 200'000, 200'000, stop,
+			    [&](Item& item, uint64_t seq) {
+				    BusyNs(2'000);
+				    item.output      = Work(item.input);
+				    item.prepared_by = w + 1u;
+				    item.preparations++;
+				    window.Complete(seq);
+			    },
+			    [] {}, [] { return 1u; }, Hooks {&limits, &parked_periods});
+		});
+	}
+	uint64_t next_input = 0, next_retire = 0, head_parks = 0;
+	bool     ok         = true;
+	const auto retire = [&] {
+		auto& item = window.HeadPayload();
+		if (window.TryClaimHead()) {
+			item.output = Work(item.input);
+			item.preparations++;
+		} else {
+			while (!window.HeadDone()) {
+				head_parks += window.ParkHead() ? 1u : 0u;
+			}
+		}
+		ok &= item.input == next_retire && item.output == Work(item.input) && item.preparations == 1;
+		next_retire++;
+		window.Retire();
+	};
+	while (next_input < items) {
+		if (window.Full()) {
+			retire();
+		}
+		auto& item        = window.Reserve();
+		item.input        = next_input++;
+		item.output       = 0;
+		item.preparations = 0;
+		window.Publish();
+		gate.OnPublish([&] { return window.Unclaimed(); });
+		if (next_input % 61u == 0u) {
+			while (!window.Empty()) {
+				retire();
+			}
+			std::this_thread::sleep_for(std::chrono::microseconds(200)); // let the workers park
+		}
+	}
+	while (!window.Empty()) {
+		retire();
+	}
+	stop.store(true, std::memory_order_seq_cst);
+	gate.WakeAll();
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	Check(ok && next_retire == items, "head wake: every item once, in order, right result");
+	Check(limits.load() != 0 && parked_periods.load() != 0, "worker hooks: asked per idle period, parks reported");
+	std::printf("  head wake %u workers: %llu items, %llu head parks, %llu worker idle parks\n", workers,
+	            static_cast<unsigned long long>(items), static_cast<unsigned long long>(head_parks),
+	            static_cast<unsigned long long>(parked_periods.load()));
+}
+
+// KYTY_DRAW_PREP_ADAPT: the adaptive pool's workers (the production loop) against a producer that
+// publishes in bursts with pauses (so workers park and must be woken), retires in order, takes
+// unclaimed heads itself, and changes the cap while it runs. Every item is prepared exactly once
+// and the run ends (a lost wakeup would leave items to the producer only; a hang fails the test
+// by timing out in ctest).
+void TestAdaptivePoolStress(uint32_t workers, uint64_t spin_ns, uint32_t batch) {
+	DrawPrep::Window<Item>    window(32);
+	DrawPrep::AdaptivePool    pool(workers, workers);
+	std::atomic<bool>         stop {false};
+	std::vector<std::thread>  threads;
+	for (uint32_t w = 0; w < workers; w++) {
+		threads.emplace_back([&, w] {
+			DrawPrep::RunAdaptiveWorker(
+			    pool, window, w, spin_ns, stop,
+			    [&, w](Item& item, uint64_t seq) {
+				    item.output      = Work(item.input);
+				    item.prepared_by = w + 1u;
+				    item.preparations++;
+				    window.Complete(seq);
+			    },
+			    [batch] { return batch; });
+		});
+	}
+	constexpr uint64_t Items = 60000;
+	uint64_t next_input = 0, next_retire = 0, self = 0, by_workers = 0;
+	bool     ok         = true;
+	const auto retire_head = [&] {
+		auto& item = window.HeadPayload();
+		if (window.TryClaimHead()) {
+			item.output = Work(item.input);
+			item.preparations++;
+			self++;
+		} else {
+			while (!window.HeadDone()) {
+				std::this_thread::yield();
+			}
+			by_workers++;
+		}
+		ok &= item.input == next_retire && item.output == Work(item.input) && item.preparations == 1;
+		next_retire++;
+		window.Retire();
+	};
+	std::mt19937 rng(77);
+	while (next_input < Items) {
+		const auto burst = 1u + rng() % 40u;
+		for (uint32_t i = 0; i < burst && next_input < Items; i++) {
+			if (window.Full()) {
+				retire_head();
+			}
+			auto& item        = window.Reserve();
+			item.input        = next_input++;
+			item.output       = 0;
+			item.preparations = 0;
+			window.Publish();
+			(void)pool.OnPublish();
+		}
+		if (rng() % 8u == 0) {
+			pool.SetCap(1u + rng() % workers);
+		}
+		if (rng() % 16u == 0) {
+			// A pause long enough for every worker to park.
+			std::this_thread::sleep_for(std::chrono::microseconds(200));
+		}
+		// Commit slowly enough that workers have work to find.
+		const auto retire = rng() % (burst + 2u);
+		for (uint32_t i = 0; i < retire && !window.Empty(); i++) {
+			retire_head();
+		}
+	}
+	while (!window.Empty()) {
+		retire_head();
+	}
+	stop.store(true, std::memory_order_seq_cst);
+	pool.WakeAll();
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	Check(ok, "adaptive pool: in order, each item prepared exactly once");
+	Check(next_retire == Items && self + by_workers == Items, "adaptive pool: every item retires");
+	Check(by_workers > Items / 20,"adaptive pool: workers (not only the producer) prepare items");
+	Check(pool.Spinning() == 0, "adaptive pool: no worker counts as spinning after shutdown");
+	std::printf("  adaptive pool %u workers spin %llu ns batch %u: %llu of %llu by workers, %llu wakes\n",
+	            workers, static_cast<unsigned long long>(spin_ns), batch,
+	            static_cast<unsigned long long>(by_workers), static_cast<unsigned long long>(Items),
+	            static_cast<unsigned long long>(pool.Wakes()));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -905,6 +1369,175 @@ void TestWorkerGateBasics() {
 		(void)gate.OnPublish(backlog);
 	}
 	Check(backlog_reads == 8, "the producer reads the backlog every WakeBacklog-th publish");
+}
+
+// KYTY_SPEC_SEGMENTS (segment.h): synthetic draws through encode, validate, compare and the
+// segment bookkeeping; then the hand-over through the preparation window (workers encode, the
+// producer validates in order).
+DrawPrep::Segment::EncodeInputs SegmentInputs(uint32_t n) {
+	DrawPrep::Segment::EncodeInputs in;
+	in.run_key                  = 0x1234;
+	in.index_type               = 0;
+	in.index_count              = 3 * (n + 1);
+	in.instance_count           = 1 + (n & 1u);
+	in.base_vertex              = static_cast<int32_t>(n) - 2;
+	in.index_address            = 0x100000 + uint64_t {n} * 0x40;
+	in.resolved_vertex_offset   = 10;
+	in.resolved_instance_offset = n & 3u;
+	return in;
+}
+
+void TestSegmentEncodeValidate() {
+	using namespace DrawPrep::Segment;
+	Check(ParseMode(nullptr) == Mode::Off && ParseMode("0") == Mode::Off && ParseMode("1") == Mode::On &&
+	          ParseMode("2") == Mode::Verify && ParseMode("verify") == Mode::Verify && ParseMode("x") == Mode::Off,
+	      "segments: switch values");
+	auto in   = SegmentInputs(5);
+	auto draw = Encode(in);
+	Check(draw.miss == Miss::None && draw.run_key == 0x1234 && draw.element_size == 2 && draw.index_count == 18 &&
+	          draw.instance_count == 2 && draw.vertex_offset == 13 && draw.first_instance == 1 &&
+	          draw.index_address == 0x100000 + 5 * 0x40 && draw.index_bytes == 36,
+	      "segments: encode fields (vertex offset = resolved + base vertex)");
+	in.index_type = 1;
+	Check(Encode(in).element_size == 4 && Encode(in).index_bytes == 72, "segments: 32-bit indices");
+	// Each refusal, in the order Encode checks them.
+	const auto refuse = [&](auto&& change, Miss expected, const char* text) {
+		auto bad = SegmentInputs(1);
+		change(bad);
+		Check(Encode(bad).miss == expected, text);
+	};
+	refuse([](EncodeInputs& x) { x.indexed = false; }, Miss::NotIndexed, "segments: not indexed");
+	refuse([](EncodeInputs& x) { x.prepared_ok = false; }, Miss::NotPrepared, "segments: not prepared");
+	refuse([](EncodeInputs& x) { x.run_key = 0; }, Miss::NoKey, "segments: no key");
+	refuse([](EncodeInputs& x) { x.offsets_from_state = false; }, Miss::OffsetSource, "segments: offset source");
+	refuse([](EncodeInputs& x) { x.gpu_instance_address = 0x40; }, Miss::GpuInstances, "segments: GPU instances");
+	refuse([](EncodeInputs& x) { x.plain_primitive = false; }, Miss::PrimitiveType, "segments: primitive type");
+	refuse([](EncodeInputs& x) { x.index_type = 2; }, Miss::ElementSize, "segments: element size");
+	refuse([](EncodeInputs& x) { x.vertex_stage = false; }, Miss::NoVertexStage, "segments: no vertex stage");
+	refuse([](EncodeInputs& x) { x.indexed = false; x.run_key = 0; }, Miss::NotIndexed, "segments: first reason wins");
+	// Validate.
+	Check(Validate(draw, 0x1234, 2) == Miss::None, "segments: validates against its run");
+	Check(Validate(EncodedDraw {}, 0x1234, 2) == Miss::NotEncoded, "segments: nothing encoded");
+	Check(Validate(draw, 0x9999, 2) == Miss::Key, "segments: another run's key");
+	Check(Validate(draw, 0x1234, 4) == Miss::RecordElement, "segments: the record's element size");
+	// Compare.
+	auto serial = draw;
+	Check(Compare(draw, serial) == 0, "segments: equal draws compare equal");
+	serial.vertex_offset++;
+	serial.index_bytes++;
+	Check(Compare(draw, serial) == ((1u << static_cast<uint32_t>(Field::VertexOffset)) |
+	                                (1u << static_cast<uint32_t>(Field::IndexBytes))),
+	      "segments: the mask names the differing fields");
+	// Segments: consecutive validated draws of one run.
+	SegmentTracker tracker;
+	uint32_t       starts = 0;
+	for (uint64_t run: {7u, 7u, 7u}) starts += tracker.Note(run) ? 1u : 0u;
+	tracker.Break(); // a start draw in between
+	for (uint64_t run: {7u, 7u, 9u, 9u}) starts += tracker.Note(run) ? 1u : 0u;
+	Check(starts == 3, "segments: a break or another run starts a segment");
+	// The report line names every field and reason.
+	Counters counters;
+	counters.kernel_taken = 10;
+	counters.validated    = 8;
+	counters.segments     = 2;
+	counters.misses[static_cast<size_t>(Miss::Key)] = 2;
+	counters.mismatches[static_cast<size_t>(Field::VertexOffset)] = 1;
+	const auto line = FormatLine(counters, "verify");
+	Check(line.find("validated 8 (80.0%)") != std::string::npos && line.find("(4.0 draws/segment)") != std::string::npos &&
+	          line.find("vertex_offset=1") != std::string::npos && line.find("total=1") != std::string::npos &&
+	          line.find("key=2") != std::string::npos && line.find("record_element=0") != std::string::npos,
+	      "segments: report line");
+}
+
+struct SegmentItem {
+	uint32_t                       input = 0;
+	DrawPrep::Segment::EncodedDraw draw;
+};
+
+void TestSegmentHandOver() {
+	using namespace DrawPrep::Segment;
+	constexpr uint64_t            Items = 100000;
+	DrawPrep::Window<SegmentItem> window(32);
+	std::atomic<bool>             stop {false};
+	std::vector<std::thread>      threads;
+	const auto                    encode = [](uint32_t input) {
+        auto in = SegmentInputs(input);
+        if (input % 97u == 0) in.run_key = 0x5555; // another run's draw: a validation miss
+        return Encode(in);
+	};
+	for (int w = 0; w < 4; w++) {
+		threads.emplace_back([&] {
+			while (!stop.load(std::memory_order_acquire)) {
+				uint64_t seq  = 0;
+				auto*    item = window.TryClaim(seq);
+				if (item == nullptr) {
+					std::this_thread::yield();
+					continue;
+				}
+				item->draw = encode(item->input);
+				window.Complete(seq);
+			}
+		});
+	}
+	uint64_t   next = 0, retired = 0, validated = 0, key_misses = 0, mismatches = 0;
+	const auto retire = [&] {
+		auto& item = window.HeadPayload();
+		if (window.TryClaimHead()) {
+			item.draw = encode(item.input); // the producer prepares the head itself
+		} else {
+			while (!window.HeadDone()) std::this_thread::yield();
+		}
+		const auto miss = Validate(item.draw, 0x1234, 2);
+		if (miss == Miss::None) {
+			validated++;
+			mismatches += Compare(item.draw, Encode(SegmentInputs(item.input))) != 0 ? 1u : 0u;
+		} else {
+			key_misses += miss == Miss::Key ? 1u : 0u;
+		}
+		window.Retire();
+		retired++;
+	};
+	while (retired < Items) {
+		if (next < Items && !window.Full()) {
+			window.Reserve().input = static_cast<uint32_t>(next++);
+			window.Publish();
+		} else {
+			retire();
+		}
+	}
+	stop.store(true, std::memory_order_release);
+	for (auto& t: threads) t.join();
+	const uint64_t expected_misses = (Items + 96) / 97;
+	Check(key_misses == expected_misses && validated == Items - expected_misses,
+	      "segments hand-over: every draw validated or missed by its key");
+	Check(mismatches == 0, "segments hand-over: encoded draws equal the serial encode");
+}
+
+// KYTY_SERVE_IN_WAITS bit 1 (HeadWaitServiceAt): off keeps the 2 ms deadlock guard only; on serves
+// at every 64th look while commands are queued, and asks whether they are only at such a look.
+void TestHeadWaitService() {
+	using DrawPrep::HeadWaitService;
+	int        asked   = 0;
+	const auto queued  = [&] { asked++; return true; };
+	const auto nothing = [&] { asked++; return false; };
+	for (uint32_t spins = 0; spins < 4096; spins++) {
+		const auto off = DrawPrep::HeadWaitServiceAt(spins, 1'000'000u, false, queued);
+		Check(off == HeadWaitService::None, "serve-in-waits off: nothing before 2 ms");
+	}
+	Check(asked == 0, "serve-in-waits off: the pending test is never asked");
+	Check(DrawPrep::HeadWaitServiceAt(1023, 2'000'001u, false, queued) == HeadWaitService::Guard,
+	      "serve-in-waits off: the guard after 2 ms at a 1024th look");
+	Check(DrawPrep::HeadWaitServiceAt(1022, 2'000'001u, false, queued) == HeadWaitService::None,
+	      "serve-in-waits off: the guard only at a 1024th look");
+	uint32_t served = 0;
+	for (uint32_t spins = 0; spins < 4096; spins++) {
+		served += DrawPrep::HeadWaitServiceAt(spins, 0, true, queued) == HeadWaitService::Serve ? 1 : 0;
+	}
+	Check(served == 64 && asked == 64, "serve-in-waits on: every 64th look, asked only there");
+	Check(DrawPrep::HeadWaitServiceAt(63, 0, true, nothing) == HeadWaitService::None,
+	      "serve-in-waits on: nothing queued, nothing run");
+	Check(DrawPrep::HeadWaitServiceAt(1023, 2'000'001u, true, nothing) == HeadWaitService::Guard,
+	      "serve-in-waits on: the guard still runs");
 }
 
 // AwaitHead step by step: this thread is the producer and also plays the workers holding slots.
@@ -1984,6 +2617,7 @@ int main(int argc, char** argv) {
 	TestLogEmptyRangeNeverIntersects();
 	TestLogBumpWithoutReaders();
 	TestLogHullMatchesSearch();
+	TestLogSummaryMatchesCheck();
 	TestGlobalLogAlwaysRecords();
 	TestLogOverflow();
 	TestLogConcurrentAppends();
@@ -1996,6 +2630,9 @@ int main(int argc, char** argv) {
 	TestReadSetDigests();
 	TestReadSetCertificate();
 	TestReadSetValidateInPlace();
+	TestReadSetLeanMatchesPlain();
+	TestCodeDigestCache();
+	TestAdaptiveCap();
 	TestRecordScopeNests();
 	TestPacketClassification();
 	TestFenceKinds();
@@ -2005,12 +2642,24 @@ int main(int argc, char** argv) {
 	TestWindowConcurrent(4, 8, 200000);  // tiny window: constant wrap-around and races
 	TestWindowConcurrent(32, 6, 200000); // the default shape
 	TestWindowConcurrent(32, 1, 50000);
+	TestWindowConcurrent(4, 8, 200000, 2); // KYTY_DRAW_PREP_LEAN claim part
+	TestWindowConcurrent(32, 6, 200000, 2);
+	TestWindowConcurrent(32, 3, 200000, 4);
+	TestHeadWakeAndWorkerHooks(6, 60000);
+	TestHeadWakeAndWorkerHooks(2, 60000);
+	TestHeadWakeAndWorkerHooks(1, 20000);
 	TestWorkerGateBasics();
+	TestHeadWaitService();
+	TestSegmentEncodeValidate();
+	TestSegmentHandOver();
 	TestAwaitHead();
 	TestWorkerGateStress();
 	TestColdTokenStranded();
 	TestColdTokenStress();
 	TestStealStress();
+	TestAdaptivePoolStress(6, 10'000, 1);
+	TestAdaptivePoolStress(6, 0, 1);
+	TestAdaptivePoolStress(3, 2'000, 2);
 	TestGapLedgerExclusive();
 	TestGapLedgerPhasesAndNested();
 	TestGapLedgerFlushAndOverflow();

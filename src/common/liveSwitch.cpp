@@ -1,4 +1,4 @@
-#include "common/liveSwitch.h"
+﻿#include "common/liveSwitch.h"
 
 #include "common/cpuPlacement.h"
 #include "common/hangTrace.h"
@@ -64,6 +64,10 @@ uint64_t g_cp_slice_start = 0; // 0: outside a slice
 
 std::atomic<void (*)(const std::string&)> g_log_sink {nullptr};
 std::atomic<GpuTotals (*)()>              g_gpu_totals {nullptr};
+std::atomic<CpIdleTotals (*)()>           g_cp_idle {nullptr};
+std::atomic<std::string (*)(uint64_t)>    g_extra_lines {nullptr};
+std::atomic<std::string (*)()>            g_line_suffix {nullptr};
+std::atomic<uint64_t> g_test_counts[static_cast<uint32_t>(TestCounter::Count)] {};
 
 void WriteLog(const std::string& line) {
 	if (auto* sink = g_log_sink.load(std::memory_order_acquire); sink != nullptr) {
@@ -291,6 +295,19 @@ Switch::Switch(const char* name, Parser parse, OnChange on_change) noexcept
 	registry.head = this;
 }
 
+bool ReloadFromEnvironment(const char* name) {
+	auto&           registry = Registry::Get();
+	std::lock_guard lock(registry.mutex);
+	bool            found = false;
+	for (Switch* s = registry.head; s != nullptr; s = s->m_next) {
+		if (std::strcmp(s->m_name, name) == 0) {
+			s->m_value.store(s->m_parse(EnvValue(name)), std::memory_order_relaxed);
+			found = true;
+		}
+	}
+	return found;
+}
+
 std::string Registry::Names() {
 	auto&                    registry = Get();
 	std::vector<std::string> names;
@@ -370,9 +387,29 @@ void Registry::Apply(uint64_t flip) {
 		                  totals.busy_ns / 1000u, totals.idle_ns / 1000u, totals.starved_ns / 1000u,
 		                  totals.cmdbufs);
 	}
+	if (auto* provider = g_cp_idle.load(std::memory_order_acquire); provider != nullptr) {
+		const auto i = provider();
+		gpu += fmt::format(" cpidle [tsc {}, nowork {}, empty {}, blocked {}, fence {}, starved {}]", i.tsc,
+		                   i.nowork, i.empty, i.blocked, i.fence, i.starved);
+	}
+	// jgcp counters: only once something counted (the line keeps its old form otherwise).
+	const auto drawidx = g_test_counts[0].load(std::memory_order_relaxed);
+	const auto suspend = g_test_counts[1].load(std::memory_order_relaxed);
+	const auto submits = g_test_counts[2].load(std::memory_order_relaxed);
+	if (drawidx + suspend + submits != 0) {
+		gpu += fmt::format(" counts [drawidx {}, suspend {}, submits {}]", drawidx, suspend, submits);
+	}
+	if (auto* suffix = g_line_suffix.load(std::memory_order_acquire); suffix != nullptr) {
+		gpu += suffix();
+	}
 	WriteLog(fmt::format("Live: seq {} applied at CP flip {} (t_ms {}, t_us {}, cp_busy_us {}){}: {}\n",
 	                     seq, flip, t_ms, now_ns / 1000u, busy_ns / 1000u, gpu,
 	                     changes.empty() ? std::string("no change") : changes));
+	if (auto* extra = g_extra_lines.load(std::memory_order_acquire); extra != nullptr) {
+		if (auto lines = extra(staged.seq.value_or(0)); !lines.empty()) {
+			WriteLog(lines);
+		}
+	}
 	for (const auto& key: unknown) {
 		WriteLog(fmt::format("Live: seq {}: {} is not a live switch in this build (ignored)\n", seq,
 		                     key));
@@ -391,6 +428,15 @@ Switch g_test_cp_spin_us("KYTY_LIVE_TEST_CP_SPIN_US", [](const char* value) -> i
 
 } // namespace
 
+} // namespace Live
+
+// KYTY_STATIC_ONCE_FAST (common/staticOnce.h; live, default 1).
+namespace Common::StaticOnceDetail {
+Live::Switch g_fast("KYTY_STATIC_ONCE_FAST", Live::ParseDefaultOn);
+} // namespace Common::StaticOnceDetail
+
+namespace Live {
+
 int64_t ParseDefaultOn(const char* value) {
 	return value == nullptr || std::strcmp(value, "0") != 0 ? 1 : 0;
 }
@@ -401,6 +447,39 @@ int64_t ParseDefaultOff(const char* value) {
 
 bool Enabled() noexcept {
 	return g_enabled.load(std::memory_order_relaxed);
+}
+
+void SetExtraLinesProvider(std::string (*provider)(uint64_t seq)) noexcept {
+	g_extra_lines.store(provider, std::memory_order_release);
+}
+
+void SetLineSuffixProvider(std::string (*provider)()) noexcept {
+	g_line_suffix.store(provider, std::memory_order_release);
+}
+
+void CountTest(TestCounter counter) noexcept {
+	g_test_counts[static_cast<uint32_t>(counter)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountTestSingleWriter(TestCounter counter) noexcept {
+	auto& c = g_test_counts[static_cast<uint32_t>(counter)];
+	c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
+void TestSpinNs(int64_t ns) noexcept {
+	if (ns <= 0) {
+		return;
+	}
+	const auto end = std::chrono::steady_clock::now() + std::chrono::nanoseconds(ns);
+	while (std::chrono::steady_clock::now() < end) {
+#if defined(_M_X64) || defined(__x86_64__)
+		_mm_pause();
+#endif
+	}
+}
+
+void SetCpIdleProvider(CpIdleTotals (*provider)()) noexcept {
+	g_cp_idle.store(provider, std::memory_order_release);
 }
 
 void SetGpuTotalsProvider(GpuTotals (*provider)()) noexcept {

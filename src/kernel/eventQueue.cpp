@@ -1,7 +1,9 @@
+﻿#include "common/hleWaitStats.h"
 #include "kernel/eventQueue.h"
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/gthreadStats.h"
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -33,12 +35,6 @@ constexpr uint16_t EV_ADD     = 0x01;
 constexpr uint16_t EV_ONESHOT = 0x10;
 constexpr uint16_t EV_CLEAR   = 0x20;
 constexpr uint16_t EV_ERROR   = 0x4000;
-
-static uint64_t MonotonicTimeNs() {
-	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-	                                 std::chrono::steady_clock::now().time_since_epoch())
-	                                 .count());
-}
 
 namespace {
 
@@ -203,7 +199,7 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	TriggerExpiredTimers(MonotonicTimeNs());
+	TriggerExpiredTimers(Common::SteadyNs());
 
 	if (KernelEqueueCoalesceMode() == EqueueCoalesceMode::Legacy) {
 		return GetTriggeredEventsLegacy(ev, num);
@@ -388,7 +384,6 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 
 	uint32_t      elapsed = 0;
 	Common::Timer t;
-	t.Start();
 
 	for (;;) {
 		int ret = GetTriggeredEvents(ev, num);
@@ -400,7 +395,7 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 		HangWatchdog::Scope wait("guest-equeue", reinterpret_cast<uint64_t>(this), num, 0, 0,
 		                         micros);
 		uint32_t   timer_wait = 0;
-		const bool has_timer  = GetNextTimerWaitMicros(MonotonicTimeNs(), &timer_wait);
+		const bool has_timer  = GetNextTimerWaitMicros(Common::SteadyNs(), &timer_wait);
 		if (micros == 0 && !has_timer) {
 			m_cond_var.Wait(&m_mutex);
 		} else {
@@ -426,7 +421,7 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 		                       return e.event.ident == ident && e.event.filter == filter;
 	                       });
 	if (it != m_events.end()) {
-		TriggerExpiredTimers(MonotonicTimeNs());
+		TriggerExpiredTimers(Common::SteadyNs());
 		it->deadline_ns = event.deadline_ns;
 		it->interval_ns = event.interval_ns;
 		it->event.udata = event.event.udata;
@@ -614,7 +609,9 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
+	HleWait::Scope hle_wait_scope(HleWait::EqNone); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	auto owner = KernelPinEqueue(eq);
 	if (!owner) {
@@ -649,6 +646,14 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		} else {
 			*out = owner->WaitForEvents(ev, num, *timo);
 		}
+	}
+	if (*out > 0) {
+		const auto f = ev[0].filter;
+		const auto id = static_cast<uint64_t>(ev[0].ident);
+		hle_wait_scope.Set(f == KERNEL_EVFILT_VIDEO_OUT ? (id == 0 ? HleWait::EqFlip : id == 1 ? HleWait::EqVblank : HleWait::EqVideoOutOther)
+		                   : f == KERNEL_EVFILT_GRAPHICS ? HleWait::EqGraphics
+		                   : f == KERNEL_EVFILT_USER     ? HleWait::EqUser
+		                                                 : HleWait::EqOther);
 	}
 	if (pace_begin != 0) {
 		const bool got = *out > 0;
@@ -748,7 +753,7 @@ int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id) {
 }
 
 static int AddTimerEvent(KernelEqueue eq, int id, uint64_t delay_ns, bool periodic, void* udata) {
-	const auto now_ns = MonotonicTimeNs();
+	const auto now_ns = Common::SteadyNs();
 	KernelEqueueEvent event {};
 	event.deadline_ns  = delay_ns <= UINT64_MAX - now_ns ? now_ns + delay_ns : UINT64_MAX;
 	event.interval_ns  = periodic ? delay_ns : 0;
@@ -761,6 +766,10 @@ static int AddTimerEvent(KernelEqueue eq, int id, uint64_t delay_ns, bool period
 
 int KYTY_SYSV_ABI KernelAddTimerEvent(KernelEqueue eq, int id, KernelUseconds usec, void* udata) {
 	return AddTimerEvent(eq, id, static_cast<uint64_t>(usec) * 1000, true, udata);
+}
+
+int KYTY_SYSV_ABI KernelDeleteTimerEvent(KernelEqueue eq, int id) {
+	return KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_TIMER);
 }
 
 int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTimespec* ts,

@@ -7,9 +7,11 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/watchRange.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -28,6 +30,13 @@ public:
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
 
+	// KYTY_TRACKER_LOCKFREE_DIRTY=1 (default off; adapted from usa-ratt/KytyPS5-GT7 ba83f1a64,
+	// mainline #1284): on the thread `is_owner` names (the GPU thread, which owns the GPU-dirty
+	// bits), IsRegionCpuModified and IsRegionGpuModified read
+	// the regions' published mirrors (RegionManager::IsModifiedAcquire) instead of taking their
+	// locks. Other threads lock as before. Set once by the buffer cache.
+	using OwnerThreadFn = bool (*)() noexcept;
+	static void SetLockFreeDirtyOwner(OwnerThreadFn is_owner) noexcept;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// IsRegionCpuModified and IsRegionGpuModified of one range with each region lock taken once.
@@ -103,6 +112,8 @@ public:
 	[[nodiscard]] uint64_t FaultMutationEpoch() const noexcept {
 		return m_cpu_mutation_epoch.load(std::memory_order_acquire);
 	}
+	// Whether CPU-mutation transitions advance FaultMutationEpoch() at all (constructor flag).
+	[[nodiscard]] bool TracksCpuMutations() const noexcept { return m_track_cpu_mutations; }
 	// KYTY_BDA_DIRTY_LOG (BufferCache::SynchronizeBdaBuffersNow). Once enabled, every transition
 	// FaultMutationEpoch() covers also records the range it can make CPU-dirty (a write fault's
 	// whole fault-ahead window, a whole new region, a demoted or swept region's hot pages, ...),
@@ -117,6 +128,11 @@ public:
 	// one. False when ranges were dropped since the last take (overflow): the caller must
 	// re-examine everything.
 	[[nodiscard]] bool TakeDirtiedRanges(RangeSet& ranges, uint64_t& epoch);
+	// KYTY_BDA_REACH=verify (bufferCacheReach.cpp): a second log of the same transitions, with or
+	// without CPU-mutation tracking, taken by the reach verification only. False from the take
+	// when ranges were dropped (overflow).
+	void EnableReachLog(bool enable) noexcept { m_reach_log_on.store(enable, std::memory_order_release); }
+	[[nodiscard]] bool TakeReachLog(RangeSet& ranges);
 	// The sum of the mutation serials (RegionManager::Serial) of the regions [vaddr, vaddr + size)
 	// spans, or 0 when one of them does not exist yet (or the range is invalid). Serials only grow,
 	// so while this sum is unchanged no CPU-dirty, GPU-dirty, hot or readback-pending bit of any
@@ -153,11 +169,26 @@ private:
 		static_assert(std::is_invocable_v<Flush&>);
 		static_assert(std::is_nothrow_invocable_v<AheadFunc&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback();
+		if (WatchRange::Enabled()) {
+			WatchRange::Note(write_fault ? "CPU write fault" : "CPU invalidate", vaddr, size);
+		}
 		// KYTY_FAULT_AHEAD_ADAPT (SetFaultAheadOverride): a larger window for write faults.
 		FaultPolicy policy = m_fault_policy;
 		if (const auto ahead = s_ahead_override.load(std::memory_order_relaxed);
 		    write_fault && ahead > policy.ahead_pages) {
 			policy.ahead_pages = ahead;
+		}
+		if (write_fault && s_sequential_ahead.load(std::memory_order_relaxed)) {
+			policy.sequential_ahead = true;
+		}
+		// KYTY_HOT_PAGE_MAX_LIVE / KYTY_HOT_PAGE_FRAMES_LIVE (SetHotOverride), hot pages on only.
+		if (write_fault && policy.hot_frames != 0) {
+			if (const auto max = s_hot_max_override.load(std::memory_order_relaxed); max != 0) {
+				policy.hot_max = max;
+			}
+			if (const auto frames = s_hot_frames_override.load(std::memory_order_relaxed); frames != 0) {
+				policy.hot_frames = frames;
+			}
 		}
 		// The pages this makes CPU-dirty become writable when the scope ends, after every region
 		// lock below is released (KYTY_DEFER_UNPROTECT): their bits, serials and mirrors change
@@ -179,7 +210,8 @@ private:
 					return true;
 				}
 				if (write_fault) {
-					const auto [begin, end] = FaultWindow(offset, bytes, policy.ahead_pages);
+					const auto [begin, end] =
+					    FaultWindow(offset, bytes, policy.ahead_pages, policy.sequential_ahead);
 					NotifyCpuMutation(manager->GetCpuAddr() + begin, end - begin);
 				} else {
 					NotifyCpuMutation(manager->GetCpuAddr() + offset, bytes);
@@ -209,6 +241,22 @@ private:
 	}
 
 public:
+	// KYTY_TRACKER_DIRTY_WALK=1 (default off; adapted from Senaxx 6625a63ec via usa-ratt/
+	// KytyPS5-GT7): read-only uploads visit only the regions with CPU-dirty pages in the range
+	// (ForEachUploadRange). Tests set it; SetDirtyWalk(-1) returns to the variable.
+	static void SetDirtyWalk(int value) noexcept {
+		s_dirty_walk.store(value, std::memory_order_relaxed);
+	}
+	[[nodiscard]] static bool DirtyWalkEnabled() noexcept {
+		auto value = s_dirty_walk.load(std::memory_order_relaxed);
+		if (value < 0) {
+			const char* text = std::getenv("KYTY_TRACKER_DIRTY_WALK");
+			value            = text != nullptr && text[0] == '1' ? 1 : 0;
+			s_dirty_walk.store(value, std::memory_order_relaxed);
+		}
+		return value != 0;
+	}
+
 	// Fault policy knobs (constant after construction).
 	[[nodiscard]] const FaultPolicy& GetFaultPolicy() const noexcept { return m_fault_policy; }
 	// KYTY_FAULT_AHEAD_ADAPT (BufferCache): write faults use a fault-ahead window of at least this
@@ -220,6 +268,18 @@ public:
 	}
 	[[nodiscard]] static uint32_t FaultAheadOverride() noexcept {
 		return s_ahead_override.load(std::memory_order_relaxed);
+	}
+	// KYTY_FAULT_AHEAD_SEQUENTIAL (BufferCache, live): write faults open their fault-ahead window
+	// only for sequential fills (FaultPolicy::sequential_ahead). Any thread.
+	static void SetSequentialAhead(bool on) noexcept {
+		s_sequential_ahead.store(on, std::memory_order_relaxed);
+	}
+	// KYTY_HOT_PAGE_MAX_LIVE / KYTY_HOT_PAGE_FRAMES_LIVE (BufferCache, live): with hot pages on,
+	// write faults promote up to `max` hot pages after `frames` consecutive faulting frames instead
+	// of the policy's (0: the policy's). Any thread; a fault takes the values current when it starts.
+	static void SetHotOverride(uint32_t frames, uint32_t max) noexcept {
+		s_hot_frames_override.store(std::min<uint32_t>(frames, 255), std::memory_order_relaxed);
+		s_hot_max_override.store(std::min<uint32_t>(max, 65536), std::memory_order_relaxed);
 	}
 	// Diagnostics (KYTY_FAULT_MAP): whether a write fault on this thread since the last call found
 	// a faulting page CPU-dirty already (FaultResult::already_dirty). Resets the flag.
@@ -289,7 +349,15 @@ public:
 		const bool  keep_hot              = hot_aware && !is_written;
 		const auto  frame                 = Frame();
 		uint32_t    demoted               = 0;
+		// KYTY_TRACKER_DIRTY_WALK=1: a read-only upload skips, without their locks, the regions
+		// with no CPU-dirty page in the range: their collection below would find nothing and
+		// change nothing (a region created here starts CPU-dirty and is visited).
+		const bool dirty_walk = !is_written && DirtyWalkEnabled();
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (dirty_walk && (!manager->AnyCpuModifiedRelaxed() ||
+			                   !manager->IsModifiedAcquire<DirtySource::Cpu>(offset, bytes))) {
+				return;
+			}
 			manager->lock.lock();
 			demoted += manager->CollectUpload(
 			    manager->GetCpuAddr() + offset, bytes, keep_hot, frame, m_hot_count,
@@ -305,6 +373,8 @@ public:
 			}
 		});
 		MemoryStats::Count(MemoryStats::Counter::HotDemotions, demoted);
+		if (is_written && WatchRange::Enabled()) WatchRange::Note("written binding takes GPU ownership", vaddr, size);
+		if (is_written && FaultCost::AttribEnabled()) FaultCost::AttribNoteProducer(vaddr, size, 0);
 		upload_func();
 		// No clean-verdict bump: these GPU bits are not read by clean-read verdicts, and the
 		// only writer (BufferCache::ObtainBuffer) bumps when it adds the exact dirty range.
@@ -363,6 +433,8 @@ public:
 				    late_range_func(address, range_bytes);
 			    });
 		});
+		if (WatchRange::Enabled()) WatchRange::Note("written binding takes GPU ownership (late copy)", vaddr, size);
+		if (FaultCost::AttribEnabled()) FaultCost::AttribNoteProducer(vaddr, size, 1);
 		late_upload_func();
 		Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->template ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset,
@@ -396,6 +468,7 @@ private:
 		return sum;
 	}
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+	inline static std::atomic_int                   s_dirty_walk {-1};
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
@@ -442,9 +515,14 @@ private:
 	void           AdvanceCpuMutationEpoch() noexcept;
 	// The region-relative byte window a write fault of [offset, offset + bytes) can make CPU-dirty
 	// (RegionManager::MarkWriteFault's fault-ahead window of `ahead` pages).
+	// `sequential`: FaultPolicy::sequential_ahead (the window may reach `ahead` pages past the start).
 	[[nodiscard]] static std::pair<uint64_t, uint64_t> FaultWindow(uint64_t offset, uint64_t bytes,
-	                                                               uint64_t ahead) noexcept;
+	                                                               uint64_t ahead,
+	                                                               bool     sequential = false) noexcept;
 	inline static std::atomic_uint32_t s_ahead_override {0};
+	inline static std::atomic_bool     s_sequential_ahead {false};
+	inline static std::atomic_uint32_t s_hot_max_override {0};
+	inline static std::atomic_uint32_t s_hot_frames_override {0};
 	inline static thread_local bool   t_fault_found_dirty = false;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
@@ -463,6 +541,10 @@ private:
 	std::mutex              m_dirtied_mutex;
 	RangeSet                m_dirtied;
 	bool                    m_dirtied_overflow = false;
+	// Reach log (EnableReachLog), under m_dirtied_mutex.
+	std::atomic_bool        m_reach_log_on {false};
+	RangeSet                m_reach_log;
+	bool                    m_reach_log_overflow = false;
 };
 
 } // namespace Libs::Graphics

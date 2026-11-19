@@ -27,10 +27,6 @@ on:
         description: Windows release with the command processor's per-draw diagnostics (KYTY_CP_COMMIT_STATS) compiled in - test builds only, about 2-3% slower
         type: boolean
         default: false
-      cpu_v3:
-        description: Windows release built for x86-64-v3 CPUs (AVX2, FMA, BMI2; every CPU that runs PS5 games has them) - test builds for now
-        type: boolean
-        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -59,7 +55,7 @@ jobs:
     name: Build KytyPS5 (Windows)
     if: inputs.release_tag == '' && !inputs.macos_only
     needs: metadata
-    runs-on: windows-2022
+    runs-on: windows-2025
 
     steps:
       - name: Checkout repository
@@ -152,15 +148,18 @@ jobs:
         shell: cmd
         run: |
           cmake --build _Build/windows --target launcher ^
-            audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
-            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
+            resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests ^
+            memory_tracker_tests page_manager_tests image_page_table_tests bit_array_tests build_flags_tests ^
+            event_queue_lifetime_tests sync_on_address_tests save_data_memory_tests trophy_system_tests ^
+            audio_out_timing_tests ajm_resample_tests png_enc_tests jpeg_dec_tests jpeg_enc_tests occlusion_queries_tests ces_tests save_data_dialog_tests psml_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|memory_tracker|page_manager|image_page_table|bit_array|build_flags|event_queue_lifetime|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|ces|save_data_dialog|psml)$"
 
       - name: Install
         shell: cmd
@@ -243,7 +242,8 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+            --target launcher audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel \
@@ -265,7 +265,7 @@ jobs:
           # (memory_tracker, page_manager and shader_recompiler_compute: Jetsku's int21 versions use
           # Linux-only mmap flags and exceptions, not built on macOS.)
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -444,7 +444,7 @@ jobs:
         run: |
           cmake --build _Build/linux \
             --target launcher kyty_emulator page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel
@@ -453,7 +453,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -466,9 +466,11 @@ jobs:
           file _Build/linux/install/kyty_launcher
           file _Build/linux/install/kyty_emulator
           test -x _Build/linux/install/kyty_updater
+          test -z "$(file _Build/linux/install/kyty_* | grep 'not stripped')"
           file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
           ldd _Build/linux/install/kyty_emulator > /dev/null
           readelf -d _Build/linux/install/kyty_launcher | grep -q 'RPATH.*\$ORIGIN/lib'
+          test -z "$(find _Build/linux/install -name '*.so.*.*' -o -name '*.a' -o -name include)"
           while IFS= read -r -d '' binary; do
             while read -r dependency; do
               test -e "_Build/linux/install/lib/$dependency"
@@ -599,7 +601,6 @@ jobs:
       draft: ${{ inputs.draft }}
       prerelease: ${{ inputs.prerelease }}
       cp_diagnostics: ${{ inputs.cp_diagnostics }}
-      cpu_v3: ${{ inputs.cpu_v3 }}
 
   # The Linux build added to this fork's release (windows_only off): a .tar.gz ending in
   # Linux-x86_64.tar.gz with kyty_emulator at its top, as Linux installers (Batocera's
@@ -618,6 +619,8 @@ jobs:
         with:
           sparse-checkout: |
             tools/u59-preset.json
+            tools/u59-preset.*.json
+            tools/PipelineLists/
             docs/ASTRO-BOT-DLSSG.md
             LICENSE
           sparse-checkout-cone-mode: false
@@ -638,6 +641,13 @@ jobs:
           test -x "$linux_dir/kyty_emulator" || chmod a+x "$linux_dir/kyty_emulator"
           chmod a+x "$linux_dir/kyty_emulator" "$linux_dir/kyty_launcher" "$linux_dir/kyty_updater" || true
           cp tools/u59-preset.json "$linux_dir/"
+          # int22: the per-game presets (u59-preset.<title id>.json) and the shipped shader lists
+          # (PipelineLists, for Precompile) go beside it, as in the Windows package.
+          find tools -maxdepth 1 -name 'u59-preset.*.json' -exec cp {} "$linux_dir/" \;
+          if [ -d tools/PipelineLists ]; then
+            mkdir -p "$linux_dir/PipelineLists"
+            cp tools/PipelineLists/*.kyplst "$linux_dir/PipelineLists/"
+          fi
           cp docs/ASTRO-BOT-DLSSG.md "$linux_dir/README-DLSSG.md"
           cp LICENSE "$linux_dir/"
           archive="KytyPS5-AstroBot-DLSSG-${TAG}-Linux-x86_64.tar.gz"
@@ -661,6 +671,8 @@ jobs:
         with:
           sparse-checkout: |
             tools/u59-preset.json
+            tools/u59-preset.*.json
+            tools/PipelineLists/
             docs/ASTRO-BOT-DLSSG.md
             LICENSE
           sparse-checkout-cone-mode: false
@@ -682,6 +694,13 @@ jobs:
           unzip -q artifacts/KytyPS5-macOS-x86_64.zip -d "$mac_dir"
           # (Beside KytyPS5.app, outside the signed bundle: the launcher looks there too.)
           cp tools/u59-preset.json "$mac_dir/"
+          # int22: the per-game presets (u59-preset.<title id>.json) and the shipped shader lists
+          # (PipelineLists, for Precompile) go beside it, as in the Windows package.
+          find tools -maxdepth 1 -name 'u59-preset.*.json' -exec cp {} "$mac_dir/" \;
+          if [ -d tools/PipelineLists ]; then
+            mkdir -p "$mac_dir/PipelineLists"
+            cp tools/PipelineLists/*.kyplst "$mac_dir/PipelineLists/"
+          fi
           cp docs/ASTRO-BOT-DLSSG.md "$mac_dir/README-DLSSG.md"
           cp LICENSE "$mac_dir/"
           archive="$PWD/KytyPS5-AstroBot-DLSSG-${TAG}-macOS-x86_64.zip"

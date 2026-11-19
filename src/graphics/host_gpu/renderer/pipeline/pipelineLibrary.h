@@ -111,6 +111,21 @@ private:
 	bool                                                       m_has_provoking_vertex = false;
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT m_provoking_vertex {};
 	vk::PipelineMultisampleStateCreateInfo                     m_multisample {};
+	// NV mixed samples (KYTY_EQAA_MIXED): the coverage reduction mode and the attachments' sample
+	// counts. Serialized as an optional block, so pipelines that use them keep a journal key.
+	bool                                                       m_has_reduction = false;
+	vk::PipelineCoverageReductionStateCreateInfoNV             m_reduction {};
+	bool                                                       m_has_sample_count = false;
+	vk::AttachmentSampleCountInfoAMD                           m_sample_count {};
+	std::vector<vk::SampleCountFlagBits>                       m_color_samples;
+	// Per stage: specialization constants (journal keys only); empty map = none.
+	struct Specialization {
+		std::vector<vk::SpecializationMapEntry> entries;
+		std::vector<uint8_t>                    data;
+		vk::SpecializationInfo                  info {};
+	};
+	std::vector<Specialization>                                m_specializations;
+	bool                                                       m_has_specialization = false;
 	bool                                                       m_has_depth_stencil = false;
 	vk::PipelineDepthStencilStateCreateInfo                    m_depth_stencil {};
 	vk::PipelineColorBlendStateCreateInfo                      m_color_blend {};
@@ -122,6 +137,20 @@ private:
 	std::vector<vk::DynamicState>                              m_dynamic_states;
 	vk::ShaderModule                                           m_vertex_module   = nullptr;
 	vk::ShaderModule                                           m_fragment_module = nullptr;
+	// Tessellation (Capture with allow_mesh): the patch size and which extra stages are present.
+	bool                                                       m_tessellation    = false;
+	vk::PipelineTessellationStateCreateInfo                    m_tess_state {};
+	uint32_t                                                   m_tess_stages     = 0; // ShaderStageFlags seen
+	bool AddTessellationStage(vk::ShaderStageFlagBits stage) {
+		const auto bit = static_cast<uint32_t>(stage);
+		if ((stage != vk::ShaderStageFlagBits::eTessellationControl &&
+		     stage != vk::ShaderStageFlagBits::eTessellationEvaluation && stage != vk::ShaderStageFlagBits::eGeometry) ||
+		    (m_tess_stages & bit) != 0) {
+			return false;
+		}
+		m_tess_stages |= bit;
+		return true;
+	}
 };
 
 // The library cache and link step. Not thread-safe: the caller serializes Create (PipelineCache

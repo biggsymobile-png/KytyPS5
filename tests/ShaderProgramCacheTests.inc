@@ -205,6 +205,24 @@ void CheckFingerprint() {
                  [](CodegenOptions &o) { o.sample_lod_clamp = !o.sample_lod_clamp; });
   options_differ("host_ftz_inputs", [](CodegenOptions &o) { o.host_ftz_inputs = !o.host_ftz_inputs; });
   options_differ("exec_selects", [](CodegenOptions &o) { o.exec_selects = !o.exec_selects; });
+  options_differ("lane2_share", [](CodegenOptions &o) { o.lane2_share = !o.lane2_share; });
+  options_differ("known_bits_masks",
+                 [](CodegenOptions &o) { o.known_bits_masks = !o.known_bits_masks; });
+  options_differ("gds_m0_base", [](CodegenOptions &o) { o.gds_m0_base = !o.gds_m0_base; });
+  options_differ("lds_atomic_order",
+                 [](CodegenOptions &o) { o.lds_atomic_order = !o.lds_atomic_order; });
+  options_differ("split_lds_write_sync",
+                 [](CodegenOptions &o) { o.split_lds_write_sync = !o.split_lds_write_sync; });
+  options_differ("storage_table_loose",
+                 [](CodegenOptions &o) { o.storage_table_loose = !o.storage_table_loose; });
+  options_differ("sampled_table_reads",
+                 [](CodegenOptions &o) { o.sampled_table_reads = !o.sampled_table_reads; });
+  options_differ("scalar_load_groups",
+                 [](CodegenOptions &o) { o.scalar_load_groups = !o.scalar_load_groups; });
+  options_differ("null_image_keep_dim",
+                 [](CodegenOptions &o) { o.null_image_keep_dim = !o.null_image_keep_dim; });
+  options_differ("storage_swizzle_canon",
+                 [](CodegenOptions &o) { o.storage_swizzle_canon = !o.storage_swizzle_canon; });
   options_differ("ps_append_live_election",
                  [](CodegenOptions &o) { o.ps_append_live_election = !o.ps_append_live_election; });
   for (const auto mode : {ShaderRecompiler::PsLiveExec::Off,
@@ -215,6 +233,9 @@ void CheckFingerprint() {
     }
   }
   options_differ("loop_guard_budget", [](CodegenOptions &o) { o.loop_guard_budget++; });
+  options_differ("indirect_format_stores_shaders", [](CodegenOptions &o) {
+    o.indirect_format_stores_shaders.push_back(0x0b0ec2bac5920bd3u);
+  });
   options_differ("loop_guard_shaders",
                  [](CodegenOptions &o) { o.loop_guard_shaders.push_back(0x1234u); });
   options_differ("srt_variant_reads",
@@ -225,6 +246,15 @@ void CheckFingerprint() {
   options_differ("dpp_skip_inactive",
                  [](CodegenOptions &o) { o.dpp_skip_inactive = !o.dpp_skip_inactive; });
   options_differ("lane_reductions", [](CodegenOptions &o) { o.lane_reductions = !o.lane_reductions; });
+  options_differ("split_dpp_lane", [](CodegenOptions &o) { o.split_dpp_lane = !o.split_dpp_lane; });
+  options_differ("mov_int_mods", [](CodegenOptions &o) { o.mov_int_mods = !o.mov_int_mods; });
+  options_differ("mad_flush", [](CodegenOptions &o) { o.mad_flush = !o.mad_flush; });
+  options_differ("f16_exact_round", [](CodegenOptions &o) { o.f16_exact_round = !o.f16_exact_round; });
+  options_differ("movrel_full_m0", [](CodegenOptions &o) { o.movrel_full_m0 = !o.movrel_full_m0; });
+  options_differ("omod_zero", [](CodegenOptions &o) { o.omod_zero = !o.omod_zero; });
+  options_differ("cvt_f32_f64_inf", [](CodegenOptions &o) { o.cvt_f32_f64_inf = !o.cvt_f32_f64_inf; });
+  options_differ("bfm_defined", [](CodegenOptions &o) { o.bfm_defined = !o.bfm_defined; });
+  options_differ("wave64_high_lanes", [](CodegenOptions &o) { o.wave64_high_lanes = !o.wave64_high_lanes; });
   options_differ("dispatcher_cap", [](CodegenOptions &o) { o.dispatcher_cap++; });
   options_differ("ir_linear_uses", [](CodegenOptions &o) { o.ir_linear_uses = !o.ir_linear_uses; });
   options_differ("fold_lane_masks", [](CodegenOptions &o) { o.fold_lane_masks = !o.fold_lane_masks; });
@@ -650,14 +680,172 @@ void CheckCacheFile() {
                 !cache.FindPermutation(first.key.digest, 0, first.specialization).has_value(),
             "records were added beyond the file size cap");
   }
+  // KYTY_PROGRAM_CACHE_EVICT: at the cap, records this run has not used make room for new ones;
+  // used ones and the new one are kept, and the file stays within the cap.
+  {
+    WriteFileBytes(path, file);
+    {
+      auto evicting = settings(identity_a);
+      evicting.evict_unused = true;
+      evicting.max_file_bytes = file.size();
+      ProgramDiskCache cache(evicting);
+      Require(name, "evict", cache.FindSource(first.key).has_value() &&
+                                 cache.FindPermutation(first.key.digest, 0, first.specialization).has_value(),
+              "the used records were not found");
+      cache.AddPermutation(first.key.digest, 0, other_specialization, first.info, first.spirv, {});
+      const auto stats = cache.GetStats();
+      Require(name, "evict", stats.evicted != 0 && stats.added_permutations == 1,
+              "nothing was evicted for the new record (evicted " + std::to_string(stats.evicted) + ")");
+      Require(name, "evict",
+              cache.FindPermutation(first.key.digest, 0, other_specialization).has_value(),
+              "the new record was not returned this run");
+      Require(name, "evict", cache.Flush(), "the save failed");
+    }
+    Require(name, "evict", ReadFileBytes(path).size() <= file.size(), "the saved file exceeds the cap");
+    ProgramDiskCache cache(settings(identity_a));
+    Require(name, "evict",
+            cache.FindSource(first.key).has_value() &&
+                cache.FindPermutation(first.key.digest, 0, first.specialization).has_value() &&
+                cache.FindPermutation(first.key.digest, 0, other_specialization).has_value(),
+            "a used or new record was not saved");
+    Require(name, "evict", !cache.FindSource(second.key).has_value(),
+            "the oldest unused record was not the one evicted");
+  }
+  // KYTY_PROGRAM_CACHE_COMPRESS: packed permutations come back byte-equal (in this run and the
+  // next), a plain file stays readable and mixes with packed records, and a packed record whose
+  // frame is damaged behind a valid checksum is dropped on its first hit.
+  {
+    // Repetitive SPIR-V (packs well, like real modules).
+    std::vector<u32> big_spirv;
+    for (u32 i = 0; i < 4096; i++) big_spirv.push_back(first.spirv[i % first.spirv.size()]);
+    std::vector<uint8_t> big_plan;
+    for (u32 i = 0; i < 8192; i++) big_plan.push_back(static_cast<uint8_t>((i % 61u) * 3u));
+    ProgramDiskCache::SourceKey big_key;
+    const std::vector<u32> big_code{9, 8, 7, 6};
+    ProgramDiskCache::BuildSourceKey({.stage = 2, .hash = 11, .code = big_code}, big_key);
+    WriteFileBytes(path, file);
+    {
+      auto packing = settings(identity_a);
+      packing.compress_level = 3;
+      ProgramDiskCache cache(packing);
+      check_complete(cache); // plain records of the old file
+      cache.AddSource(big_key, false, big_plan); // a packed plan (added first: the permutation
+                                                 // stays the file's last record)
+      cache.AddPermutation(first.key.digest, 12, first.specialization, first.info, big_spirv,
+                           first.spirv);
+      const auto source = cache.FindSource(big_key);
+      Require(name, "pack", source.has_value() && SameBytes(source->plan, big_plan),
+              "the packed plan did not come back in its run");
+      const auto stats = cache.GetStats();
+      Require(name, "pack", stats.packed_added == 1 && stats.packed_bytes < stats.packed_raw_bytes,
+              "the new permutation was not stored packed");
+      const auto again = cache.FindPermutation(first.key.digest, 12, first.specialization);
+      Require(name, "pack",
+              again.has_value() && SameBytes(again->info, first.info) &&
+                  SameBytes(again->spirv, WordBytes(big_spirv)) &&
+                  SameBytes(again->spirv_plain, WordBytes(first.spirv)),
+              "the packed permutation did not come back in its run");
+      Require(name, "pack", cache.Flush(), "the save failed");
+    }
+    const auto packed_file = ReadFileBytes(path);
+    Require(name, "pack", packed_file.size() < file.size() + big_spirv.size() * sizeof(u32) / 2,
+            "the saved file is not smaller than its plain form");
+    {
+      ProgramDiskCache cache(settings(identity_a)); // plain run reads packed records
+      check_complete(cache);
+      const auto packed = cache.FindPermutation(first.key.digest, 12, first.specialization);
+      Require(name, "unpack",
+              packed.has_value() && SameBytes(packed->info, first.info) &&
+                  SameBytes(packed->spirv, WordBytes(big_spirv)) &&
+                  SameBytes(packed->spirv_plain, WordBytes(first.spirv)),
+              "the packed permutation did not come back in the next run");
+      // Each hit expands into its own buffer (nothing stays expanded in the cache).
+      const auto repeat = cache.FindPermutation(first.key.digest, 12, first.specialization);
+      Require(name, "unpack",
+              repeat.has_value() && repeat->body != nullptr && repeat->body != packed->body &&
+                  SameBytes(repeat->spirv, WordBytes(big_spirv)),
+              "a repeated hit did not expand its own body");
+      // A packed plan is expanded once and kept.
+      const auto source_a = cache.FindSource(big_key);
+      const auto source_b = cache.FindSource(big_key);
+      const auto stats    = cache.GetStats();
+      Require(name, "unpack",
+              source_a.has_value() && source_b.has_value() && SameBytes(source_a->plan, big_plan) &&
+                  source_a->plan.data() == source_b->plan.data() && stats.expanded == 3 &&
+                  stats.loaded_permutations == 4 && stats.loaded_sources == 4,
+              "the packed plan did not come back once-expanded in the next run");
+    }
+    // Damage inside the zstd frame of the packed record (the last one), with its checksum fixed:
+    // loading keeps it (the frame header is intact), the first hit drops it, the others stay.
+    {
+      auto damaged = packed_file;
+      // After the old file's records: the packed source, then the packed permutation.
+      size_t offset = ends.back();
+      uint64_t size = 0;
+      std::memcpy(&size, damaged.data() + offset + 8, sizeof(size));
+      offset += ProgramDiskCache::RecordHeaderBytes + size;
+      std::memcpy(&size, damaged.data() + offset + 8, sizeof(size));
+      Require(name, "damaged frame", offset + ProgramDiskCache::RecordHeaderBytes + size == damaged.size(),
+              "unexpected packed layout");
+      const auto payload = offset + ProgramDiskCache::RecordHeaderBytes;
+      damaged[damaged.size() - 9] ^= 0x5au; // inside the frame's data (before the end)
+      const auto checksum = XXH3_64bits(damaged.data() + payload, size);
+      std::memcpy(damaged.data() + offset + 16, &checksum, sizeof(checksum));
+      WriteFileBytes(path, damaged);
+      ProgramDiskCache cache(settings(identity_a));
+      const auto broken = cache.FindPermutation(first.key.digest, 12, first.specialization);
+      const auto stats  = cache.GetStats();
+      Require(name, "damaged frame",
+              !broken.has_value() && stats.invalidated == 1 &&
+                  !cache.FindPermutation(first.key.digest, 12, first.specialization).has_value(),
+              "a packed record with a damaged frame was returned");
+      check_complete(cache);
+    }
+  }
   RemoveTestFile(path);
   std::printf("[cpu]     %-32s ok (%zu truncations)\n", name, cuts.size());
+}
+
+// KYTY_SELECTOR_*: the selector read's bitmap flag, excluded key and mask ranks survive the codec,
+// and the switches change the codegen fingerprint.
+void CheckSelectorReadCodec() {
+  constexpr const char *name = "ProgramCacheSelectorRead";
+  using ShaderRecompiler::IR::DescriptorSource;
+  for (uint32_t variant = 0; variant < 3u; ++variant) {
+    ShaderRecompiler::IR::ResourcePlan plan;
+    auto &source = plan.descriptor_sources.emplace_back();
+    source.dword_count = 8u;
+    auto &indirect = source.indirect_descriptor.emplace();
+    auto &selector = indirect.selector.emplace(
+        DescriptorSource::IndirectDescriptor::SelectorRead{.source = 0u, .stride = 32u, .offset = 4u});
+    selector.bitset = variant == 1u;
+    if (variant != 0u) selector.excluded = 5u + variant;
+    if (variant == 2u)
+      selector.ranks = DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks{
+          .source = 0u, .stride = 16u, .offset = 8u};
+    std::vector<uint8_t> bytes;
+    ShaderRecompiler::IR::ResourcePlan decoded;
+    Require(name, "round trip",
+            ShaderRecompiler::IR::EncodeResourcePlan(plan, bytes) &&
+                ShaderRecompiler::IR::DecodeResourcePlan(bytes, decoded) &&
+                decoded.descriptor_sources.size() == 1u &&
+                decoded.descriptor_sources[0].indirect_descriptor.has_value() &&
+                decoded.descriptor_sources[0].indirect_descriptor->selector == selector,
+            "a selector read changed through the program codec");
+  }
+  const auto base = ShaderRecompiler::CodegenFingerprint();
+  auto options = GetCodegenOptions();
+  options.selector_keys = ShaderRecompiler::SelectorKeysBitscan;
+  ScopedCodegenOptions scope(options);
+  Require(name, "fingerprint", ShaderRecompiler::CodegenFingerprint() != base,
+          "the fingerprint does not depend on CodegenOptions::selector_keys");
 }
 
 void RunCpu() {
   CheckSourceKeys();
   CheckFingerprint();
   CheckCacheFile();
+  CheckSelectorReadCodec();
 }
 
 // ---------------------------------------------------------------------------------------------

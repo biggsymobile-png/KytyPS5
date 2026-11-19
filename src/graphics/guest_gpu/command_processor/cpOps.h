@@ -89,6 +89,8 @@ enum class OpKind : uint16_t {
 	WaitRegMem,
 	WaitFlipDone,
 	DumpConstRam,
+	// Experimental Pro mode: a linear PSSR request (R_PSSR, upstream 651ef73a0).
+	Pssr,
 	// Lockstep ops: their result decides the front's parse (Result::value, Result::suspended).
 	Predication,
 	CondExec,
@@ -318,6 +320,12 @@ struct LodStatsOp {
 	uint32_t body[4] {};
 };
 
+// R_PSSR: the packet's Pssr::Request (output and input T#s, size and, since upstream e1292528f,
+// the temporal upscaler inputs), 52 dwords; ProcessPssr checks the size against Pssr::Request.
+struct PssrOp {
+	uint32_t request[52] {};
+};
+
 enum class FlipVariant : uint32_t { Plain = 0, Label = 1, LabelInterrupt = 2 };
 
 // The flip markers: the front's flip info (SetFlip) and the label.
@@ -347,6 +355,7 @@ struct WaitRegMemOp {
 struct WaitFlipDoneOp {
 	uint32_t video_out_handle     = 0;
 	uint32_t display_buffer_index = 0;
+	uint64_t flip_watermark       = UINT64_MAX; // KYTY_FLIP_WATERMARK: the submission's
 };
 
 // DUMP_CONST_RAM: dw_num dwords of the front's constant RAM follow as inline data.
@@ -429,7 +438,7 @@ static_assert(IsPayload<DrawIndexOp> && IsPayload<DrawAutoOp> && IsPayload<DrawI
               IsPayload<DispatchDirectOp> && IsPayload<DispatchIndirectOp> &&
               IsPayload<EndOfPipeOp> && IsPayload<ReleaseMemOp> && IsPayload<EventWriteOp> &&
               IsPayload<WriteDataOp> && IsPayload<ReferenceClockOp> && IsPayload<DmaDataOp> &&
-              IsPayload<LodStatsOp> && IsPayload<FlipOp> && IsPayload<WaitRegMemOp> &&
+              IsPayload<LodStatsOp> && IsPayload<PssrOp> && IsPayload<FlipOp> && IsPayload<WaitRegMemOp> &&
               IsPayload<WaitFlipDoneOp> && IsPayload<DumpConstRamOp> &&
               IsPayload<PredicationOp> && IsPayload<CondExecOp> && IsPayload<BranchOp> &&
               IsPayload<ReadCheckOp> && IsPayload<StreamBeginOp> && IsPayload<StreamEndOp> &&
@@ -454,6 +463,7 @@ KYTY_CPSEQ_PAYLOAD(WriteData, WriteDataOp)
 KYTY_CPSEQ_PAYLOAD(ReferenceClock, ReferenceClockOp)
 KYTY_CPSEQ_PAYLOAD(DmaData, DmaDataOp)
 KYTY_CPSEQ_PAYLOAD(LodStats, LodStatsOp)
+KYTY_CPSEQ_PAYLOAD(Pssr, PssrOp)
 KYTY_CPSEQ_PAYLOAD(Flip, FlipOp)
 KYTY_CPSEQ_PAYLOAD(WaitRegMem, WaitRegMemOp)
 KYTY_CPSEQ_PAYLOAD(WaitFlipDone, WaitFlipDoneOp)

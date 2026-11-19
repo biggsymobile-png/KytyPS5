@@ -85,23 +85,17 @@ class TypedValue: public Value {
 public:
 	TypedValue() = default;
 
-	template <Type other_type>
-	requires(TypesOverlap(type_, other_type))
-	TypedValue(const TypedValue<other_type>& value): Value(value) {}
-
 	explicit TypedValue(Value value): Value(value) {
 		EXIT_IF(!AreTypesCompatible(value.GetType(), type_));
 	}
 };
 
-using U1     = TypedValue<Type::U1>;
-using U8     = TypedValue<Type::U8>;
-using U16    = TypedValue<Type::U16>;
-using U32    = TypedValue<Type::U32>;
-using U64    = TypedValue<Type::U64>;
-using F16    = TypedValue<Type::F16>;
-using F32    = TypedValue<Type::F32>;
-using U32F32 = TypedValue<Type::U32 | Type::F32>;
+using U1  = TypedValue<Type::U1>;
+using U16 = TypedValue<Type::U16>;
+using U32 = TypedValue<Type::U32>;
+using U64 = TypedValue<Type::U64>;
+using F16 = TypedValue<Type::F16>;
+using F32 = TypedValue<Type::F32>;
 
 struct Use {
 	Inst*  user    = nullptr;
@@ -196,5 +190,55 @@ private:
 	std::vector<Use>    uses;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
+
+// The accessors the IR passes and the resource walker call for every operand, inline (Senaxx
+// c73447398 via usa-ratt/KytyPS5-GT7): out of line they were a fifth of the GPU thread's resource
+// walk in builds without link-time optimization. Same checks.
+inline bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+inline Inst* Value::ResolveInstruction() const {
+	EXIT_IF(type != Type::Opaque);
+	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
+}
+
+inline Value Value::Resolve() const {
+	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
+}
+
+inline uint32_t Value::U32() const {
+	EXIT_IF(type != Type::U32);
+	return imm_u32;
+}
+
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
+inline size_t Inst::NumArgs() const {
+	return args.size();
+}
+
+inline Value Inst::Arg(size_t index) const {
+	EXIT_IF(index >= args.size());
+	return args[index];
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

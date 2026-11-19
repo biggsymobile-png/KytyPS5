@@ -6,6 +6,8 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/fpEnv.h"
+#include "common/gthreadStats.h"
 #include "common/guestProbe.h"
 #include "common/hangTrace.h"
 #include "common/hostException.h"
@@ -21,6 +23,9 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "loader/demonsSoulsLoaderGuard.h"
+#include "loader/demonsSoulsPageFree.h"
+#include "loader/demonsSoulsTextureMips.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -31,6 +36,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -42,13 +49,11 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #else
 #if defined(__APPLE__)
@@ -750,6 +755,10 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 		case CoreAccess::Execute: access = GpuAccess::Execute; break;
 		default: return false;
 	}
+	// KYTY_TRANSIENT_UNMAP_RETRY: a guest range briefly unmapped while the emulator replaced its
+	// mapping: wait until it is mapped again, then retry the access unless the GPU tracking
+	// resolves the fault (0 at once while the switch is off).
+	const auto transient = Libs::LibKernel::Memory::WaitForTransientUnmap(info->access_violation_vaddr);
 	if (HangTrace::Enabled()) {
 		char fault_thread[32] = "(host thread)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
@@ -769,7 +778,7 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 		HangTrace::SetReadbackKind(access == GpuAccess::Write ? HangTrace::ReadbackKind::FaultWrite
 		                                                      : HangTrace::ReadbackKind::FaultRead);
 	}
-	if (Libs::Graphics::FaultCost::MapEnabled()) {
+	if (Libs::Graphics::FaultCost::MapEnabled() || Libs::Graphics::FaultCost::AttribEnabled()) {
 		Libs::Graphics::FaultCost::SetFaultInstruction(info->exception_address);
 	}
 	// The faulting instruction runs again when this handler returns (KYTY_READBACK_SIDE_WRITES),
@@ -794,7 +803,71 @@ static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo
 	}
 #endif
 	const GuestLoad::FaultScope guest_load(guest_code ? info->native_context : nullptr);
-	const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+	// Store in place (KYTY_STORE_IN_PLACE / KYTY_STORE_CLEAN, adapted from usa-ratt/KytyPS5-GT7
+	// 21246d78a and 41848bb9a): a game thread's plain store to a page protected because the GPU
+	// wrote it (or a CPU-clean page watched for CPU writes) is done on both copies by the GPU
+	// thread, which leaves the page protected, instead of downloading the page first and waiting
+	// for the GPU (or releasing the page for the next sync to upload and protect again). Guest
+	// code only; anything the GPU thread declines takes the normal path below.
+	if (access == GpuAccess::Write &&
+	    Libs::LibKernel::Memory::IsStoreInPlaceCandidate(info->access_violation_vaddr)) {
+		bool store_guest_code = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		HMODULE module   = nullptr;
+		store_guest_code = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		                                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                                      reinterpret_cast<LPCWSTR>(info->exception_address),
+		                                      &module) == 0;
+#endif
+		if (store_guest_code &&
+		    Loader::X64InstructionEmulator::TryEmulateStore(
+		        info->native_context, info->access_violation_vaddr,
+		        [](uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+		           uint64_t size) {
+			        return Libs::LibKernel::Memory::TryStoreInPlace(pc, fault_vaddr, vaddr, data,
+			                                                        size);
+		        })) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+			if (HangTrace::Enabled()) {
+				HangTrace::ClearFaultContext();
+			}
+			return true;
+		}
+	}
+	bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+	if (!handled && transient != 0 &&
+	    Libs::LibKernel::Memory::RetryTransientUnmapFault(info->access_violation_vaddr, transient)) {
+		handled = true;
+	}
+	// KYTY_FAULT_AMM_WAIT_MS=N (default 5000; 0 off; after IDXTRI's Wolverine fix): an access to
+	// memory that a queued AMM map command will map waits for that map, up to N ms, and then runs
+	// again. On the hardware the map runs within microseconds; here its queue can sit behind a wait
+	// on the emulated GPU, and the access faulted fatally on the unmapped page.
+	if (!handled && access != GpuAccess::Execute &&
+	    Libs::LibKernel::Memory::PendingAmmMapCovers(info->access_violation_vaddr)) {
+		static const int64_t wait_ms = [] {
+			const char* value = std::getenv("KYTY_FAULT_AMM_WAIT_MS");
+			return value != nullptr && value[0] != '\0' ? std::strtoll(value, nullptr, 10) : int64_t {5000};
+		}();
+		const auto start    = std::chrono::steady_clock::now();
+		const auto deadline = start + std::chrono::milliseconds(std::max<int64_t>(wait_ms, 0));
+		while (std::chrono::steady_clock::now() < deadline &&
+		       Libs::LibKernel::Memory::PendingAmmMapCovers(info->access_violation_vaddr)) {
+			std::this_thread::sleep_for(std::chrono::microseconds(200));
+		}
+		// The map ran (or the wait ended): the access runs again and faults anew if it must.
+		handled = !Libs::LibKernel::Memory::PendingAmmMapCovers(info->access_violation_vaddr);
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::printf("Host fault at 0x%016" PRIx64 ": waited %lld us for a queued AMM map: %s\n",
+			            info->access_violation_vaddr,
+			            static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                       std::chrono::steady_clock::now() - start)
+			                                       .count()),
+			            handled ? "retrying" : "still pending");
+			std::fflush(stdout);
+		}
+	}
 	if (handled) {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 	}
@@ -871,6 +944,34 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// KYTY_GUEST_ASSERT_CONTINUE=1 (default 0; on in the PPSA26344 title preset): a guest INT 0x41
+	// (CD 41, the debug break a game's assert handler executes after printing the message; on
+	// Windows a general-protection fault with address ~0) is stepped over and the guest continues
+	// as without a debugger. Ghost of Yotei 02.002 asserts in its audio curve code
+	// ("!(isnan(inputValue) || isinf(inputValue))") on the Digital Deluxe bonus screen.
+	static const bool assert_continue = [] {
+		const auto* value = std::getenv("KYTY_GUEST_ASSERT_CONTINUE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (assert_continue && info->native_context != nullptr &&
+	    info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    DescribeCodeAddress(info->exception_address).starts_with("no module") &&
+	    IsReadableRange(info->exception_address, 2)) {
+		const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+		if (code[0] == 0xcdu && code[1] == 0x41u) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Guest assert trap (INT 0x41) at 0x{:016x} stepped over "
+				    "(KYTY_GUEST_ASSERT_CONTINUE)\n",
+				    info->exception_address));
+			}
+			static_cast<CONTEXT*>(info->native_context)->Rip += 2;
+			return true;
+		}
+	}
+#endif
 	if (TryHandleGuestAccessFault(exception_info)) {
 		return true;
 	}
@@ -905,6 +1006,21 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			if (doing[0] != '\0') {
 				append("thread was in: {}\n", doing);
 			}
+		}
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			// What the faulting address was: an unmapped page, a protected view, a range the GPU
+			// tracker no longer maps, or memory a queued AMM map still has to back.
+			append("fault address: 0x{:016x}\n", info->access_violation_vaddr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			MEMORY_BASIC_INFORMATION mbi {};
+			if (VirtualQuery(reinterpret_cast<const void*>(info->access_violation_vaddr), &mbi, sizeof(mbi)) != 0) {
+				append("host page: base=0x{:x} alloc=0x{:x} size=0x{:x} state=0x{:x} protect=0x{:x} type=0x{:x}\n",
+				       reinterpret_cast<uint64_t>(mbi.BaseAddress), reinterpret_cast<uint64_t>(mbi.AllocationBase),
+				       static_cast<uint64_t>(mbi.RegionSize), static_cast<uint32_t>(mbi.State),
+				       static_cast<uint32_t>(mbi.Protect), static_cast<uint32_t>(mbi.Type));
+			}
+#endif
+			append("{}", Libs::LibKernel::Memory::DescribeAddressForCrash(info->access_violation_vaddr));
 		}
 		append("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
 		       "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
@@ -1562,6 +1678,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
+	GThreadStats::MarkGuestThread();
+	GThreadStats::Start();
 	auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1569,8 +1687,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	// initializers execute on the host stack too, so grow it before calling any guest code.
 	size_t expanded_size = 0;
 	while (expanded_size < static_cast<size_t>(768) * 1024) {
-		sys_dbg_stack_info_t stack {};
-		SysStackUsage(stack);
+		const auto stack = SysStackUsage();
 		*reinterpret_cast<uint32_t*>(stack.guard_addr) = 0;
 		expanded_size += stack.guard_size;
 	}
@@ -1593,9 +1710,15 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	if (!m_programs.empty()) {
 		GamePatch::ApplyBuiltin(m_programs.front());
 	}
+	// Demon's Souls only (each finds its code by signature; other titles and builds untouched).
+	DemonsSoulsLoaderGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsPageFree::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsTextureMips::Install(m_programs.empty() ? nullptr : m_programs.front());
 	if (!m_programs.empty() && !m_programs.front()->elf->IsShared()) {
 		Common::GuestProbe::Arm(m_programs.front()->base_vaddr, m_programs.front()->base_size);
 	}
+	// Upstream f399d4818: the main guest thread runs with the console's FP environment.
+	Common::WriteFpEnv(Common::GuestFpEnv);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
@@ -1625,6 +1748,7 @@ void RuntimeLinker::Clear() {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
 	Common::LockGuard lock(m_mutex);
+	DemonsSoulsPageFree::Clear();
 	GamePatch::Clear();
 
 	for (auto* p: m_programs) {
@@ -1954,6 +2078,8 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 	}
 }
 
+constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
+
 static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 	uint64_t base_size = 0;
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
@@ -1965,6 +2091,20 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 		}
 	}
 	return base_size;
+}
+
+// A module's E, R and RW LOAD segments use flexible memory in 16 KiB pages; GNU_RELRO adds none
+// since it lies inside an RW LOAD.
+uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
+	uint64_t size = 0;
+	for (Elf64_Half i = 0; i < phnum; i++) {
+		const auto flags = phdr[i].p_flags;
+		if (phdr[i].p_type == PT_LOAD &&
+		    (flags == PF_X || flags == PF_R || flags == (PF_R | PF_W))) {
+			size += AlignUp(phdr[i].p_memsz, GUEST_PAGE_SIZE);
+		}
+	}
+	return size;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1986,8 +2126,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	EXIT_IF(phdr == nullptr || ehdr == nullptr);
 
-	program->base_size                 = CalcBaseSize(ehdr, phdr);
-	constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
+	program->base_size = CalcBaseSize(ehdr, phdr);
 	EXIT_IF(program->base_size > UINT64_MAX - (GUEST_PAGE_SIZE - 1));
 	program->base_size_aligned = AlignUp(program->base_size, GUEST_PAGE_SIZE);
 
@@ -2000,7 +2139,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	const uint64_t tsc_multiplier =
+	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
+	const bool patch_guest_instructions =
+	    protect_memory_faults || emulate_amd || tsc_multiplier != 0;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -2012,6 +2154,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
+	// Charged only with KYTY_UPSTREAM_MEMORY_DEFAULTS=1 (0 otherwise).
+	program->flexible_size =
+	    Libs::LibKernel::Memory::ChargeFlexibleMemory(CalcFlexibleMemorySize(phdr, ehdr->e_phnum));
+
 
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
@@ -2121,23 +2267,24 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
 		if (!have_function_starts) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD instruction patch for Intel CPUs" : "Guest red-zone protection",
-			                module_name));
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
+			    module_name));
 		}
 		if (emulate_amd) {
 			X64InstructionEmulator::ConfigureReciprocalSqrtStats();
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
+			const auto result = PatchGuestInstructions(
+			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
+			    GetGuestInstructionHostFeatures(), tsc_multiplier);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
 			totals.rdpid += result.rdpid;
 			totals.clwb += result.clwb;
+			totals.rdtsc += result.rdtsc;
 			if (protect_memory_faults) {
 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
@@ -2150,6 +2297,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
+		}
+		if (totals.rdtsc.found != 0) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Guest TSC: {} (RDTSC/RDTSCP: native={}, skipped={})\n", module_name,
+			                totals.rdtsc.native, totals.rdtsc.Skipped()));
 		}
 		if (emulate_amd && have_function_starts) {
 			InstructionPatchCounts combined {};
@@ -2222,6 +2374,7 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		}
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
+		Libs::LibKernel::Memory::ReleaseFlexibleMemory(program->flexible_size);
 	}
 }
 
@@ -2340,6 +2493,12 @@ void RuntimeLinker::Relocate(Program* program) {
 	if (g_invalid_memory == 0) {
 		g_invalid_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 		    INVALID_MEMORY, 4096, Common::VirtualMemory::Mode::NoAccess, "invalid_memory", true);
+		// An internal fault sentinel, not a guest ABI address: the ray tracing driver runtime
+		// (KYTY_RT_HW, initialized before the guest reservation) can own the preferred address.
+		if (g_invalid_memory == 0) {
+			g_invalid_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+			    INVALID_MEMORY, 4096, Common::VirtualMemory::Mode::NoAccess, "invalid_memory");
+		}
 		EXIT_NOT_IMPLEMENTED(g_invalid_memory == 0);
 	}
 

@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/command_processor/cpOps.h"
+#include "common/staticOnce.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -45,7 +46,8 @@ int VerifyMode() {
 }
 
 bool PacketHashing() {
-	static const bool enabled = ConfiguredMode() != Mode::Off && VerifyMode() != 0;
+	static constinit Common::StaticOnce<bool> enabled_once;
+	const bool& enabled = enabled_once.Get([&] { return ConfiguredMode() != Mode::Off && VerifyMode() != 0; });
 	return enabled;
 }
 
@@ -96,6 +98,7 @@ const char* OpKindName(OpKind kind) noexcept {
 		case OpKind::ReferenceClock: return "ReferenceClock";
 		case OpKind::DmaData: return "DmaData";
 		case OpKind::LodStats: return "LodStats";
+		case OpKind::Pssr: return "Pssr";
 		case OpKind::Flip: return "Flip";
 		case OpKind::WaitRegMem: return "WaitRegMem";
 		case OpKind::WaitFlipDone: return "WaitFlipDone";
@@ -129,6 +132,7 @@ uint32_t PayloadSize(OpKind kind) noexcept {
 		case OpKind::ReferenceClock: return sizeof(ReferenceClockOp);
 		case OpKind::DmaData: return sizeof(DmaDataOp);
 		case OpKind::LodStats: return sizeof(LodStatsOp);
+		case OpKind::Pssr: return sizeof(PssrOp);
 		case OpKind::Flip: return sizeof(FlipOp);
 		case OpKind::WaitRegMem: return sizeof(WaitRegMemOp);
 		case OpKind::WaitFlipDone: return sizeof(WaitFlipDoneOp);

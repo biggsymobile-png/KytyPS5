@@ -20,12 +20,15 @@
 
 #include <array>
 #include <atomic>
+#include <string>
 #include <deque>
+#include <functional>
 #include <bitset>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -35,7 +38,28 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class Buffer;
+class NanScrubber;
 class BufferCache;
+
+// KYTY_META_CLEAR_COVER / KYTY_META_TRACE (textureCache.cpp).
+[[nodiscard]] bool     MetaClearCoverEnabled();
+[[nodiscard]] bool     StencilPlaneFillClearEnabled();
+[[nodiscard]] uint64_t MetaTraceAddress();
+void                   SetMetaTraceAddressAuto(uint64_t address);
+void                   SetMetaTraceAddressStencil(uint64_t address);
+[[nodiscard]] bool     MetaTraceLine();
+// Null images (adapted from Erlou93/KytyPS5-Yotei NullTextureDesc / GetNullImage / NullCompareBinding;
+// textureCache.cpp). KYTY_NULL_TEXTURE_ZERO=1: a sampled null float texture is an RGBA32F image and
+// every null colour image is cleared to (0, 0, 0, 0), what the hardware returns for a null T#.
+// KYTY_NULL_COMPARE_DEPTH=1: a null image on a depth-compare binding is a 1x1 D16 cleared to the
+// depth that fails the S#'s comparison (SetNullCompareFuncs: DEPTH_COMPARE_FUNC bits of the binding).
+[[nodiscard]] bool     NullTextureZeroEnabled();
+// KYTY_STENCIL_RESTORE_GUARD=1 (Erlou93/KytyPS5-Yotei): after a stencil plane swap restored the
+// plane, its record is uploaded only for a GPU buffer write, not a CPU-dirty mark (FindDepthTarget).
+[[nodiscard]] bool     StencilRestoreGuardEnabled();
+[[nodiscard]] bool     ImageContainsEnabled();
+[[nodiscard]] bool     NullCompareDepthEnabled();
+void                   SetNullCompareFuncs(uint32_t funcs);
 class CommandBuffer;
 class CommandScheduler;
 class DccClearHelper;
@@ -46,6 +70,14 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	// Bindless table hooks (Senaxx; RenderContext sets them). DeleteImage, on the GPU thread, calls
+	// on_bindless_unregister for a bindless-pinned image and then on_image_views_dropped with the
+	// image's views, before it unregisters it; its destruction waits for the current tick.
+	// replaced: another image already holds the dropped image's contents (ExpandImage), so the
+	// keys that sampled it can be resolved again at once.
+	std::function<void(ImageId, bool replaced)>           on_bindless_unregister;
+	std::function<bool(std::span<const CachedImageView>)> on_image_views_dropped;
+
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	// A render-target binding with CMASK fast clears enabled (CB_COLORn_INFO.FAST_CLEAR):
@@ -122,6 +154,29 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	// `record` (optional): filled as described at RepeatLookup.
+	// Diagnostic (KYTY_DUMP_CS_IMAGES, renderCompute.cpp): records a copy of mip 0 / layer 0 of the
+	// colour image whose guest base is `address` into a download buffer and, once the tick
+	// completed, writes its texels to <prefix>_<address>_<w>x<h>_vk<format>_b<bytes>.raw. Returns
+	// false when no such image is cached (or it is a depth/MSAA/compressed image). GPU thread, at
+	// an emission safe point.
+	// width/height 0: any extent; otherwise an image of that extent is preferred.
+	bool DebugDumpImage(uint64_t address, uint32_t width, uint32_t height, const std::string& prefix);
+	// KYTY_NAN_SCAN (renderCompute.cpp, diagnostics): downloads a band of rows of the cached image at
+	// `address` (layer 0, mip 0) after the current recording and counts NaN/Inf texels of float
+	// formats when the submission completed; the line names `label` (op order, shader, image).
+	// False when the image is not cached or its format cannot hold NaN.
+	bool DebugNanScan(uint64_t address, uint32_t width, uint32_t height, const std::string& label);
+	// One image of DebugDumpImage (m_lock held).
+	bool DebugDumpOne(ImageId id, uint64_t address, const std::string& prefix);
+	// KYTY_PASS_DUMP (renderCompute.cpp, diagnostic): samples every `step`-th row and column of the
+	// cached image at `address` (layer 0, mip 0; `aspect` 0 colour, 1 depth, 2 stencil of a depth
+	// image; an image of want_width x want_height preferred) after the current recording. When the
+	// submission completed, `emit` gets one text record: extent, format, per-channel mean/min/max,
+	// NaN/Inf and all-zero counts, a hash of the sampled bytes and a 16x9 grid of region means; with
+	// `thumb_path` the sampled texels are also written there as float RGBA. False when no such
+	// image is cached or the format is block-compressed / multisampled.
+	bool DebugPassSample(uint64_t address, uint32_t want_width, uint32_t want_height, int aspect, uint32_t step,
+	                     const std::string& thumb_path, std::function<void(std::string)> emit);
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
 	                                      RepeatLookup* record = nullptr);
 	// The lookup `record` describes, repeated for the same `desc` and `exact_format` (the caller
@@ -134,6 +189,53 @@ public:
 	// Diagnostics (KYTY_DRAW_SEQUENCE_VERIFY): residency extensions and alias synchronizations
 	// FindImage has performed; a repeat must add none.
 	[[nodiscard]] uint64_t      LookupSideEffects() const noexcept { return m_lookup_side_effects; }
+	// KYTY_IMG_STATS / KYTY_IMG_OVERLAP: how the last FindImage reached its answer when the first-page
+	// lookup found nothing. `pure`: every ResolveOverlap branch it took returned without an effect
+	// or a time-dependent decision, and nothing was inserted, so the same lookup over the same
+	// owner lists of the region's pages returns `result` again with nothing else done.
+	struct OverlapLookup {
+		bool     overlap        = false;
+		bool     pure           = false;
+		bool     inserted       = false;
+		bool     first_page     = false; // the first-page lookup answered (no overlap loop)
+		// Candidates whose branch depended on time (safe_to_delete) and was decided "keep, do
+		// nothing" (safe_to_delete false): the same branch is taken again exactly while
+		// OverlapSafeToDelete stays false for each (checked live by the memo). More than
+		// MaxTimed such candidates make the lookup impure.
+		static constexpr uint32_t MaxTimed = 4;
+		uint32_t                  timed_count = 0;
+		std::array<ImageId, MaxTimed> timed {};
+		// The first reason the loop was impure (KYTY_IMG_OVERLAP counters).
+		enum Why : uint8_t { WhyNone, WhyTimedTaken, WhyTimedMany, WhyDepth, WhyExpand, WhyMerge, WhyContains };
+		uint8_t impure_why = WhyNone;
+		// KYTY_IMG_DEPTHALIAS: ResolveDepthOverlap answered at least once without recreating (the
+		// cached image itself, or a kept alias found by its inner region scan). Such a lookup is pure
+		// apart from the alias branch's one effect, listed in `rebind`: the cached (depth) image gets
+		// needs_rebind (and the image-state epoch moves) when it is bound or a target at that moment
+		// (`rebind_applied`: what the lookup did). The inner scans' pages are [span_first, span_last).
+		bool                          depth_class = false;
+		static constexpr uint32_t     MaxRebinds  = 2;
+		uint32_t                      rebind_count = 0;
+		std::array<ImageId, MaxRebinds> rebind {};
+		std::array<bool, MaxRebinds>    rebind_applied {};
+		uint64_t                      span_first = UINT64_MAX;
+		uint64_t                      span_last  = 0;
+		ImageInfo requested;             // the description's info as FindImage got it
+		uint32_t candidates     = 0;
+		uint64_t region_address = 0;
+		uint64_t region_size    = 0;
+		ImageId  result;
+	};
+	[[nodiscard]] const OverlapLookup& LastOverlap() const noexcept { return m_last_overlap; }
+	// ResolveOverlap's safe_to_delete for a candidate image, as it would be decided now (GPU
+	// thread; caller holds m_lock).
+	[[nodiscard]] bool OverlapSafeToDelete(const Image& cached) const;
+	// Marks the current lookup's overlap loop impure, keeping the first reason.
+	void NoteOverlapImpure(uint8_t why);
+	// KYTY_BLOCK_SUBRESOURCE_WRITES (FindImage's ApplyBlockSubwrites runs for every lookup).
+	[[nodiscard]] static bool BlockSubwritesOn();
+	// KYTY_ALIAS_SYNC_SKIP (RestoreContentIfUnwritten restores a serial only with it).
+	[[nodiscard]] static bool AliasSyncSkipOn();
 	// Diagnostics (KYTY_CP_COMMIT=texdcc verify): DCC decisions of MaterializeDccClear that did
 	// something (a slice clear, or a native GPU inspection); a memo hit's full resolution adds none.
 	[[nodiscard]] uint64_t      DccDecisionEffects() const noexcept { return m_dcc_decision_effects; }
@@ -178,6 +280,18 @@ public:
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
+	// KYTY_SPARSE_HOLES=1 (default off; adapted from usa-ratt/KytyPS5-GT7 89be9768d): a depth image
+	// over memory only partly mapped (sparse, in 64 KB blocks), sampled with a depth comparison,
+	// has the texels of its unmapped blocks reset to `empty`, the depth that passes the comparison
+	// (1.0 for LESS/LEQUAL, 0.0 for GREATER/GEQUAL), once each time its contents change. The
+	// console drops the writes that land there and reports reads there as not resident, which the
+	// shaders sampling such shadow maps take as lit. Without it the host's texels there, drawn
+	// into, shadow the ground in noisy patches with straight edges (GT7).
+	void               ResetUnmappedDepth(ImageId id, float empty);
+	// KYTY_NAN_SCRUB=1 (textureCache.cpp), GPU thread, at a guest flip's preparation: one changed
+	// GPU-written B10G11R11 or half-float array of six layers or more has its texels that are not
+	// finite rewritten (a NaN to zero, an infinity to the largest finite value).
+	void               RunNanScrub();
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	// KYTY_IMAGE_EXACT_RANGE_INVALIDATE (default off; =1 on, =count dry run): when a GPU buffer
@@ -197,20 +311,65 @@ public:
 	[[nodiscard]] uint32_t CountImagesOutsideGpuWrite(uint64_t address, uint64_t size,
 	                                                  std::span<const GuestRange> written);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// KYTY_SRT_STALE_IMAGE_READS (kernel/memory.cpp): whether a GPU-modified image is still the
+	// source of some guest byte of the range: it owns bytes there and no CPU write superseded it
+	// (a definitely CPU-dirty image without kept ranges is refreshed whole from guest memory and is
+	// no source of guest bytes, as MaterializeOwnedBytes treats it). IsRegionGpuModified asks only
+	// whether a GPU-modified image overlaps the range.
+	[[nodiscard]] bool IsRegionGpuOwnedForRead(uint64_t address, uint64_t size);
+	// KYTY_SRT_STALE_IMAGE_READS: moves the bytes of the range that GPU-modified images own into the
+	// buffer cache (MaterializeOwnedBytes, KYTY_ALIAS_BYTES), so a GPU-thread read can download them
+	// like any GPU-written buffer bytes. GPU thread; records GPU work. Returns the bytes moved.
+	uint64_t MaterializeForRead(uint64_t address, uint64_t size);
+	// Diagnostics (KYTY_INDIRECT_ARGS_DIAG / KYTY_READINESS_DIAG): the GPU-modified images over the
+	// range, "image 0x<addr>+0x<size> <format> <w>x<h> ..." joined by "; " (empty when none).
+	[[nodiscard]] std::string DescribeGpuModifiedImages(uint64_t address, uint64_t size);
+	// KYTY_BDA_SETTLE_IMAGE_STARTS (BufferCache::SettleBdaWrittenRange): InvalidateMemoryFromGPU
+	// restricted to the images whose first byte lies in [address, address + size) (Erlou93/
+	// KytyPS5-Yotei's rule, which acts on images starting at the written address only). GPU thread.
+	void InvalidateMemoryFromGPUImageStarts(uint64_t address, uint64_t size);
+	// Whether a registered image has `info`'s backing (FindImageWithSameBacking under m_lock;
+	// descriptors.cpp HoldLayerRange / HoldFromBaseLevel).
+	[[nodiscard]] bool HoldsImage(const ImageInfo& info);
+	// Whether an image over the range was written by the GPU (KYTY_TEXTURE_REDUCE leaves those whole).
+	[[nodiscard]] bool HasGpuWrittenImageOverlap(uint64_t address, uint64_t size);
 	// Whether any cached image overlaps the range (RenderContext::UnmapMemory: CPU-only unmaps skip
 	// the GPU drain).
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	// KYTY_CMASK_MSAA: a colour target's CMASK starts at this address (MaterializeCmaskClear).
+	[[nodiscard]] bool IsColorMeta(uint64_t address);
 	// KYTY_META_CLEAR_MEMO=1 (default off; BryanKAdams/KytyPS5 c36bbff): the last answer is kept for
 	// its address while m_surface_meta_generation holds, without m_lock. Called by the GPU (CP)
 	// thread only (the depth-target resolution of draws).
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// KYTY_HTILE_SLICE_CLEAR=1 (adapted from Erlou93/KytyPS5-Yotei FIX_HTILE_SLICE_CLEAR, M122;
+	// PPSA26344 preset, default off; =0 is ClearMeta(address)): a clear of `size` bytes at a
+	// layered HTILE clears the layers it covers only. At the HTILE's base address the first
+	// size / slice-size layers (the other layers keep their state; ClearMeta takes every layer as
+	// cleared); inside it (a single layer's or a few layers' HTILE bytes) those layers, which
+	// ClearMeta did not see at all. True only for a clear at the base (the caller may consume it).
+	[[nodiscard]] bool ClearMetaRange(uint64_t address, uint64_t size);
+	// KYTY_HTILE_SIZE_RULE=1 (Erlou93/KytyPS5-Yotei ClearMetaWrite): a compute write at an HTILE base
+	// larger than that HTILE is an ordinary write, not a clear: the entry is erased and true returned.
+	[[nodiscard]] bool OversizedMetaWrite(uint64_t address, uint64_t size);
+	[[nodiscard]] static bool HtileSizeRuleEnabled();
+	[[nodiscard]] static bool HtileSliceClearEnabled();
+	// KYTY_META_CLEAR_COVER: marks cleared every surface metadata entry that starts inside
+	// (address, address + size) (the exact start is ClearMeta's); returns how many.
+	[[nodiscard]] uint32_t ClearMetaCovered(uint64_t address, uint64_t size);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// With storage readback (Config::ReadbackStorageImagesEnabled, upstream 9678c59b7), a GL2
+	// writeback makes GPU-written images visible to the CPU; returns whether a download was
+	// recorded.
+	[[nodiscard]] bool WriteBackImages();
+	// The tick of the latest storage-readback write-back pending over the range's pages, or 0.
+	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
 	// Called once per completed guest flip. Alias lifetimes are measured in presented frames:
 	// a frame spans hundreds of scheduler ticks, so tick age alone treats every alias used
 	// earlier in the same frame as stale.
@@ -218,7 +377,126 @@ public:
 	[[nodiscard]] uint64_t Frame() const noexcept { return m_frame.load(std::memory_order_relaxed); }
 	// The image of a slot id, or nullptr when the slot is free (GPU thread).
 	[[nodiscard]] Image* TryGetImage(ImageId id) noexcept { return m_slot_images.try_get(id); }
+	// KYTY_MS_DEPTH_SAMPLE0=1 (from usa-ratt/KytyPS5-GT7 rounds 122-124): a texture binding that
+	// reads a multisample depth image through a single-sample dimension (the shader then has a
+	// single-sample image: ResourceMaterialization's DescriptorDimension) reads a single-sample
+	// copy of its first sample, as the console's texture unit does. SingleSampleDepth: a D32
+	// image of the depth (each layer of an array), SingleSampleStencil (argument: the depth
+	// image): an R8_UINT image of the stencil. The copy has no guest memory (never registered),
+	// is refreshed when its source's content serial moved, and goes with its source image. Any
+	// other image (or the switch off): the argument. GPU thread.
+	[[nodiscard]] static bool MsDepthSample0Enabled();
+	[[nodiscard]] ImageId SingleSampleDepth(ImageId id);
+	[[nodiscard]] ImageId SingleSampleStencil(ImageId depth_id);
+	// KYTY_PRESERVE_STENCIL=1 (adapted from Erlou93/KytyPS5-Yotei WORKAROUND_PRESERVE_STENCIL,
+	// STENCIL_PLANE_SYNC and FIX_STENCIL_PLANE_WRITES, M119; PPSA26344 preset, default off). The
+	// PS5 keeps each stencil plane in its own memory; the host keeps one stencil aspect per depth
+	// image. When a depth target is bound with another stencil plane than the one its stencil
+	// aspect holds, the held plane is saved (a GPU buffer per depth address, plane and extent) and
+	// the new plane's saved copy, if any, is restored (SwapStencilPlane). A shader read of a plane
+	// the depth image does not hold now reads that plane's saved copy (StencilPlaneReader) instead
+	// of the other plane, and a refresh of such a plane from guest memory waits until the plane is
+	// swapped back in, so a guest write to it no longer lands on the plane the depth image holds
+	// (Erlou: the game's fill of one plane overwrote the water bits of another: no water lighting).
+	// Single-sample, one-layer depth images only. GPU thread.
+	[[nodiscard]] static bool PreserveStencilEnabled();
+	// The image a sampled read of the stencil plane `record_id` (a stencil association record)
+	// binds: its depth image, or (copy = true) a copy of the plane's saved contents.
+	[[nodiscard]] ImageId StencilPlaneReader(ImageId record_id, bool& copy);
+	// KYTY_STENCIL_READ_DEPTH=1 (default off): sampled stencil-plane reads bind the depth image (see
+	// the .cpp). StencilPlaneDepth: the single-sample depth image that swaps to the plane at this
+	// address (SwapStencilPlane saw it), or none.
+	[[nodiscard]] static bool StencilReadDepthEnabled();
+	// KYTY_STENCIL_READ_HELD (default on, see the .cpp): with KYTY_STENCIL_READ_DEPTH a plane record
+	// the depth image does not hold is still read from its saved copy.
+	[[nodiscard]] static bool StencilReadHeldEnabled();
+	// KYTY_STENCIL_PLANE_FILL_SAVED (default on): a fill of a plane the depth image does not hold
+	// fills the plane's saved copy (ClearImageFromBuffer).
+	[[nodiscard]] static bool StencilPlaneFillSavedEnabled();
+	// KYTY_STENCIL_PLANE_SYNC=2 (default; =0 off; based on Erlou93/KytyPS5-Yotei
+	// WORKAROUND_STENCIL_PLANE_SYNC level 2): at swap-in, a 1-byte colour image at the plane's address
+	// and the depth image's extent that a shader or clear wrote after the plane's saved copy is the
+	// plane's contents (loaded instead of the stale copy).
+	[[nodiscard]] static int StencilPlaneSyncLevel();
+	bool FillStencilPlaneSaved(CommandBuffer& command, ImageId depth_id, ImageId record_id, uint8_t value,
+	                           const char* what);
+	[[nodiscard]] ImageId     StencilPlaneDepth(uint64_t plane_address);
+	// KYTY_STENCIL_READ_PARTNER=1 (default off; Erlou93/KytyPS5-Yotei parity, see the .cpp): a sampled
+	// read redirected by KYTY_STENCIL_READ_DEPTH binds the plane the depth image swapped away from
+	// (StencilPlanePartnerRecord: its stencil association record, or none).
+	[[nodiscard]] static bool StencilReadPartnerEnabled();
+	[[nodiscard]] ImageId     StencilPlanePartnerRecord(uint64_t plane_address);
+	// KYTY_STENCIL_ALIAS_COPY=1 (adapted from Erlou93/KytyPS5-Yotei WORKAROUND_STENCIL_ALIAS_COPY,
+	// a logged approximation for dynamic resolution; PPSA26344 preset, default off): a 1-byte
+	// image at a stencil plane's address with another extent than its depth image (the plane read
+	// at another resolution) is a separate image nothing writes; before it is sampled the
+	// overlapping top-left region of the plane (the depth image's stencil aspect, or the plane's
+	// saved copy with KYTY_PRESERVE_STENCIL) is copied into it. True when it copied.
+	[[nodiscard]] static bool StencilAliasCopyEnabled();
+	// KYTY_STENCIL_STORAGE_SHADOW=1 (adapted from Erlou93/KytyPS5-Yotei
+	// WORKAROUND_STENCIL_STORAGE_SHADOW; PPSA26344 preset, default off): a storage view of a depth
+	// image's stencil aspect is invalid Vulkan (no storage usage). The binding gets an R8_UINT
+	// shadow holding the stencil aspect's contents instead; after the dispatch the shadow is copied
+	// back into the stencil aspect (FlushStencilStorageShadows). Single-sample one-layer depth
+	// images whose stencil holds the bound plane only; anything else returns the depth image.
+	[[nodiscard]] static bool StencilStorageShadowEnabled();
+	// KYTY_PRESERVE_STENCIL_RECREATE=1 (Erlou93/KytyPS5-Yotei WORKAROUND_PRESERVE_STENCIL's
+	// SaveStencil/RestoreStencil; default off): a depth/stencil image replaced by a colour image
+	// at its memory (a compute shader writes the depth as R32 storage) is freed, and the depth
+	// image made again when the game binds the depth target copies only the depth aspect back: the
+	// stencil aspect of the new image was undefined (RenderDoc: "UNDEFINED IMG" at the torii's
+	// Water Lighting, whose classifier then lit tiles in the sky). The replaced image's stencil is
+	// saved and written into the next depth image made at the same address and extent.
+	// Single-sample, one-layer depth images only (as KYTY_PRESERVE_STENCIL).
+	[[nodiscard]] static bool PreserveStencilRecreateEnabled();
+	[[nodiscard]] ImageId StencilStorageShadow(ImageId record_id, bool& shadow);
+	[[nodiscard]] bool HasStencilStorageShadows() const noexcept { return !m_pending_stencil_shadows.empty(); }
+	void FlushStencilStorageShadows();
+	bool CopyStencilPlaneToAlias(ImageId target_id);
+	// KYTY_SUB_EXTENT_COPY=1 (from usa-ratt/KytyPS5-GT7 429692dd3, Franseven's case): a texture
+	// narrower or shorter than the single-sample colour image at its address, with the same guest
+	// layout (same memory size and tiling: UI text drawn with a narrower viewport into a wider
+	// target, then sampled at the narrower width). A view cannot shrink the extent, so normalized
+	// coordinates would reach the image's columns past the texture's: the texture reads a copy of
+	// the image's corner of its extent, made again whenever the image changed (content serial).
+	// The image keeps all its pixels. Any other request (or the switch off): `id`. GPU thread.
+	[[nodiscard]] static bool SubExtentCopyEnabled();
+	[[nodiscard]] ImageId SubExtentCopy(ImageId id, const ImageInfo& requested);
+	// KYTY_LIGHT_GRID_CAP=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 ecef51e59): a pixel
+	// shader's light grid (R32G32_UINT linear array of two or more layers, read-only;
+	// descriptors.cpp) has its shape remembered here, and uploads of linear R32G32_UINT arrays of
+	// a shape seen are checked for cells whose packed count asks for more than 1024 lights, which
+	// game data never does: the shader then loops over up to 65535 lights a pixel, tens of
+	// milliseconds a draw (GT7's reflection freezes). Such cells are uploaded empty when the upload
+	// comes from guest bytes (not from a GPU-written cache buffer). Any thread.
+	[[nodiscard]] static bool LightGridCapEnabled();
+	static void NoteLightGridShape(const ImageInfo& info);
+	// KYTY_LIGHT_GRID_PROBE=1 (diagnostics, default off): every light grid a pixel shader binds
+	// (descriptors.cpp) has its guest bytes scanned at bind time and logged (garbage cells, the
+	// largest and summed light counts). Any thread.
+	[[nodiscard]] static bool LightGridProbeEnabled();
+	// KYTY_LIGHT_GRID_GUEST=1 (default off; needs KYTY_LIGHT_GRID_CAP): a light grid's image is
+	// compared with its guest bytes once per guest submission and uploaded from them (repaired)
+	// when they changed, even when GPU writes of other data covered the grid's memory, which
+	// otherwise makes the refresh take the stale GPU-written bytes of the buffer cache.
+	[[nodiscard]] static bool LightGridGuestEnabled();
+	[[nodiscard]] static bool LightGridGuestApplies(const Image& image);
+	static void ProbeLightGrid(const ImageInfo& info, uint64_t shader_hash);
 	void RunGarbageCollector();
+	// KYTY_BINDLESS_GUEST_DROP_FRAMES: no heap key refers to this bindless image any more (the
+	// guest replaced or cleared its entries): free it once no draw has used it for that many
+	// frames, whatever the memory pressure (RunGarbageCollector). Any thread but m_lock's holder.
+	void ReleaseDroppedByGuest(ImageId id);
+	// KYTY_BINDLESS_EVICT: bindless images no draw sampled during the last usage probe
+	// (RenderExecutor::UpdateBindlessUsageProbe); replaces the previous list. They stay pinned,
+	// but while the cache is under pressure RunGarbageCollector frees the clean, unbound ones.
+	// Returns their accounted bytes. GPU thread; takes m_lock.
+	uint64_t SetBindlessEvictable(std::span<const ImageId> ids);
+	// Whether the cache's images (or, with a reported budget, the device's usage) are at its
+	// pressure threshold.
+	[[nodiscard]] bool BindlessUnderPressure() const noexcept {
+		return m_total_used_memory >= m_pressure_gc_memory;
+	}
 	// KYTY_VRAM_STATS report lines (vramStats.h): images by binding kind, frame age, residency,
 	// render-target sizes and aliases, the largest images, the GC thresholds (GPU thread).
 	void ReportVram();
@@ -231,6 +509,13 @@ public:
 	// a buffer copy source; and before a GPU-modified image is freed (except by an unmap).
 	// Needs aliases aged by frames (KYTY_IMAGE_ALIAS_AGE).
 	[[nodiscard]] static bool AliasBytesEnabled();
+
+	// KYTY_BINDLESS_HOLD_EXTENT (adapted from upstream 95bbc9c65): whether a bindless heap lookup
+	// of `info` should wait instead of creating an image. Heaps hold a descriptor per
+	// dynamic-resolution extent of a render target, and only one extent at an address holds data:
+	// true when no registered image has the lookup's backing but a registered bindless-pinned
+	// image of the same type at the same address has another extent. Takes m_lock.
+	[[nodiscard]] bool HeapExtentHeld(const ImageInfo& info, bool exact_format);
 
 private:
 	enum class TransferDirection { Upload, Download };
@@ -255,6 +540,14 @@ private:
 		Type type;
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		// KYTY_HTILE_SLICE_CLEAR: one layer's HTILE bytes and the layers, from a depth target bound
+		// with all of its image's layers (0 = not known).
+		uint64_t slice_size = 0;
+		uint32_t layers     = 0;
+		// KYTY_HTILE_SIZE_RULE: the largest HTILE size a depth target bound with it (0 = not known).
+		uint64_t size       = 0;
+		// The depth image that last acquired this HTile range (upstream 2d84e36b4).
+		ImageId owner;
 	};
 
 	struct OverlapResult {
@@ -315,6 +608,9 @@ private:
 	                                                    HangTrace::ImageFreeReason::Other);
 	void                      TouchImage(Image& image);
 	void                      SyncAliasFromOwner(ImageId id);
+	// KYTY_BLOCK_SUBRESOURCE_WRITES (caller holds m_lock).
+	void                      NoteBlockSubwrite(ImageId id);
+	void                      ApplyBlockSubwrites(ImageId id);
 	void                      TrackImage(ImageId id);
 	// Chunk-granular tracking (Image::ChunkState). Caller holds m_lock.
 	[[nodiscard]] bool        ChunkTrackingEligible(const Image& image) const;
@@ -339,6 +635,15 @@ private:
 	// Uploads the subresources over image.kept_dirty from guest memory; false: nothing recorded,
 	// the caller uploads the whole image.
 	[[nodiscard]] PartialUploadResult UploadKeptRanges(Image& image);
+	// KYTY_IMAGE_PARTIAL_GPU_WRITE (see UploadGpuWrittenRanges).
+	[[nodiscard]] bool GpuWriteTrackEligible(const Image& image) const;
+	[[nodiscard]] bool GpuWritePartialCandidate(const Image& image);
+	void               MaterializeForRebuild(ImageId id, RefreshIntent intent);
+	[[nodiscard]] PartialUploadResult UploadGpuWrittenRanges(ImageId id, RefreshIntent intent);
+	[[nodiscard]] std::optional<ImageInfo> GpuWriteDepthInfo(const Image& image) const;
+	void VerifyGpuWrittenRanges(ImageId id, RefreshIntent intent);
+	void NoteRefreshSync(ImageId id, bool gpu_partial);
+	void PrintPartialGpuWriteSummary();
 	[[nodiscard]] bool        UploadKeptDepthLayers(Image& image, PartialUploadResult& result);
 	// Whole-image refresh of a tiled sampled texture whose guest bytes are copied to staging
 	// by m_staging_copier. False when the ordinary refresh path must be used.
@@ -368,6 +673,10 @@ private:
 	[[nodiscard]] bool SafeToSyncIntoBuffer(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
+	// KYTY_DCC_GPU_ALIASED: whether images over a target's metadata keep its inspection on the CPU
+	// (m_lock held).
+	// *aliased: images lie over the metadata and were accepted (KYTY_DCC_GPU_WIDE / _ALIASED=2).
+	[[nodiscard]] bool          MetadataAliasBlocks(ImageId id, GuestRange range, bool* aliased = nullptr);
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	// Caller holds m_lock. Equal backing ranges must begin in the same indexed page.
@@ -377,7 +686,38 @@ private:
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
+	// How the last ResolveDepthOverlap answered (KYTY_IMG_DEPTHALIAS): None (no image), Same (the
+	// cached image, no effect), Alias (a kept alias of the inner region m_depth_inner_*; the
+	// cached image's rebind effect applied or not: m_depth_rebind_applied), Recreate (anything else).
+	enum class DepthPath : uint8_t { None, Same, Alias, Recreate };
+	DepthPath m_depth_path            = DepthPath::None;
+	uint64_t  m_depth_inner_address   = 0;
+	uint64_t  m_depth_inner_size      = 0;
+	bool      m_depth_rebind_applied  = false;
+	// ResolveOverlap's record of a depth answer into m_last_overlap.
+	void NoteDepthOverlap(ImageId cached_id);
+	// KYTY_DEPTH_GROW_RECREATE: a depth target bound at the address of a cached one with the same
+	// layout but a larger width and/or height (a dynamic-resolution target that grows inside a fixed
+	// pitch). The pitch/height comparison of ResolveOverlap never recreates it, so draws covered the
+	// larger extent of a smaller attachment (GT7 License Center, upstream PR #2082).
+	[[nodiscard]] static bool   IsDepthGrowth(const ImageInfo& requested, const ImageInfo& cached);
+	// Caller holds m_lock. A new image of the requested size: guest bytes everywhere, then the
+	// cached image's native depth and stencil over its own extent; the cached image is freed.
+	[[nodiscard]] ImageId       GrowDepthTarget(const ImageInfo& requested, ImageId cached);
+	// KYTY_VIEW_PLACEMENT: where a binding the overlap loop found inside `result` lies in it
+	// (loop_own: the loop's last overlap placed the binding itself there, at view_mip/view_layer);
+	// clears `result` when it has no place there its view fits in (it gets an image of its own).
+	[[nodiscard]] static bool   ViewPlacementEnabled();
+	void                        PlaceBindingView(const ImageDesc& desc, ImageId& result, bool loop_own,
+	                                             int32_t& view_mip, int32_t& view_layer) const;
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
+	// KYTY_GUEST_HASH_IMAGES_KB: small linear images the CPU writes, compared with their guest bytes
+	// once per guest submission instead of trusting the page tracking alone.
+	[[nodiscard]] bool          ChecksGuestContent(const Image& image);
+	void                        RefreshByContent(ImageId id, RefreshIntent intent);
+	// KYTY_PENDING_FILLS (BufferCache::FillOfNewImage), caller holds m_lock: a fresh target made
+	// inside a known GPU fill is cleared to it; false when nothing was done (the caller uploads).
+	bool                        ClearFromKnownFill(ImageId id);
 	void                        RefreshImage(ImageId id,
 	                                         RefreshIntent intent = RefreshIntent::Read);
 	// `noop` (optional): how the decision can be repeated (MetadataNoop), reset first.
@@ -403,6 +743,9 @@ private:
 	void EraseSurfaceMeta(uint64_t address);
 	// SyncAliasFromOwner returns before looking for an owner (caller holds m_lock).
 	[[nodiscard]] static bool SyncAliasReturnsAtOnce(const Image& image);
+	// Whether SyncAliasFromOwner, for `image`, would take `other` (another image of its region) as
+	// the owner to copy from (its loop condition; caller holds m_lock).
+	[[nodiscard]] static bool IsAliasSyncSource(const Image& other, const Image& image);
 	// Whether a registered image other than `found` has exactly its backing range, extent and
 	// sample count on `page` (SyncAliasFromOwner's only possible owners). Caller holds m_lock.
 	[[nodiscard]] bool HasAliasPartner(uint64_t page, ImageId found, const Image& image) const;
@@ -413,11 +756,14 @@ private:
 	// The native inspection behind TryMaterializeGpuDccClear for any metadata whose uniform
 	// bytes select a clear value (values/decodable in DccClearHelper::ClearCodes order): clears
 	// the bound slices whose bytes all equal an accepted code and leaves those bytes 0xFF. cmask:
-	// CMASK bytes (only code 0x00), not counted as DCC work.
+	// CMASK bytes (only code 0x00), not counted as DCC work. consume=false (video-out bindings,
+	// KYTY_DCC_GPU_VIDEOOUT): the keys stay as they are, and no inspection is retained for reuse.
 	[[nodiscard]] Profiler::FrameEvent TryMaterializeGpuMetadataClear(
 	    DccClearHelper& helper, ImageId id, const ImageDesc& desc, GuestRange range,
 	    uint32_t metadata_base_layer, const DccClearHelper::ClearValues& values, uint32_t decodable,
-	    bool cmask);
+	    bool cmask, bool keep_keys = false);
+	// KYTY_LIGHT_GRID_CAP: a light grid's staged upload bytes, repaired before the copy is recorded.
+	void RepairLightGridUpload(const Image& image, Buffer& source, uint64_t source_offset);
 	void                        InitializeImage(ImageId id,
 	                                            RefreshIntent intent = RefreshIntent::Read);
 	// KYTY_ALIAS_BYTES. Moves the bytes of `range` that GPU-modified images own into the buffer
@@ -433,6 +779,14 @@ private:
 	[[nodiscard]] bool OtherImagesOwnBytes(GuestRange range, ImageId except);
 	// False when no image is registered on the 1 MiB pages of the range (lock-free, any thread).
 	[[nodiscard]] bool MayOverlapImages(uint64_t address, uint64_t size) const;
+	// KYTY_TEXEL_SYNC_MEMO: the image registration epoch (InvalidateCleanImageProofs), or 0 when it
+	// is not maintained (KYTY_TEXTURE_CLEAN_PROOFS off) or saturated.
+	[[nodiscard]] uint64_t RegistrationEpoch() const {
+		const auto epoch = m_clean_image_epoch.load(std::memory_order_acquire);
+		return m_clean_image_proofs && epoch != UINT64_MAX ? epoch : 0;
+	}
+	// Whether a registered image starts at `address` (whatever its state).
+	[[nodiscard]] bool AnyImageStartsAt(uint64_t address);
 	// The 64 KiB blocks of a single-level, single-layer render target (64 KiB render-target
 	// tiling) under `rect` (level-0 texels, clamped to the extent). False: not such a target, or
 	// the rectangle covers the whole image (claim it all).
@@ -475,15 +829,26 @@ private:
 	// Returns true when the destination's copied subresources now hold exactly the source's
 	// native bits for every subresource of both images (same shape, lossless path).
 	bool CopyImage(ImageId destination, ImageId source, const char* context = "other");
+	// The depth image's stencil plane record covering exactly range, or none (upstream 84419aef7).
+	[[nodiscard]] ImageId FindStencilPlane(const Image& depth, GuestRange range) const;
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// `done` (optional) is set once the downloaded bytes are in guest memory (the deferred write-back ran).
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, std::shared_ptr<std::atomic_bool> done = nullptr);
 	// KYTY_IMAGE_WRITEBACK_GUARD: a recorded image download not yet written into guest memory. It
 	// watches the pages it has not given up (`watched`); a CPU write to them before the write-back
 	// releases them and marks them CPU-written, and the write-back leaves those to the CPU.
+	// A storage-readback image download whose guest pages stay inaccessible until it lands
+	// (upstream 9678c59b7).
+	struct StorageWriteBack {
+		GuestRange range;
+		uint64_t   tick;
+	};
+	[[nodiscard]] bool DownloadQueuedImages();
+
 	struct PendingWriteback {
 		KeptRanges::List watched;
 		KeptRanges::List cpu_written;
@@ -520,6 +885,18 @@ private:
 	uint64_t           m_idle_frames          = 0;
 	uint64_t           m_idle_next_frame      = 0;
 	uint64_t           m_idle_freed           = 0;
+	// KYTY_BINDLESS_GUEST_DROP_FRAMES: images the guest dropped from its texture heaps, with the
+	// frame of the drop (ReleaseDroppedByGuest).
+	std::vector<std::pair<ImageId, uint64_t>> m_guest_dropped;
+	uint64_t                                  m_guest_dropped_freed       = 0;
+	uint64_t                                  m_guest_dropped_freed_bytes = 0;
+	void                                      FreeGuestDroppedImages(uint64_t frame);
+	// KYTY_BINDLESS_EVICT (SetBindlessEvictable).
+	std::vector<ImageId> m_bindless_evictable;
+	uint64_t             m_bindless_evicted       = 0;
+	uint64_t             m_bindless_evicted_bytes = 0;
+	bool                 m_bindless_evicting      = false; // FreeImage frees a pinned image
+	void                 FreeBindlessEvictable(uint64_t frame);
 	uint64_t           m_pressure_frames      = 0;
 	uint64_t           m_pressure_frame       = 0;
 	uint64_t           m_pressure_freed_bytes = 0;
@@ -528,6 +905,31 @@ private:
 	bool               RunBudgetGarbageCollector(uint64_t frame);
 	uint64_t           m_budget_frame       = UINT64_MAX;
 	uint64_t           m_budget_freed_bytes = 0;
+	// KYTY_VRAM_GC_FIX (textureCache.cpp, CollectGpuWrittenImages; adapted from Erlou93/KytyPS5-Yotei):
+	// GPU-written colour images the budget collector downloads into guest memory and frees once the
+	// bytes are there, if the image was neither written nor used since.
+	struct GcFixEviction {
+		ImageId                           id;
+		uint64_t                          serial = 0; // content serial when the download was recorded
+		uint64_t                          frame  = 0; // frame of the recording
+		uint64_t                          bytes  = 0;
+		std::shared_ptr<std::atomic_bool> done;
+	};
+	struct GcFixStats {
+		uint64_t downloads = 0, download_bytes = 0, freed = 0, freed_bytes = 0, cancelled = 0;
+		uint64_t failed = 0, skip_budget = 0, verify_exact = 0, verify_mismatch = 0, verify_skipped = 0;
+	};
+	uint64_t           CollectGpuWrittenImages(uint64_t frame, uint64_t min_age, uint64_t enough, bool critical);
+	void               FinishGcFixEvictions(uint64_t frame);
+	[[nodiscard]] bool GcFixEligible(const Image& image, uint64_t frame, uint64_t min_age);
+	// KYTY_VRAM_GC_FIX_VERIFY: the native texels of the image and of an image rebuilt from the
+	// downloaded guest bytes are compared before the free (1: equal, 0: differ, -1: not checked).
+	int                VerifyGcFixRoundTrip(ImageId id);
+	[[nodiscard]] uint64_t LimitTickForAge(uint64_t frame, uint64_t min_age) const;
+	std::vector<GcFixEviction>   m_gc_fix_pending;
+	std::unordered_set<uint32_t> m_gc_fix_pending_ids; // ImageId indices in m_gc_fix_pending
+	GcFixStats                   m_gc_fix_stats;
+	uint64_t                     m_gc_fix_log_frame = 0;
 	uint64_t           m_budget_freed       = 0;
 	uint64_t           m_budget_last        = 0; // planning budget at the last collection
 	std::deque<std::pair<uint64_t, uint64_t>> m_frame_ticks;
@@ -555,10 +957,81 @@ private:
 	uint64_t m_gpu_dcc_fallbacks = 0;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	std::unordered_map<uint64_t, ImageId>             m_null_images;
+	// SingleSampleDepth's and SingleSampleStencil's copies, by the multisample depth image they
+	// copy: the copy and the source content serial it holds.
+	struct SingleSampleCopy {
+		ImageId  copy {};
+		uint64_t serial = UINT64_MAX;
+	};
+	std::unordered_map<ImageId, SingleSampleCopy>      m_single_sample_depths;
+	// KYTY_CMASK_MSAA: the addresses colour targets' CMASK starts at (IsColorMeta), at most 4096.
+	std::unordered_set<uint64_t>                       m_color_metas;
+	std::unordered_map<ImageId, SingleSampleCopy>      m_single_sample_stencils;
+	// KYTY_PRESERVE_STENCIL: saved stencil planes by StencilPlaneKey (depth address, plane address,
+	// extent): the buffer, its extent, the save count it holds and the reader copy made of it.
+	struct SavedStencilPlane {
+		std::shared_ptr<Buffer> buffer;
+		uint32_t                width  = 0;
+		uint32_t                height = 0;
+		uint64_t                serial = 0;
+		// KYTY_STENCIL_PLANE_SYNC: Image::NextContentSerial() when the copy was last written.
+		uint64_t                content_serial = 0;
+		ImageId                 reader {};
+		uint64_t                reader_serial = 0;
+	};
+	std::unordered_map<uint64_t, SavedStencilPlane> m_stencil_planes;
+	uint64_t                                        m_stencil_plane_serial = 0;
+	// KYTY_STENCIL_READ_DEPTH: plane address -> the depth image that swapped to or from it.
+	std::unordered_map<uint64_t, ImageId>           m_stencil_plane_depth;
+	// KYTY_STENCIL_READ_PARTNER: plane address -> the plane the depth image held before it.
+	std::unordered_map<uint64_t, uint64_t>          m_stencil_plane_partner;
+	std::shared_ptr<Buffer>                         m_stencil_alias_staging;
+	// KYTY_PRESERVE_STENCIL_RECREATE: the stencil of the last depth image replaced by a colour image.
+	void SaveRecreatedStencil(Image& depth);
+	bool RestoreRecreatedStencil(Image& depth);
+	std::shared_ptr<Buffer>                         m_recreate_stencil;
+	uint64_t                                        m_recreate_stencil_address = 0;
+	uint64_t                                        m_recreate_stencil_plane   = 0;
+	uint32_t                                        m_recreate_stencil_width   = 0;
+	uint32_t                                        m_recreate_stencil_height  = 0;
+	bool                                            m_recreate_stencil_valid   = false;
+	// KYTY_STENCIL_STORAGE_SHADOW: shadow image per depth image, and the pairs to copy back.
+	std::unordered_map<ImageId, ImageId>            m_stencil_shadows;
+	std::vector<std::pair<ImageId, ImageId>>        m_pending_stencil_shadows; // shadow, depth
+	// Whether the depth image of a stencil record holds the record's plane (KYTY_PRESERVE_STENCIL).
+	[[nodiscard]] bool StencilPlaneHeld(const Image& record) const;
+	// True when the incoming plane was restored from its saved copy (or loaded, STENCIL_PLANE_SYNC=2).
+	bool SwapStencilPlane(ImageId depth_id, uint64_t next_plane);
+	// SubExtentCopy's copies, by the image they copy (at most 4 extents each).
+	struct SubExtentCopyEntry {
+		ImageId  copy {};
+		uint32_t width  = 0;
+		uint32_t height = 0;
+		uint64_t serial = UINT64_MAX;
+		uint64_t used   = 0;
+	};
+	std::unordered_map<ImageId, std::vector<SubExtentCopyEntry>> m_sub_extent_copies;
+	[[nodiscard]] ImageId SingleSampleCopyOf(ImageId id, bool stencil);
+	// Releases an image that was never registered (a SingleSample* copy) once the GPU is done.
+	void ReleaseUnregisteredImage(ImageId id);
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	std::mutex                                        m_storage_write_back_mutex;
+	std::vector<StorageWriteBack>                     m_storage_write_backs;
 	std::atomic<uint64_t>                             m_frame {0};
+	// KYTY_DISCARDED_TARGET_SKIP (textureCache.cpp): ranges of GPU-written render/depth targets freed
+	// without their pixels reaching guest memory, with the frame of the free.
+	struct DiscardedTarget {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t frame = 0;
+	};
+	static constexpr size_t DiscardedTargetCount = 32;
+	std::array<DiscardedTarget, DiscardedTargetCount> m_discarded_targets {};
+	size_t                                            m_discarded_next = 0;
+	void               NoteDiscardedTarget(ImageId id, const Image& image);
+	[[nodiscard]] bool WasDiscardedTarget(const Image& image) const;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	// KYTY_CP_COMMIT=metaerase (EraseSurfaceMeta): insertions into m_surface_metas so far, and per
 	// recently erased address the insertion count at its erase. While the count is unchanged the
@@ -596,6 +1069,8 @@ private:
 	bool             m_gc_filter_candidates  = true;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t>::Cursor m_pressure_gc_cursor;
 	uint64_t m_pressure_retirement_bytes = 0;
+	// ExpandImage is freeing the image it copied into a new one (on_bindless_unregister's replaced).
+	bool m_freeing_replaced = false;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_direct_dirty_image_query = false;
 	struct CleanImagePageProof {
@@ -603,7 +1078,9 @@ private:
 		uint64_t epoch = 0;
 	};
 	std::array<CleanImagePageProof, 256> m_clean_image_pages {};
-	uint64_t m_clean_image_epoch = 1;
+	// Bumped on every image register/unregister and GPU-modified transition (with clean proofs
+	// on); atomic so that BufferCache's texel-sync memo can read it on the GPU thread.
+	std::atomic<uint64_t> m_clean_image_epoch {1};
 	bool m_clean_image_proofs = false;
 	ImageLookupMode  m_image_lookup_mode = ImageLookupMode::FirstPage;
 	uint64_t         m_image_lookup_checks = 0;
@@ -614,6 +1091,7 @@ private:
 	uint64_t         m_dcc_decision_effects = 0;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
+	bool             m_readback_storage_images = false;
 	// Texture streaming (see TextureCache constructor for the environment switches).
 	bool             m_partial_upload      = true;
 	bool             m_partial_bands       = true;
@@ -631,6 +1109,11 @@ private:
 	// Set by FindImage for the ResolveOverlap calls of one lookup: many live overlapping
 	// images already share the requested range, so overlapped images are not kept.
 	bool             m_overlap_crowded     = false;
+	// Set by ResolveOverlap when a branch has an effect (free, expansion, merge, depth copy) or a
+	// time-dependent decision (safe_to_delete, the keep window); reset by FindImage per lookup.
+	bool             m_overlap_impure      = false;
+	// The last FindImage's overlap path (GPU thread): see LastOverlap.
+	OverlapLookup    m_last_overlap;
 	uint64_t         m_partial_verify_mismatches = 0;
 	// KYTY_TEXTURE_ASYNC_STAGING=0: null, staging copies stay on the GPU thread.
 	std::unique_ptr<StagingCopier> m_staging_copier;
@@ -662,6 +1145,7 @@ private:
 	void NoteExactRangeRewrite(Image& image);
 	void PrintExactRangeSummary();
 	int  m_exact_range_mode = 0;
+	bool m_invalidate_image_starts_only = false; // InvalidateMemoryFromGPUImageStarts
 	struct ExactRangeTotals {
 		uint64_t exact_writes = 0; // buffer writes whose range equals an image's range
 		uint64_t kept         = 0; // partly overlapped images left unrebuilt (count: would be)
@@ -672,6 +1156,32 @@ private:
 	ExactRangeTotals m_exact_range_printed;
 	uint64_t         m_exact_range_print_ns = 0;
 	uint32_t         m_exact_range_logged   = 0;
+	// KYTY_IMAGE_PARTIAL_GPU_WRITE=1|verify, KYTY_IMAGE_PARTIAL_GPU_WRITE_STENCIL=keep.
+	int  m_partial_gpu_write              = 0;
+	bool m_partial_gpu_write_verify       = false;
+	bool m_partial_gpu_write_stencil_keep = false;
+	bool m_stencil_draw_suppressed        = false;
+	// KYTY_DEPTH_GROW_RECREATE=1 (GrowDepthTarget).
+	bool m_depth_grow_recreate = false;
+	bool m_bind_mark                      = false; // a binding's mark right before its refresh
+	struct PartialGpuWriteTotals {
+		uint64_t refreshes       = 0; // refreshes of buffer-modified images
+		uint64_t untracked       = 0; // written ranges not tracked
+		uint64_t stale           = 0; // tracked, but other changes since:
+		uint64_t stale_foreign   = 0; //   another image wrote its bytes / not in sync
+		uint64_t stale_serial    = 0; //   its native contents were written
+		uint64_t stale_cpu       = 0; //   CPU writes
+		uint64_t partial         = 0; // partial rebuilds
+		uint64_t partial_bytes   = 0; // tiled bytes they rebuilt
+		uint64_t whole_bytes     = 0; // bytes the whole rebuilds would have read
+		uint64_t fallback_layout = 0;
+		uint64_t fallback_most   = 0;
+		uint64_t fallback_others = 0;
+		uint64_t overflows       = 0;
+	};
+	PartialGpuWriteTotals m_pgw_totals;
+	PartialGpuWriteTotals m_pgw_printed;
+	uint64_t              m_pgw_print_ns = 0;
 	bool m_gpu_write_skip        = true;
 	int  m_gpu_write_skip_verify = 0;
 	// Why TryMaterializeGpuMetadataClear last refused an image (DccImageState* FrameEvent).
@@ -705,6 +1215,47 @@ private:
 	void RecordDccRefreshVerify(Buffer& metadata, uint64_t offset, uint64_t slice_size,
 	                            std::vector<uint8_t> before, std::vector<uint8_t> clears,
 	                            GuestRange range);
+	// KYTY_DCC_GPU_WIDE=<mask> (default 0 = off, needs KYTY_DCC_GPU=1): GPU-written colour metadata
+	// that the native inspection used to refuse, so that the CPU fallback drained the GPU for it
+	// (a command-processor wait for the current recording, ~2 ms each, 6-8 ms per GT7 race frame),
+	// is inspected on the GPU too. The CPU fallback reads the metadata from the buffer cache
+	// (BufferCache::ReadMemory downloads buffer bytes only, never an image's), and the inspection
+	// reads the same buffer bytes in queue order, so both take the same decision; the image layer
+	// cleared and the keys consumed are the ones the fallback's ClearImage + key write would touch.
+	//  1: images registered over the metadata bytes (any, also GPU-modified ones; not the target
+	//     itself) no longer refuse (KYTY_DCC_GPU_ALIASED=2 does the same for DCC only);
+	//  2: the image found for the binding differs from the description (data range or extent, e.g.
+	//     a texture view of a larger target): the image's whole layer is inspected and cleared, as
+	//     the fallback's ClearImage(id) clears it;
+	//  4: video-out bindings (flips): inspected without consuming the keys (the fallback leaves a
+	//     flip's keys as they are), never reused from an earlier inspection.
+	//  8: with 4, also video-out surfaces with DCC compression (GT7's 3840x2160 flips, whose
+	//     fallback was a side readback of their metadata at every flip, on the command processor).
+	// KYTY_DCC_GPU_WIDE_VERIFY=1|exit: for an inspection accepted only through these, also take the
+	// CPU fallback's decision (after a drain) and compare it with the inspection's decision copied
+	// out behind it: "DCC wide verify" mismatches are counted and logged (exit stops).
+	uint32_t m_dcc_gpu_wide        = 0;
+	int      m_dcc_gpu_wide_verify = 0;
+	[[nodiscard]] uint32_t DccGpuWide() const;
+
+public:
+	[[nodiscard]] static int64_t ParseDccGpuWide(const char* value);
+
+private:
+	struct DccWideTotals {
+		std::atomic<uint64_t> aliased {0};   // inspections accepted with images over the metadata
+		std::atomic<uint64_t> mismatch {0};  // inspections of an image that differs from the binding
+		std::atomic<uint64_t> video_out {0}; // flip inspections (keys kept)
+		std::atomic<uint64_t> verify_checks {0};
+		std::atomic<uint64_t> verify_mismatches {0};
+	};
+	DccWideTotals m_dcc_wide_totals;
+	// Caller holds m_lock, after the slices' RecordSlice copied their decisions to `decisions`
+	// (16 bytes per slice, download ring): compares them with the fallback's (`expected`) at
+	// completion.
+	void RecordDccWideVerify(const uint8_t* decisions, uint64_t download_offset, std::vector<uint8_t> expected,
+	                         GuestRange range, uint32_t type);
+	void ReportDccWide();
 	struct GpuWriteSkipTotals {
 		std::atomic<uint64_t> skips {0};
 		std::atomic<uint64_t> verify_checks {0};
@@ -770,6 +1321,21 @@ private:
 	[[nodiscard]] uint64_t PageVersion(uint64_t page) const noexcept {
 		return m_page_versions ? m_page_versions[page] : 0;
 	}
+
+	// KYTY_NAN_SCRUB: the arrays the GPU wrote (by address), when each was last scrubbed (content
+	// serial, frame), the round-robin position, the last frame a scrub ran, its pipeline and scratch.
+	struct NanScrubCandidate {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t serial  = UINT64_MAX;
+		uint64_t frame   = 0;
+	};
+	void                           NoteNanScrubCandidate(const Image& image);
+	std::vector<NanScrubCandidate> m_nan_candidates;
+	size_t                         m_nan_next  = 0;
+	uint64_t                       m_nan_frame = UINT64_MAX;
+	std::unique_ptr<NanScrubber>   m_nan_scrubber;
+	std::shared_ptr<Buffer>        m_nan_scratch;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

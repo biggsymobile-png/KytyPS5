@@ -17,9 +17,78 @@
 
 namespace Libs::Graphics {
 
-enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
+// Narrow10_11_11: KYTY_10_11_11_RED (see Red10_11_11InRed). Rotate2_10_10_10: KYTY_2_10_10_10_ROTATE
+// (see Rotate2_10_10_10Enabled). The values are also used by gpu_tiler_color.inc.
+enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11, Narrow10_11_11, Rotate2_10_10_10 };
 
-enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
+// KYTY_2_10_10_10_ROTATE=1 (default off; upstream 963aaeb3b). A guest 2_10_10_10 UNorm image is held as
+// A2R10G10B10 with the transfers rotating each element by two bits, so the guest's bytes keep their
+// layout (the 2-bit component at the bottom) in CPU reads, readbacks and copies. By default the host
+// image is A2B10G10R10 behind a component mapping, whose bytes come out shuffled when the guest reads
+// them. Off by default: the GT7 2_10_10_10 targets were checked with the mapping only.
+[[nodiscard]] inline bool Rotate2_10_10_10Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_2_10_10_10_ROTATE");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_10_11_11_RED=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 473c43a3d). A guest
+// 10_11_11 float image is held with red in the host's red: the B10G11R11 image takes no channel
+// mapping, and the transfers convert the bits (Narrow10_11_11, Guest10_11_11ToHost). By default
+// the host image holds blue in red behind a view swizzle (Reverse10_11_11), which a storage view
+// cannot take: what compute stored came back with red and blue swapped when sampled (GT7's light
+// probe arrays: orange street lights lit the night blue). Off by default because Astro Bot's
+// galaxy map was not checked with it.
+[[nodiscard]] inline bool Red10_11_11InRed() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_10_11_11_RED");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+// Narrow10_11_11: the guest word holds red in its low 10 bits (5-bit exponent, 5-bit mantissa),
+// green in the next 11 and blue in the top 11; the host's B10G11R11 holds red in its low 11 bits,
+// green in the next 11 and blue in the top 10. Each component keeps its place; the narrower field
+// drops the lowest mantissa bit (truncated; a NaN stays a NaN). The GPU tiler does the same
+// (gpu_tiler_color.inc, transform 3).
+[[nodiscard]] constexpr uint32_t NarrowSmallFloat(uint32_t bits, uint32_t mantissa_bits) {
+	const uint32_t narrow = bits >> 1u;
+	const uint32_t mask   = (1u << mantissa_bits) - 1u;
+	const bool     nan    = (bits >> mantissa_bits) == 0x1fu && (bits & mask) != 0u;
+	return nan && (narrow & (mask >> 1u)) == 0u ? narrow | 1u : narrow;
+}
+
+[[nodiscard]] constexpr uint32_t Guest10_11_11ToHost(uint32_t packed) {
+	const uint32_t red   = packed & 0x3ffu;
+	const uint32_t green = (packed >> 10u) & 0x7ffu;
+	const uint32_t blue  = NarrowSmallFloat(packed >> 21u, 6);
+	return (red << 1u) | (green << 11u) | (blue << 22u);
+}
+
+[[nodiscard]] constexpr uint32_t Host10_11_11ToGuest(uint32_t packed) {
+	const uint32_t red   = NarrowSmallFloat(packed & 0x7ffu, 6);
+	const uint32_t green = (packed >> 11u) & 0x7ffu;
+	const uint32_t blue  = packed >> 22u;
+	return red | (green << 10u) | ((blue << 1u) << 21u);
+}
+
+// A 32-bit clear or fill word of the guest's layout in the host's (Narrow10_11_11 only).
+[[nodiscard]] constexpr uint32_t GuestColorWordToHost(uint32_t word, ColorTransform transform) {
+	return transform == ColorTransform::Narrow10_11_11 ? Guest10_11_11ToHost(word) : word;
+}
+
+// DCC of a video-out buffer, named by its CB_DCC_CONTROL block sizes: maximum uncompressed,
+// maximum compressed, independent blocks (0: none).
+enum class VideoOutCompression : uint8_t {
+	Uncompressed,
+	Dcc256_256_0,
+	Dcc256_64_64,
+	Dcc128_128_128,
+	Unsupported
+};
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc };
 
@@ -39,6 +108,11 @@ struct ImageSubresources {
 	uint32_t levels                                      = 1;
 	uint32_t layers                                      = 1;
 	auto     operator<=>(const ImageSubresources&) const = default;
+	// Erlou93/KytyPS5-Yotei: lexicographic above is the overlap rules' order. As a capacity, levels
+	// and layers are independent: 7 levels of 9 layers hold no 12 layers (KYTY_IMAGE_CONTAINS).
+	[[nodiscard]] constexpr bool Contains(const ImageSubresources& other) const noexcept {
+		return levels >= other.levels && layers >= other.layers;
+	}
 };
 
 struct ImageSubresourceRange {
@@ -79,7 +153,11 @@ struct ImageInfo {
 		if (bgra16) return ColorTransform::SwapBgra16;
 		switch (guest_format) {
 			case Prospero::BufferFormat::k10_11_11Float:
-				return ColorTransform::Reverse10_11_11;
+				return Red10_11_11InRed() ? ColorTransform::Narrow10_11_11
+				                          : ColorTransform::Reverse10_11_11;
+			case Prospero::BufferFormat::k2_10_10_10UNorm:
+				return Rotate2_10_10_10Enabled() ? ColorTransform::Rotate2_10_10_10
+				                                 : ColorTransform::None;
 			default: return ColorTransform::None;
 		}
 	}
@@ -179,15 +257,17 @@ struct ImageViewInfo {
 	vk::ComponentMapping mapping     = {};
 	vk::ImageUsageFlags  usage       = vk::ImageUsageFlagBits::eSampled;
 
-	[[nodiscard]] bool operator==(const ImageViewInfo& rhs) const noexcept {
-		return format == rhs.format && type == rhs.type && aspect == rhs.aspect &&
-		       base_level == rhs.base_level && level_count == rhs.level_count &&
-		       min_lod == rhs.min_lod && base_layer == rhs.base_layer &&
-		       layer_count == rhs.layer_count && mapping.r == rhs.mapping.r &&
-		       mapping.g == rhs.mapping.g && mapping.b == rhs.mapping.b &&
-		       mapping.a == rhs.mapping.a && usage == rhs.usage;
-	}
+	[[nodiscard]] bool operator==(const ImageViewInfo&) const noexcept = default;
 };
+
+// KYTY_IMAGE_LEVEL_CLAMP (default on; =0 off). A T# may give more mip levels than its extent has
+// (Ghost of Yotei: 1x1 RGBA8 textures with 12-14 levels, 513x513 with 14): the PS5 lays out every
+// level, but a Vulkan image may have at most bit_width(max extent) levels
+// (VUID-VkImageCreateInfo-mipLevels-00958). The extra levels are the smallest size again; they are
+// dropped (neither uploaded nor viewed): a view past the last valid level views the last valid
+// one. Returns true when it changed info.resources.levels or the view's level range.
+[[nodiscard]] bool ImageLevelClampEnabled();
+bool               ClampImageLevelsToExtent(ImageInfo& info, ImageViewInfo& view);
 
 struct DepthFormatPolicy {
 	Prospero::DepthFormat     depth_format;
@@ -245,19 +325,6 @@ FindGuestDepthFormatPolicy(Prospero::BufferFormat guest_format) noexcept {
 	return has_stencil ? policy.stencil_attachment_formats.front() : policy.depth_attachment_format;
 }
 
-[[nodiscard]] inline constexpr vk::Format
-DepthAttachmentFormat(Prospero::DepthFormat   depth_format,
-                      Prospero::StencilFormat stencil_format) noexcept {
-	bool has_stencil = false;
-	switch (stencil_format) {
-		case Prospero::StencilFormat::kInvalid: break;
-		case Prospero::StencilFormat::k8UInt: has_stencil = true; break;
-		default: return vk::Format::eUndefined;
-	}
-	const auto* policy = FindDepthFormatPolicy(depth_format);
-	return policy == nullptr ? vk::Format::eUndefined : DepthAttachmentFormat(*policy, has_stencil);
-}
-
 [[nodiscard]] inline constexpr vk::ImageUsageFlags DepthTargetImageUsage() noexcept {
 	return vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled |
 	       vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
@@ -287,14 +354,6 @@ inline bool ImageInfo::IsDepth() const noexcept {
 	}
 }
 
-[[nodiscard]] inline constexpr uint32_t EncodeD16AsD24(uint16_t value) noexcept {
-	return static_cast<uint32_t>((static_cast<uint64_t>(value) * 0x00ffffffu + 0x7fffu) / 0xffffu);
-}
-
-[[nodiscard]] inline uint32_t EncodeD16AsD32(uint16_t value) noexcept {
-	return std::bit_cast<uint32_t>(static_cast<float>(value) / 65535.0f);
-}
-
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const ImageInfo& info) {
 	const auto* policy = FindGuestDepthFormatPolicy(info.guest_format);
 	return policy != nullptr && info.bytes_per_block == policy->bytes_per_element &&
@@ -316,6 +375,11 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
                             uint64_t dcc_clear_color) noexcept {
 	constexpr uint32_t DCC_256_256_0 = 0x00000048u;
 	constexpr uint32_t DCC_256_64_64 = 0x00000208u;
+	// usa-ratt/KytyPS5-GT7 3f9cef931: 128-byte blocks, independent (INDEPENDENT_128B_BLOCKS, bit
+	// 20). GT7 told the output runs at 120 Hz registers its video-out buffers again with these
+	// when a race starts. Video-out DCC is never decoded on the CPU: the layout only needs to be
+	// known.
+	constexpr uint32_t DCC_128_128_128 = 0x00100024u;
 	if (!compressed) {
 		return metadata_address == 0 && dcc_control == 0 && dcc_clear_color == 0
 		           ? VideoOutCompression::Uncompressed
@@ -327,6 +391,7 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 	switch (dcc_control) {
 		case DCC_256_256_0: return VideoOutCompression::Dcc256_256_0;
 		case DCC_256_64_64: return VideoOutCompression::Dcc256_64_64;
+		case DCC_128_128_128: return VideoOutCompression::Dcc128_128_128;
 		default: return VideoOutCompression::Unsupported;
 	}
 }
@@ -345,16 +410,22 @@ struct VideoOutFormatPolicy {
 
 inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ = 0x8100070422000000ull;
 inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ = 0x8100070400000000ull;
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ =
+    0xc001070722000000ull;
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ =
+    0xc001070700000000ull;
 
 [[nodiscard]] constexpr bool IsHdrVideoOutPixelFormat(uint64_t format) {
 	switch (format) {
 		case VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ:
-		case VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ: return true;
+		case VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ: return true;
 		default: return false;
 	}
 }
 
-inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {{
+inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
@@ -363,6 +434,10 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0x8100000000000000ull,
      {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
+    {0x8100000622000000ull,
+     {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
+    {0x8100000600000000ull,
+     {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ,
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ,
@@ -370,6 +445,10 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
     {0xc001000622000000ull,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
     {0xc001000600000000ull,
+     {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, true}},
+    {VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ,
+     {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
+    {VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, true}},
 }};
 
@@ -405,6 +484,9 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
+	const auto unorm16 = [](uint64_t value) {
+		return static_cast<float>(value & 0xffffu) / 65535.0f;
+	};
 	const auto float16 = [](uint32_t value) {
 		const auto sign = (value & 0x8000u) << 16u;
 		const auto exponent = (value >> 10u) & 0x1fu;
@@ -430,19 +512,49 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 			next.float32[1] = float16(packed >> 16u);
 			[[fallthrough]];
 		case vk::Format::eR16Sfloat: next.float32[0] = float16(packed); break;
-		case vk::Format::eR16G16Unorm:
-			next.float32[1] = static_cast<float>(packed >> 16u) / 65535.0f;
+		case vk::Format::eR16G16B16A16Unorm:
+			next.float32[2] = unorm16(clear_words >> 32u);
+			next.float32[3] = unorm16(clear_words >> 48u);
 			[[fallthrough]];
-		case vk::Format::eR16Unorm:
-			next.float32[0] = static_cast<float>(packed & 0xffffu) / 65535.0f;
+		case vk::Format::eR16G16Unorm:
+			next.float32[1] = unorm16(packed >> 16u);
+			[[fallthrough]];
+		case vk::Format::eR16Unorm: next.float32[0] = unorm16(packed); break;
+		case vk::Format::eR16G16B16A16Uint:
+			for (uint32_t i = 0; i < 4; i++) {
+				next.uint32[i] = static_cast<uint16_t>(clear_words >> (16u * i));
+			}
 			break;
-		// Each clear register stores one raw 32-bit float channel.
+		case vk::Format::eR16G16B16A16Sint:
+			for (uint32_t i = 0; i < 4; i++) {
+				next.int32[i] = static_cast<int16_t>(clear_words >> (16u * i));
+			}
+			break;
+		// Each clear register stores one raw 32-bit channel.
 		case vk::Format::eR32G32Sfloat:
 			next.float32[1] = std::bit_cast<float>(static_cast<uint32_t>(clear_words >> 32u));
 			[[fallthrough]];
 		case vk::Format::eR32Sfloat: next.float32[0] = std::bit_cast<float>(packed); break;
-		case vk::Format::eR32Uint: next.uint32[0] = packed; break;
-		case vk::Format::eR32Sint: next.int32[0] = static_cast<int32_t>(packed); break;
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32Sint:
+			next.uint32[1] = static_cast<uint32_t>(clear_words >> 32u);
+			[[fallthrough]];
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32Sint: next.uint32[0] = packed; break;
+		// Narrow targets hold their channels in the low bits of the first word. UFC 6 (PPSA23566)
+		// fast-clears an R8_UINT map through CMASK every frame and then writes only part of it;
+		// without these the clear was dropped and old contents piled up.
+		case vk::Format::eR8Uint: next.uint32[0] = packed & 0xffu; break;
+		case vk::Format::eR8Unorm: next.float32[0] = unorm8(packed); break;
+		case vk::Format::eR8G8Uint:
+			next.uint32[0] = packed & 0xffu;
+			next.uint32[1] = (packed >> 8u) & 0xffu;
+			break;
+		case vk::Format::eR8G8Unorm:
+			next.float32[0] = unorm8(packed);
+			next.float32[1] = unorm8(packed >> 8u);
+			break;
+		case vk::Format::eR16Uint: next.uint32[0] = packed & 0xffffu; break;
 		case vk::Format::eR8G8B8A8Srgb:
 			next.float32[0] = srgb8(packed);
 			next.float32[1] = srgb8(packed >> 8u);
@@ -604,8 +716,14 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 // Keep this separate: the first register word alone cannot describe a 64-bit color.
 [[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
                                                vk::ClearColorValue& clear) {
-	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm) &&
+	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm ||
+	     format == vk::Format::eR16Uint || format == vk::Format::eR8G8Unorm ||
+	     format == vk::Format::eR8G8Uint) &&
 	    (packed & 0xffffu) != (packed >> 16u)) {
+		return false;
+	}
+	if ((format == vk::Format::eR8Unorm || format == vk::Format::eR8Uint) &&
+	    packed != (packed & 0xffu) * 0x01010101u) {
 		return false;
 	}
 	if (format == vk::Format::eR16G16B16A16Sfloat) {
@@ -656,6 +774,116 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
 			return true;
 		default: return DecodeColorDwordFill(format, word, clear);
 	}
+}
+
+// KYTY_WIDE_FILL_CLEAR=2 (default off; GT7 fork 83707d403): DecodeFilledColorClear plus the fill
+// words of more color formats. Zero bits clear any uncompressed single-plane color format; 8- and
+// 16-bit-channel formats whose texel the word repeats (R8, R8G8, R16) and the two- and four-channel
+// 16-bit formats whose texels the word holds; R8G8B8A8 uint. Float channels must be zero or normal
+// numbers (a clear need not keep a NaN payload, an infinity or a denormal; the fill's store would).
+[[nodiscard]] inline bool DecodeFillWord(vk::Format format, uint32_t packed,
+                                         vk::ClearColorValue& clear) {
+	const auto exact_float = [](uint32_t bits) {
+		const auto exponent = (bits >> 23u) & 0xffu;
+		return bits == 0 || (exponent != 0 && exponent != 0xffu);
+	};
+	const auto exact_half = [](uint32_t bits) {
+		const auto exponent = (bits >> 10u) & 0x1fu;
+		return bits == 0 || (exponent != 0 && exponent != 0x1fu);
+	};
+	// Normal (or zero) half bits only: see exact_half.
+	const auto half = [](uint32_t bits) {
+		if ((bits & 0x7fffu) == 0) {
+			return std::bit_cast<float>((bits & 0x8000u) << 16u);
+		}
+		return std::bit_cast<float>(((bits & 0x8000u) << 16u) | ((((bits >> 10u) & 0x1fu) + 112u) << 23u) |
+		                            ((bits & 0x3ffu) << 13u));
+	};
+	const auto unorm = [](uint32_t value, uint32_t bits) {
+		return static_cast<float>(value) / static_cast<float>((1u << bits) - 1u);
+	};
+	const uint32_t low         = packed & 0xffffu;
+	const uint32_t high        = packed >> 16u;
+	const bool     same_bytes  = packed == (packed & 0xffu) * 0x01010101u;
+	const bool     same_halves = low == high;
+	vk::ClearColorValue next {};
+	switch (format) {
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+			if (!exact_float(packed)) return false;
+			return DecodeFilledColorClear(format, packed, clear);
+		case vk::Format::eR16Sfloat:
+			if (!same_halves || !exact_half(low)) return false;
+			next.float32[0] = half(low);
+			break;
+		case vk::Format::eR16G16Sfloat:
+			if (!exact_half(low) || !exact_half(high)) return false;
+			next.float32[0] = half(low);
+			next.float32[1] = half(high);
+			break;
+		case vk::Format::eR16G16B16A16Sfloat:
+			if (!exact_half(low) || !exact_half(high)) return false;
+			next.float32[0] = next.float32[2] = half(low);
+			next.float32[1] = next.float32[3] = half(high);
+			break;
+		case vk::Format::eR8Unorm:
+			if (!same_bytes) return false;
+			next.float32[0] = unorm(packed & 0xffu, 8);
+			break;
+		case vk::Format::eR8Uint:
+			if (!same_bytes) return false;
+			next.uint32[0] = packed & 0xffu;
+			break;
+		case vk::Format::eR8G8Unorm:
+			if (!same_halves) return false;
+			next.float32[0] = unorm(low & 0xffu, 8);
+			next.float32[1] = unorm(low >> 8u, 8);
+			break;
+		case vk::Format::eR8G8Uint:
+			if (!same_halves) return false;
+			next.uint32[0] = low & 0xffu;
+			next.uint32[1] = low >> 8u;
+			break;
+		case vk::Format::eR16Unorm:
+			if (!same_halves) return false;
+			next.float32[0] = unorm(low, 16);
+			break;
+		case vk::Format::eR16Uint:
+			if (!same_halves) return false;
+			next.uint32[0] = low;
+			break;
+		case vk::Format::eR16G16Unorm:
+			next.float32[0] = unorm(low, 16);
+			next.float32[1] = unorm(high, 16);
+			break;
+		case vk::Format::eR16G16Uint:
+			next.uint32[0] = low;
+			next.uint32[1] = high;
+			break;
+		case vk::Format::eR8G8B8A8Uint:
+			for (uint32_t channel = 0; channel < 4; ++channel) {
+				next.uint32[channel] = (packed >> (channel * 8u)) & 0xffu;
+			}
+			break;
+		case vk::Format::eR16G16B16A16Unorm:
+			next.float32[0] = next.float32[2] = unorm(low, 16);
+			next.float32[1] = next.float32[3] = unorm(high, 16);
+			break;
+		default:
+			if (DecodeFilledColorClear(format, packed, clear)) {
+				return true;
+			}
+			// Zero bits are zero in any uncompressed single-plane color format (the core formats
+			// before the depth/stencil and block-compressed ones).
+			if (packed != 0 || static_cast<int32_t>(format) < VK_FORMAT_R4G4_UNORM_PACK8 ||
+			    static_cast<int32_t>(format) > VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) {
+				return false;
+			}
+			break;
+	}
+	clear = next;
+	return true;
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

@@ -12,13 +12,6 @@
 namespace profiler::colors {
 
 inline constexpr uint32_t RedA100        = 0xff8a80;
-inline constexpr uint32_t Blue300        = 0x64b5f6;
-inline constexpr uint32_t CyanA700       = 0x00b8d4;
-inline constexpr uint32_t Green100       = 0xc8e6c9;
-inline constexpr uint32_t Green200       = 0xa5d6a7;
-inline constexpr uint32_t Green300       = 0x81c784;
-inline constexpr uint32_t Green400       = 0x66bb6a;
-inline constexpr uint32_t Amber300       = 0xffd54f;
 inline constexpr uint32_t DeepOrangeA200 = 0xff6e40;
 
 } // namespace profiler::colors
@@ -927,6 +920,8 @@ enum class FrameEvent : uint32_t {
 	EqueueCoalescedDataChanges,
 	// KYTY_DRAW_PREP_HOT: parked (cold) draw-prep workers woken because the unclaimed backlog grew.
 	DrawPrepColdWakes,
+	// KYTY_SERVE_IN_WAITS bit 1: service commands run while the commit thread waited for a held head.
+	DrawPrepServedInWait,
 	// KYTY_RENDER_STATE_FAST (colorRenderTarget.h): prepared vertex inputs copied as their used
 	// prefixes, or in full (a count out of range); draws whose target entries were not
 	// value-initialised first; stage preparations swapped member by member. VerifyChecks/Mismatches:
@@ -1249,6 +1244,14 @@ enum class FrameEvent : uint32_t {
 	VariantPlanSkips,
 	// KYTY_BDA_STORE_LOG: stores a BDA-writing dispatch logged for pages without a cache buffer.
 	BdaLoggedStores,
+	// KYTY_DISCARDED_TARGET_SKIP: new targets not initialized from a discarded target's stale bytes.
+	TextureDiscardedTargetSkips,
+	// KYTY_UNMAP_DRAIN_SKIP: guest unmaps that skipped the full GPU drain (nothing GPU-owned there).
+	UnmapDrainSkips,
+	// KYTY_CLAMP_RANGE_BITMAP: ClampRangeSize answers from the committed-page bitmap.
+	ClampRangeBitmapHits,
+	// KYTY_WRITE_DATA_GPU_RELEASE: GPU-timeline WRITE_DATA bytes taken out of the GPU-written ranges.
+	WriteDataGpuReleased,
 	Count,
 };
 // Counted while aggregate diagnostics are on and a profiler was connected at the last guest flip
@@ -1439,6 +1442,11 @@ void CountFrameWorkShared(FrameWork kind) noexcept;
 // The cumulative count of `kind` the next guest flip would publish (every thread's block plus the
 // shared atomics). Diagnostics and tests.
 [[nodiscard]] uint64_t FrameEventTotal(FrameEvent kind);
+
+// Whether CountFrameEvent counts anything now (callers may skip computing amounts otherwise).
+[[nodiscard]] inline bool FrameEventsOn() noexcept {
+	return Detail::g_event_sink.load(std::memory_order_relaxed) != Detail::CounterSink::Off;
+}
 
 inline void CountFrameEvent(FrameEvent kind, uint64_t amount) {
 	const auto sink = Detail::g_event_sink.load(std::memory_order_relaxed);

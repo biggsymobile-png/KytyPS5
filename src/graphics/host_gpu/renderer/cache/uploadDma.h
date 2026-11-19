@@ -78,7 +78,19 @@ class Buffer;
 // (verify-all plus a 2 ms delayed worker, 0 of 5 instead of 4 of 6) but costs about 4% on Sky
 // Garden (as slow as KYTY_DEFER_PROTECTS=0). =all (diagnostic) does that for every write. KYTY_UPLOAD_DMA_WRITE_DRAIN_LOG=1 logs the
 // first drains and a running count.
+// =frame (chenxiao07/KytyPS5 5c6f80faf, adapted): as =1, and a flip (the frame boundary) also makes
+// every queued host copy first. Once a frame's submissions are consumed the guest may rewrite what
+// that frame's work read (the frame after next, double buffered), and a copy still queued then
+// would take those bytes. A frame's drain costs little: the worker has usually caught up by then.
+// =defer (the "labels after the copies" variant): as =frame, and a label the command processor
+// would write at once (an end-of-pipe or release label it does not defer otherwise) while host
+// copies are queued is written at its tick's completion instead (CommandProcessor::TryDeferLabel,
+// with its interrupt after it). That tick's submission waits for the transfer the worker submits
+// after its host copies, so the guest sees the label only after the copies read their bytes,
+// without the command processor making them (=labels) or waiting.
 [[nodiscard]] bool UploadDmaWriteDrainEnabled();
+// KYTY_UPLOAD_DMA_HELP=1 (default off): a lock-free waiter does a queued batch itself.
+[[nodiscard]] bool UploadDmaHelpEnabled();
 // KYTY_UPLOAD_DMA_LATE_AUDIT=1 (diagnostic, default off): hashes each host copy's guest bytes when
 // it is staged and again just before the worker copies them; a difference is a write that landed
 // in between (from a writer the drain does not order: guest CPU threads, other emulator threads).
@@ -126,7 +138,11 @@ public:
 	// `all`: the write may be observed by the guest (a label), which may then rewrite memory any
 	// queued host copy still reads: makes every queued host copy (KYTY_UPLOAD_DMA_WRITE_DRAIN=labels;
 	// =1 only the overlapping ones; =all every one always). Copies are taken from the worker.
-	bool DrainHostCopies(uint64_t address, uint64_t size, bool all = false);
+	// `frame`: a frame boundary (a flip); =frame then makes every queued host copy.
+	bool DrainHostCopies(uint64_t address, uint64_t size, bool all = false, bool frame = false);
+	// KYTY_UPLOAD_DMA_WRITE_DRAIN=defer, recording thread: host copies are queued that a label
+	// written now could overtake (the label is then written at its tick's completion instead).
+	[[nodiscard]] bool LabelsWaitForHostCopies();
 	struct DrainStats {
 		uint64_t checks = 0; // writes that overlapped the queued host-copy bounds
 		uint64_t waits  = 0; // writes that made (or waited for) queued host copies first
@@ -199,6 +215,9 @@ private:
 
 	[[nodiscard]] std::optional<uint64_t> Allocate(uint64_t size);
 	void                                  Worker(std::stop_token stop);
+	// One batch taken from m_jobs: its deferred protections, host copies and transfer submission
+	// (the worker, or a waiter that helps: KYTY_UPLOAD_DMA_HELP). One at a time (m_processing).
+	void                                  ProcessJobs(std::vector<Job>& jobs);
 	void                                  SubmitBatch(std::vector<Job>& jobs);
 
 	GraphicContext&         m_graphics;
@@ -238,6 +257,8 @@ private:
 	std::vector<Job>        m_jobs;
 	bool                    m_stopping = false;
 	bool                    m_hold     = false; // HoldWorkerForTest
+	// KYTY_UPLOAD_DMA_HELP: a waiter is doing a batch (the worker leaves m_jobs alone meanwhile).
+	bool                    m_processing = false;
 	std::jthread            m_worker; // last: joined before the members it uses go away
 };
 

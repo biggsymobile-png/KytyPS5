@@ -14,6 +14,7 @@
 #include <compare>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -64,6 +65,9 @@ struct ImageBinding {
 	bool             shader_write  = false;
 };
 
+// KYTY_ZERO_NEW_IMAGES=1 (default off): new images start cleared to zero (Image::ZeroFresh).
+[[nodiscard]] bool ZeroNewImagesEnabled() noexcept;
+
 class Image final {
 public:
 	// sparse_first_level > 0 (KYTY_TEXTURE_SPARSE_RESIDENCY, TextureCache::InsertImage): try a sparse
@@ -97,6 +101,11 @@ public:
 	// KYTY_IMAGE_TRANSIT_SKIP_VERIFY=1|exit runs GetBarriers after such a decision and records
 	// what it returns: a barrier there is a mismatch (counted, logged; exit stops). FrameEvents
 	// ImageTransitSkips, ImageTransitVerify{Checks,Mismatches}.
+	// KYTY_ZERO_NEW_IMAGES (ZeroNewImagesEnabled): clears a new image (undefined layout, one
+	// state) to zero through the scheduler's helper sink, before its first use (TextureCache::
+	// InsertImage). Left out: sparse, block-compressed, no transfer-destination usage, no active
+	// recording. Returns whether it cleared.
+	bool ZeroFresh();
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
 	             bool deferrable = false);
@@ -117,10 +126,16 @@ public:
 	void CopyImage(Image& source);
 	// vkCmdCopyImage between a depth aspect and a compatible color format (VK_KHR_maintenance8).
 	void CopyDepthColorImage(Image& source);
+	// As CopyImage, with the stencil aspect too (both images have the same depth/stencil format).
+	// The copy covers the smaller of the two extents (KYTY_DEPTH_GROW_RECREATE).
+	void CopyDepthStencilImage(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	// KYTY_BLOCK_SUBRESOURCE_WRITES: copies an uncompressed single-level image whose texels are
+	// this block-compressed image's blocks at (mip, layer) into that subresource.
+	void CopyBlockMip(Image& source, uint32_t mip, uint32_t layer);
 
 	// Native contents identity. Every recorded write to this image gives it a fresh serial
 	// (Image copy/upload/resolve methods here, TextureCache::MarkImageGpuModified for draws,
@@ -140,6 +155,14 @@ public:
 	// A fresh serial from the same sequence, for ordering other writers against image writes
 	// (BufferCache::InvalidateContentRevisions stamps unbounded buffer writers with it).
 	[[nodiscard]] static uint64_t NextContentSerial() noexcept;
+	// KYTY_STENCIL_PLANE_SYNC (TextureCache::SwapStencilPlane): a NextContentSerial() taken at the
+	// last storage binding or colour clear of this image (not at host-side copies); 0: none.
+	uint64_t shader_write_serial = 0;
+	// KYTY_RAW_READ_IMAGE_SYNC_ONCE (BufferCache::SyncRawReadFromWrittenImage): the content serial,
+	// buffer and range of the last raw read that took this image's contents.
+	uint64_t    raw_sync_serial = 0;
+	uint64_t    raw_sync_size   = 0;
+	const void* raw_sync_buffer = nullptr;
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(live.address, live.size, vaddr, size)) {
@@ -348,6 +371,14 @@ public:
 		return m_cpu_dirty;
 	}
 
+	// KYTY_GUEST_HASH_IMAGES_KB (TextureCache::RefreshByContent): the guest bytes are still what the
+	// last upload took; a maybe-dirty mark (a write next to the image) is dropped.
+	void ClearMaybeCpuDirty() {
+		m_maybe_cpu_dirty  = false;
+		m_maybe_hash_valid = false;
+		NoteImageStateChange();
+	}
+
 	void RefreshComplete() {
 		if (!IsCpuDirty()) {
 			EXIT("clean image cannot complete a refresh\n");
@@ -468,15 +499,51 @@ public:
 	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
+	// Any cause but a recorded GPU buffer write (NoteGpuWriteRange) makes the next refresh whole.
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
 		m_partial_valid   = false;
+		gpu_write.active  = false;
 		NoteImageStateChange();
 	}
 	void ClearBufferModified() noexcept {
 		m_buffer_modified = false;
+		gpu_write.active  = false;
+		gpu_write.ranges.clear();
 		NoteImageStateChange();
 	}
+
+	// KYTY_IMAGE_PARTIAL_GPU_WRITE (TextureCache::InvalidateMemoryFromGPU, UploadGpuWrittenRanges).
+	// While `active`, the image is buffer-modified only by GPU buffer writes over `ranges`, its
+	// native contents elsewhere equal what a whole rebuild would produce there, and the next
+	// refresh rebuilds only the subresources / block rows over those ranges. `serial` is the content
+	// serial at the first write (a native write since makes the refresh whole).
+	struct GpuWriteTrack {
+		KeptRanges::List ranges;
+		uint64_t         serial = 0;
+		bool             active = false;
+	};
+	GpuWriteTrack gpu_write;
+	// Starts the record of a GPU buffer write (after MarkBufferModified, which ends any previous one).
+	void BeginGpuWriteTrack(uint64_t serial) {
+		gpu_write.ranges.clear();
+		gpu_write.serial = serial;
+		gpu_write.active = true;
+	}
+	// The native contents may differ from the guest/buffer/other owners' contents of bytes this
+	// image does not own: true until a refresh or a whole-image GPU write, and again when another
+	// image's GPU write takes some of its bytes (TextureCache::CommitGpuWrite). Partial rebuilds
+	// need it false.
+	bool foreign_since_sync = true;
+	// KYTY_BLOCK_SUBRESOURCE_WRITES: GPU-written uncompressed views (e.g. 64x64 R32G32B32A32_UINT
+	// written as BC6 blocks) of one level and layer of this block-compressed image, copied into
+	// it at its next lookup (TextureCache::ApplyBlockSubwrites).
+	struct BlockSubwrite {
+		ImageId  source;
+		uint32_t mip;
+		uint32_t layer;
+	};
+	std::vector<BlockSubwrite> block_subwrites;
 
 	// Against the registered (resident) guest range; see `live`.
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
@@ -511,6 +578,13 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// KYTY_SPARSE_HOLES (TextureCache::ResetUnmappedDepth): the content serial it last checked.
+	uint64_t         sparse_checked_serial = UINT64_MAX;
+	// KYTY_GUEST_HASH_IMAGES_KB (TextureCache::ChecksGuestContent): the hash of the guest bytes its
+	// last upload took, and the guest submission (SyncEpoch) they were last compared in.
+	uint64_t         content_hash             = 0;
+	uint64_t         content_check_submission = 0;
+	bool             content_hash_valid       = false;
 	// Stencil associations that refer to this depth image (upstream f4692a450).
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
@@ -559,6 +633,11 @@ public:
 	uint64_t         feedback_instance = 0;
 	uint64_t         feedback_serial   = 0;
 	uint64_t         feedback_attached = 0;
+	// Referenced by a bindless table slot (Senaxx): the collector keeps it, and dropping it tells
+	// the table (TextureCache::on_bindless_unregister) to repoint the slot. bindless_self_id is the
+	// image's own id, set when it is pinned (NoteBindlessStateChange).
+	bool             bindless_pinned  = false;
+	Common::SlotId   bindless_self_id {};
 	// Replaces the tracked state without recording a barrier. Only for callers that proved no
 	// access pair of the old and new scopes can conflict (see KYTY_DEPTH_FEEDBACK_KEEP).
 	void AdoptState(vk::PipelineStageFlags2 stage, vk::AccessFlags2 access,
@@ -571,7 +650,7 @@ private:
 	friend struct ImageTestAccess;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
-	void                                      CopyImageRegions(Image& source);
+	void                                      CopyImageRegions(Image& source, bool stencil = false);
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
@@ -600,6 +679,25 @@ private:
 	vk::ImageUsageFlags  m_dropped_usage {};
 	vk::ImageCreateFlags m_dropped_flags {};
 };
+
+// Changes of a bindless-pinned image's state that the per-draw bindless pass checks
+// (RenderExecutor::CommitBindings): its layout and render-target use. A heap is rechecked only
+// when this changed since it was last checked, or for the images resolved since (Senaxx).
+inline std::atomic<uint64_t> g_bindless_state_generation {1};
+// The pinned images whose state changed, for the engine method's per-draw pass (E5), which looks
+// at these and at newly settled images only, instead of every image of a heap.
+struct BindlessStateChanges {
+	std::mutex           mutex;
+	std::vector<ImageId> ids;
+};
+inline BindlessStateChanges g_bindless_state_changes;
+inline void NoteBindlessStateChange(const Image& image) noexcept {
+	if (image.bindless_pinned) {
+		g_bindless_state_generation.fetch_add(1, std::memory_order_relaxed);
+		std::scoped_lock lock {g_bindless_state_changes.mutex};
+		g_bindless_state_changes.ids.push_back(image.bindless_self_id);
+	}
+}
 
 namespace ImageOps {
 

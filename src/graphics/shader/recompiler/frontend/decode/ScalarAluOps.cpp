@@ -58,6 +58,8 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x14u, Opcode::S_FF1_I32_B64},
     {0x15u, Opcode::S_FLBIT_I32_B32},
     {0x16u, Opcode::S_FLBIT_I32_B64},
+    {0x17u, Opcode::S_FLBIT_I32},
+    {0x18u, Opcode::S_FLBIT_I32_I64},
     {0x19u, Opcode::S_SEXT_I32_I8},
     {0x1au, Opcode::S_SEXT_I32_I16},
     {0x1bu, Opcode::S_BITSET0_B32},
@@ -74,6 +76,7 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x29u, Opcode::S_NAND_SAVEEXEC_B64},
     {0x2au, Opcode::S_NOR_SAVEEXEC_B64},
     {0x2bu, Opcode::S_XNOR_SAVEEXEC_B64},
+    {0x2cu, Opcode::S_QUADMASK_B32},
     {0x2du, Opcode::S_QUADMASK_B64},
     {0x34u, Opcode::S_ABS_I32},
     {0x37u, Opcode::S_ANDN1_SAVEEXEC_B64},
@@ -133,6 +136,7 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x18u, Opcode::S_CBRANCH_CDBGUSER},
     {0x19u, Opcode::S_CBRANCH_CDBGSYS_OR_USER},
     {0x1au, Opcode::S_CBRANCH_CDBGSYS_AND_USER},
+    {0x1eu, Opcode::S_ENDPGM}, // s_endpgm_ordered_ps_done
     {0x20u, Opcode::S_INST_PREFETCH},
     {0x21u, Opcode::S_CLAUSE},
     {0x23u, Opcode::S_WAITCNT_DEPCTR},
@@ -321,6 +325,25 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t word   = code[word_index];
 	const uint32_t opcode = (word >> 16u) & 0x7fu;
 	const uint32_t simm   = word & 0xffffu;
+
+	if (opcode == CallStateSoppOpcode) {
+		// The emulator's call-split marker (CallSplit.h): sub-operation in simm[15:12], payload words
+		// in simm[11:0], the payload right after the word.
+		inst.pc               = pc;
+		inst.family           = Family::SOPP;
+		inst.opcode_id        = opcode;
+		inst.opcode           = Opcode::S_KYTY_CALL_STATE;
+		inst.offset           = simm >> 12u;
+		inst.secondary_offset = word_index + 1u;
+		inst.word_count       = 1u + (simm & 0xfffu);
+		inst.raw[0]           = word;
+		EXIT_IF(word_index + inst.word_count > code.size());
+		// The first payload words too (the partition markers read their register there).
+		for (uint32_t i = 1; i < inst.word_count && i < MaxInstructionRawWords; i++) {
+			inst.raw[i] = code[word_index + i];
+		}
+		return;
+	}
 
 	inst.pc              = pc;
 	inst.family          = Family::SOPP;

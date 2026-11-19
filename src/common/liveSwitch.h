@@ -1,4 +1,4 @@
-#ifndef EMULATOR_SRC_COMMON_LIVESWITCH_H_
+﻿#ifndef EMULATOR_SRC_COMMON_LIVESWITCH_H_
 #define EMULATOR_SRC_COMMON_LIVESWITCH_H_
 
 #include <atomic>
@@ -72,6 +72,7 @@ public:
 
 private:
 	friend struct Registry;
+	friend bool ReloadFromEnvironment(const char* name);
 
 	const char*          m_name;
 	Parser               m_parse;
@@ -79,6 +80,11 @@ private:
 	std::atomic<int64_t> m_value {0};
 	Switch*              m_next = nullptr;
 };
+
+// Start-up only (main thread, before the threads that read switches start): re-parses the named
+// switch(es) from the process environment, without the on-change hook. For start-up code that sets
+// variables after the switches registered (KYTY_SMALL_CPU_RULE). False: no such switch.
+bool ReloadFromEnvironment(const char* name);
 
 // Common parsers.
 // 0 only for "0"; unset and anything else: 1 (flags that default on).
@@ -115,6 +121,40 @@ struct GpuTotals {
 	uint64_t cmdbufs    = 0;
 };
 void SetGpuTotalsProvider(GpuTotals (*provider)()) noexcept;
+
+// wholecp measurement: cumulative CP idle buckets in TSC ticks (PrepStats::CpIdle) plus the TSC at the
+// line, so a reader converts with the TSC rate between two lines:
+//   ... cpidle [tsc T, nowork N, empty E, blocked B, fence F, starved S]: ...
+struct CpIdleTotals {
+	uint64_t tsc     = 0;
+	uint64_t nowork  = 0;
+	uint64_t empty   = 0;
+	uint64_t blocked = 0;
+	uint64_t fence   = 0;
+	uint64_t starved = 0;
+};
+void SetCpIdleProvider(CpIdleTotals (*provider)()) noexcept;
+
+// wholecp measurement: extra log lines written right after every application line (argument: the
+// line's live sequence number), e.g. the KYTY_HLE_WAIT_STATS per-thread totals.
+void SetExtraLinesProvider(std::string (*provider)(uint64_t seq)) noexcept;
+// gpuhaz measurement: text appended to every application line after the counts (empty: nothing),
+// e.g. " haz [disp N, ..]" cumulative KYTY_GPU_HAZARD counters.
+void SetLineSuffixProvider(std::string (*provider)()) noexcept;
+
+// jgcp measurement: event counters printed on every application line with KYTY_LIVE_FILE (once any
+// counter is non-zero), so a
+// per-event dose (KYTY_LIVE_TEST_*) converts into a cost per flip:
+//   ... counts [drawidx D, suspend S, submits B]: ...
+// drawidx: indexed draw ops the command processor executed (ExecDrawIndex, the per-draw spin's
+// site); suspend: sceAgcSuspendPoint calls; submits: AGC DCB/command-buffer submit calls.
+enum class TestCounter : uint32_t { DrawIndexOps, SuspendPoints, AgcSubmits, Count };
+// One writer per counter at a time is not required (relaxed add).
+void CountTest(TestCounter counter) noexcept;
+// Single-writer form (the command processor's thread only): no locked instruction.
+void CountTestSingleWriter(TestCounter counter) noexcept;
+// Busy-waits `ns` nanoseconds on the calling thread (doses).
+void TestSpinNs(int64_t ns) noexcept;
 
 namespace Testing {
 // What the live-control thread does with the file's text: parse it and stage the changes.

@@ -5,6 +5,7 @@
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/spinGate.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drawPrep/cpGaps.h"
@@ -100,6 +101,7 @@ std::array<std::atomic<CommandRecorder*>, MaxRecorders> g_recorders {};
 std::array<std::atomic<VkCommandBuffer>, MaxRecorders> g_recording {};
 thread_local bool                                      t_replaying = false;
 std::atomic<uint64_t>                                  g_ownership_faults {0};
+std::atomic<uint64_t>                                  g_recorders_busy_ns {0};
 
 size_t RegisterRecorder(CommandRecorder* recorder) {
 	for (size_t i = 0; i < MaxRecorders; i++) {
@@ -414,7 +416,13 @@ struct CommandRecorder::NativeExecutor {
 	}
 
 	// ---- vk::CommandBuffer forwarding ----
-	void beginRendering(const vk::RenderingInfo& info) { command.beginRendering(info); }
+	void beginRendering(const vk::RenderingInfo& info) {
+		if (DeadViewScrubEnabled()) {
+			// KYTY_DEAD_VIEW_SCRUB: the views may have been destroyed since the call was encoded.
+			ScrubDeadRenderingViews(info, "a recorded rendering");
+		}
+		command.beginRendering(info);
+	}
 	void endRendering() { command.endRendering(); }
 	void pipelineBarrier2(const vk::DependencyInfo& info) { command.pipelineBarrier2(info); }
 	void pipelineBarrier(vk::PipelineStageFlags src, vk::PipelineStageFlags dst,
@@ -466,10 +474,16 @@ struct CommandRecorder::NativeExecutor {
 	// KYTY_RECORDER_DESCRIPTOR_SETS: the CP allocated the set and binds it in a later packet.
 	void updateDescriptorSets(vk::DescriptorSet /*set*/, uint32_t count,
 	                          const vk::WriteDescriptorSet* writes) {
+		if (DeadViewScrubEnabled()) {
+			ScrubDeadDescriptorViews(writes, count, "recorded descriptors");
+		}
 		owner.m_graphics.device.updateDescriptorSets(count, writes, 0, nullptr);
 	}
 	void pushDescriptorSetKHR(vk::PipelineBindPoint point, vk::PipelineLayout layout, uint32_t set,
 	                          uint32_t count, const vk::WriteDescriptorSet* writes) {
+		if (DeadViewScrubEnabled()) {
+			ScrubDeadDescriptorViews(writes, count, "recorded descriptors");
+		}
 		command.pushDescriptorSetKHR(point, layout, set, count, writes);
 	}
 	void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
@@ -587,6 +601,13 @@ struct CommandRecorder::NativeExecutor {
 	                          uint32_t marker) {
 		command.writeBufferMarkerAMD(stage, buffer, offset, marker);
 	}
+	void insertDebugLabel(const char* name) {
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdInsertDebugUtilsLabelEXT != nullptr) {
+			vk::DebugUtilsLabelEXT label {};
+			label.pLabelName = name;
+			command.insertDebugUtilsLabelEXT(label);
+		}
+	}
 	// KYTY_STREAM_COPY_DEFER (BufferCache::ObtainBufferNow): the stream copy the CP reserved.
 	void hostCopy(void* destination, uint64_t source, uint64_t size) {
 		if (!Libs::LibKernel::Memory::TryReadBackingDirect(source, destination, size)) {
@@ -662,6 +683,8 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	                         HangWatchdog::Enabled() ? m_ring.WritePosition() : 0,
 	                         HangWatchdog::Enabled() ? m_ring.Consumed() : 0);
 	const auto start = NowNs();
+	// KYTY_EMIT_SPLIT_COPIES: copies held back by the encoder are part of what the drain waits for.
+	m_encoder.FlushHostCopies();
 	// Idle: the recorder released everything encoded (published or not), so it executed every
 	// packet and records nothing until the next one. The window opens without a marker and
 	// without waking a parked recorder (the consumer's seq_cst release of the position orders its
@@ -672,7 +695,17 @@ void CommandRecorder::Drain(const void* site_key, bool is_site) {
 	} else {
 		const auto end = m_encoder.DrainMarker(++m_drain_serial);
 		if (m_mode == Mode::Thread) {
-			m_ring.WaitConsumed(end, m_drain_policy, m_drain_stats);
+			// KYTY_SPIN_BUDGET (common/spinGate.h): a short spin while the core budget is exceeded.
+			using Common::SpinGate::Site;
+			auto policy    = m_drain_policy;
+			policy.spin_ns = Common::SpinGate::SpinNs(Site::RecorderDrain, m_drain_policy.spin_ns);
+			const auto spin_tsc = m_drain_stats.spin_tsc;
+			const auto blocks   = m_drain_stats.blocks;
+			m_ring.WaitConsumed(end, policy, m_drain_stats);
+			Common::SpinGate::NoteSpin(Site::RecorderDrain, m_drain_stats.spin_tsc - spin_tsc);
+			if (m_drain_stats.blocks != blocks) {
+				Common::SpinGate::NotePark(Site::RecorderDrain);
+			}
 		}
 	}
 	const auto now = NowNs();
@@ -707,8 +740,24 @@ void CommandRecorder::WaitRecorded(uint64_t tick, bool from_producer) {
 		m_ring.Kick(m_encoder.Stats());
 	}
 	const auto start = NowNs();
+	// KYTY_SPIN_BUDGET (common/spinGate.h): a short spin while the core budget is exceeded.
+	using Common::SpinGate::Site;
+	const auto spin_ns  = Common::SpinGate::SpinNs(Site::RecorderDrain, m_drain_policy.spin_ns);
+	struct SpinNote {
+		uint64_t start = Common::SpinGate::Tsc();
+		bool     open  = true;
+		void     End() {
+			if (open) {
+				open = false;
+				Common::SpinGate::NoteSpin(Site::RecorderDrain, Common::SpinGate::Tsc() - start);
+			}
+		}
+		~SpinNote() { End(); }
+	} note;
 	while (m_recorded_tick.load(std::memory_order_acquire) < tick) {
-		if (NowNs() - start >= m_drain_policy.spin_ns) {
+		if (NowNs() - start >= spin_ns) {
+			note.End(); // the spin ends here
+			Common::SpinGate::NotePark(Site::RecorderDrain);
 			m_recorded_waiters.fetch_add(1, std::memory_order_seq_cst);
 			for (;;) {
 				const auto value = m_recorded_tick.load(std::memory_order_seq_cst);
@@ -786,9 +835,15 @@ void CommandRecorder::Run(std::stop_token stop) {
 		}
 		const auto start = NowNs();
 		ConsumeAvailable();
-		m_busy_ns.fetch_add(NowNs() - start, std::memory_order_release);
+		const auto busy = NowNs() - start;
+		m_busy_ns.fetch_add(busy, std::memory_order_release);
+		g_recorders_busy_ns.fetch_add(busy, std::memory_order_relaxed);
 	}
 	ConsumeAvailable();
+}
+
+uint64_t CommandRecorder::TotalBusyNs() noexcept {
+	return g_recorders_busy_ns.load(std::memory_order_relaxed);
 }
 
 uint64_t CommandRecorder::OwnershipFaults() noexcept {

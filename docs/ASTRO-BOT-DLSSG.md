@@ -12,7 +12,9 @@ that adds frame generation and modern upscaling to **ASTRO BOT (PPSA21564 / PPSA
 | **AMD FSR 3.1 upscaling** | replaces the game's TAA | any Vulkan GPU | Windows, Linux, macOS |
 | **Built-in render resolution** | 540p / 720p / 1080p / 1368p / 1872p / 2160p, no patch file needed | any | all |
 
-Everything else is Jetsku's U59 int21 release (24 October 2026).
+Everything else is Jetsku's U59 int22 release (18 November 2026). **From this build the Windows
+emulator needs a CPU with AVX2, BMI2 and FMA** (Intel Core 4th generation, AMD Ryzen, or newer), as
+Jetsku's int22 does; on an older CPU it says so and exits.
 
 All of this only switches on where it finds Astro Bot's or Playroom's inputs (depth, motion vectors
 and camera); in other games it stays off. With the `streamline` folder present Streamline still sits
@@ -272,7 +274,7 @@ generation are**: there they are built into the emulator from AMD's FidelityFX S
 (no extra file), so **Upscaling: AMD FSR** and **Frame generation: 2x (AMD FSR 3.1)** in the
 launcher, or `"KYTY_FSR": "1",` and `"KYTY_FRAMEGEN_BACKEND": "fsr",` in `u59-preset.json`, work on
 any Vulkan GPU (frame generation: see above, Vblank frequency at twice the game's frame rate). The built-in **render resolution**, the **shader maths profile** and everything else
-from Jetsku's int21 are in them too. The macOS build is new and untested by us: please report
+from Jetsku's int22 are in them too. The macOS build is new and untested by us: please report
 whether it works (and the console's `FSR upscaling:` and `Frame generation:` lines if it does not).
 
 23y: **Linux with AMD (RADV, Mesa 26.3):** a crash while drawing (in `vkCmdDraw`) with recent Mesa
@@ -289,8 +291,9 @@ Batocera: run the community `install_ps5_kyty.sh` with this release's Linux file
 
 ## Settings window on small or scaled screens
 
-Since 23w the settings windows (Global settings and each game's settings) scroll, and open no
-larger than the screen's free area, Windows display scaling included. Before, Global settings
+The settings windows (Global settings and each game's settings) scroll, and open no larger than
+the screen's free area, Windows display scaling included (from 25a this is int22's own version of
+the fix this fork made in 23w). Before, Global settings
 could not be made shorter than everything on its General tab, so on a 1080p screen at 125%
 scaling Save and Cancel were below the bottom of the screen (issue #6). The window can be
 resized freely; it remembers the size you leave it at.
@@ -304,16 +307,31 @@ shared file; a folder the launcher cannot write to (e.g. Program Files) does too
 
 ## Known issues
 
-- **Build 24a (test): the final space section, and a log to find it.** After the last world, the
-  on-rails space shooter expects the game's own 60 fps timing. **Below a Vblank frequency of 60**
-  (for example 40), with the built-in Decouple or the patch file's Decouple mod, your shots
-  explode just in front of the ship instead of reaching their targets. For now press the
-  **Decouple on/off key (F10)** when the section starts and again when it ends, or play it at
-  Vblank 60 (the section then runs more slowly below 60 fps without Decouple; that is expected).
-  The aim is to have the emulator do this by itself: raise the Vblank to 60 and switch Decouple
-  off for that section only, then restore both. To find a reliable sign that the section has
-  started, this build adds a temporary log, `KYTY_SECTION_LOG` (see Reporting problems). It will be
-  removed again once the fix is in.
+- **New in this build (25a): Jetsku's int22.** This build is now based on Jetsku's U59 int22 (faster
+  Astro Bot and Playroom, shader lists for **Precompile** in the game list, one preset per game, the
+  latest upstream KytyPS5 changes; see Jetsku's int22 notes) with all of this fork's features on
+  top. Things to know:
+  - **Two different "DLSS"**: int22 brings upstream's **DLSS folder** setting, which only replaces
+    PSSR in **PS5 Pro mode** (other games, with a DLSS model you supply). It does nothing for Astro
+    Bot or Playroom. This fork's DLSS frame generation and DLSS/FSR upscaling are the **Frame
+    generation** and **Upscaling** settings, as before.
+  - **Two relaxed-maths options**: **Relaxed shader maths (faster)** is this fork's
+    `KYTY_FLOAT_PROFILE` (see Shader maths profile); **Relaxed shader float math** is upstream's
+    `KYTY_RELAXED_FLOAT`, a separate switch. Use one or the other, not both, when you compare.
+  - **Smooth frame pacing** (this fork, all present modes) and int22's per-game **smooth frametime
+    fix** (Immediate only) both turn on the absolute vblank timeline.
+  - **NVIDIA Smooth Motion / CUDA:** int22 finds a working address for CUDA's early start by itself
+    (it replaces this fork's fixed 512 GiB floor from PR #58). If DLSS frame generation or Smooth
+    Motion stopped working for you in this build, please report the console's `CUDA:` lines.
+  - The temporary `KYTY_SECTION_LOG` of the unpublished 24a test build is not in this build.
+  - Not tested by us on Linux or macOS yet; Jetsku also lists int22's Linux build as untested.
+
+- **The final space section: shots explode just in front of you below Vblank 60.** After the last
+  world, the on-rails space shooter expects the game's own 60 fps timing. **Below a Vblank frequency
+  of 60** (for example 40), with the built-in Decouple or the patch file's Decouple mod, your shots
+  explode just in front of the ship instead of reaching their targets. Press the **Decouple on/off
+  key (F10)** when the section starts and again when it ends, or play it at Vblank 60 (the section
+  then runs more slowly below 60 fps without Decouple; that is expected).
 
 - **Build 23z (test): fewer freezes when one GPU queue waits for another** (`KYTY_LABEL_HANDOFF`, on
   by default; `KYTY_LABEL_HANDOFF=0` turns it off). The emulator runs the game's graphics and
@@ -474,15 +492,6 @@ off by default:
 
 For a fair comparison play the same stretch the same way in each build (for example the first
 two minutes of Sky Garden from the level start), with the same settings, and send both files.
-
-**Finding the space section (24a, temporary).** If you can reach the final space section, set
-`KYTY_SECTION_LOG=section.csv` and play from a little before the blast-off until about a minute
-into the shooter, **pressing F10 once as the shooting starts** (that puts a `mark` line in the log at
-the right moment) and once more just before you stop. Then close the emulator and send
-`section.csv`. It has one line for each thing the game uses for the first time in that session
-(`t_ms,flip,event,detail`): `open` and `apr` (files, as paths inside the game's folder only, no
-folders of yours), `gfx` and `cs` (new shaders, by hash) and `mark` (the F10 presses). It costs
-nothing when it is not set.
 
 **Optional experiments (23z, off by default).** If you have time, run the same stretch once more
 with one of these set, and send the logs with the plain run:

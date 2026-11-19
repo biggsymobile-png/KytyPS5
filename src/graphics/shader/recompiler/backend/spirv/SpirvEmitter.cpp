@@ -12,10 +12,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <span>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -31,13 +36,19 @@ enum HostFloatControlBits : uint32_t {
 std::atomic_uint32_t g_host_float_controls {0};
 std::atomic_bool     g_storage_dword_loads_return_zero {false};
 std::atomic_bool     g_uniform_dword_loads_return_zero {false};
+std::atomic_bool     g_buffer_pair_atomics {false};
 std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint8_t  g_compute_derivatives {static_cast<uint8_t>(HostComputeDerivatives::Khr)};
+std::atomic_bool     g_fragment_interlock {false};
+std::atomic_bool     g_compute_derivatives_linear {false};
 std::atomic_uint8_t  g_shader_clock_scope {0};
 std::atomic_int32_t  g_shader_clock_shift {0};
+std::atomic_uint32_t g_shader_clock_divisor {1};
 std::atomic_bool     g_guard_vertex_outputs {false};
 std::atomic_bool     g_guard_mesh_outputs {false};
 std::atomic_uint8_t  g_wave_clusters {0}; // HostWaveClusters: bit 0 vertex, 1 pixel, 2 mesh
+// KYTY_LDS_SLOTS verdicts of programs with function-scope LDS: 0 slots, 1 array kept.
+std::array<std::atomic<uint64_t>, 2> g_lds_slot_verdicts {};
 
 [[noreturn]] void Fail(const IR::Program& program, const char* reason) {
 	EXIT("SPIR-V validation failed: hash=0x%016" PRIx64 " stage=%u reason=%s\n",
@@ -109,7 +120,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
+		     return image.indirect_search_iterations != 0u || image.bindless;
 	     });
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
@@ -140,11 +151,16 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 	const auto user_data_dwords = program.bindings.user_data_registers.size();
 	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+	const bool has_call_state       = program.bindings.call_state_dword != IR::PushData::NoStart;
+	const auto call_state_start     = user_data_dwords + (has_dispatch_threads ? 3u : 0u);
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
-	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
+	    (has_call_state && (program.stage != ShaderType::Compute ||
+	                        program.bindings.call_state_dword != call_state_start)) ||
+	    program.bindings.memory_offset_dword !=
+	        call_state_start + (has_call_state ? IR::BindingLayout::CallStateDwords : 0u) ||
 	    program.bindings.memory_offset_count != program.info.buffers.size() ||
 	    program.bindings.mip_stats_count != (mip_stats ? program.info.images.size() : 0u) ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
@@ -309,6 +325,12 @@ void NoteClusteredProgram(const IR::Program& program) {
 
 } // namespace
 
+uint64_t LdsSlotVerdicts(uint32_t verdict) {
+	return verdict < g_lds_slot_verdicts.size()
+	           ? g_lds_slot_verdicts[verdict].load(std::memory_order_relaxed)
+	           : 0u;
+}
+
 Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
 	SpirvRequirements requirements {};
 	for (const auto* block: program.blocks) {
@@ -316,6 +338,20 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			requirements.float64 |= inst.GetType() == IR::Type::F64;
 			// KYTY_DCACHE_INV: an invalidation makes every buffer the program reads coherent.
 			requirements.coherent_buffers |= inst.GetOpcode() == IR::ValueOpcode::DataCacheInvalidate;
+			requirements.coherent_dcache |= inst.GetOpcode() == IR::ValueOpcode::DataCacheInvalidate;
+			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::HalfPkAdd:
+				case IR::ValueOpcode::HalfPkMul:
+				case IR::ValueOpcode::HalfPkMin:
+				case IR::ValueOpcode::HalfPkMax:
+				case IR::ValueOpcode::HalfPkFma: requirements.native_half = true; break;
+				default: break;
+			}
+			{
+				const auto image_access = IR::ImageOpcodeInfoOf(inst.GetOpcode()).access;
+				requirements.image_writes |=
+				    image_access == IR::ImageAccess::Write || image_access == IR::ImageAccess::Atomic;
+			}
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
 			    inst.GetType() == IR::Type::U64) {
 				requirements.buffer_int64_atomics = true;
@@ -359,6 +395,14 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				    inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer) {
 					requirements.subgroup_local_invocation_id = true;
 				}
+				// KYTY_BUFFER_PAIR_ATOMIC: a DWORDX2 pair through a bound V# reads or writes the u64
+				// view of the buffer atomically.
+				if (memory.kind == IR::ResourceKind::Buffer &&
+				    GetCodegenOptions().buffer_pair_atomic && GetHostBufferPairAtomics() &&
+				    BufferPairAtomicProgram(program.shader_hash) &&
+				    memory.IsCoherentBufferPair(inst.GetOpcode())) {
+					requirements.buffer_int64_atomics = true;
+				}
 				if (memory.kind == IR::ResourceKind::Buffer) {
 					requirements.coherent_buffers |= memory.coherent;
 					if (memory.resource >= program.info.buffers.size()) {
@@ -367,6 +411,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					const auto bits = StorageBufferElementBits(program, memory);
 					requirements.buffer_u8 |= bits == 8u;
 					requirements.buffer_u16 |= bits == 16u;
+					requirements.coherent_narrow |= memory.coherent && bits != 32u;
 					// ADD_TID adds the lane's id within its wave to the index. BufferLane takes it from
 					// EmitSubgroupLocalInvocationId, the lane id every cross-lane op of the stage uses
 					// (wave64 halves, wave32 clusters). A wave64 vertex or pixel shader on a 32-wide
@@ -402,6 +447,38 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
 				    kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
+					if (GetCodegenOptions().lds_slots && !requirements.lds_slots_blocked) {
+						if (const auto key = StaticLdsSlot(program, inst); key.has_value()) {
+							auto&      keys = requirements.lds_slot_keys;
+							const auto at   = std::lower_bound(keys.begin(), keys.end(), *key);
+							if (at == keys.end() || *at != *key) {
+								keys.insert(at, *key);
+							}
+						} else {
+							requirements.lds_slots_blocked = true;
+							static const bool log = [] {
+								const auto* value = std::getenv("KYTY_LDS_SLOTS_LOG");
+								return value != nullptr && value[0] == '1';
+							}();
+							if (log) {
+								// The first access that is not an own-lane dword: its opcode and
+								// its address' defining opcode (two levels).
+								const auto  address = inst.Arg(0).Resolve();
+								const auto* def     = address.TryInstruction();
+								std::string chain   = def == nullptr ? "immediate/arg" : "";
+								for (int depth = 0; def != nullptr && depth < 3; depth++) {
+									chain += std::string(depth ? " <- " : "") +
+									         std::string(IR::ValueOpcodeName(def->GetOpcode()));
+									const auto next = def->NumArgs() > 0 ? def->Arg(0).Resolve() : IR::Value {};
+									def = next.IsEmpty() ? nullptr : next.TryInstruction();
+								}
+								std::printf("LDS slots: 0x%016" PRIx64 " blocked by %s at %s\n",
+								            program.shader_hash,
+								            std::string(IR::ValueOpcodeName(inst.GetOpcode())).c_str(),
+								            chain.c_str());
+							}
+						}
+					}
 				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
@@ -471,6 +548,21 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					}
 					break;
 				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
+				case IR::ValueOpcode::ImageSampleRaw: {
+					// KYTY_IMPLICIT_LOD_STAGES: an implicit-LOD sample of a compute shader takes its
+					// LOD from lane-quad derivatives (ComputeImplicitLod decides per module).
+					if (!GetCodegenOptions().implicit_lod_stages ||
+					    program.stage != ShaderType::Compute) {
+						break;
+					}
+					const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
+					if (memory_index >= program.memory_info.size()) break;
+					const auto flags = program.memory_info[memory_index].image_sample_flags;
+					requirements.implicit_compute_lod |=
+					    (flags & (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagLod |
+					              Decoder::ImageSampleFlagLevelZero)) == 0u;
+					break;
+				}
 				case IR::ValueOpcode::ImageGatherRaw:
 					requirements.image_gather_extended = true;
 					break;
@@ -530,6 +622,92 @@ HostBufferRobustness GetHostBufferRobustness() {
 	            g_uniform_dword_loads_return_zero.load(std::memory_order_relaxed)};
 }
 
+bool SrtUniformEnabled() {
+	return GetCodegenOptions().srt_uniform &&
+	       g_uniform_dword_loads_return_zero.load(std::memory_order_relaxed);
+}
+
+void SetHostBufferPairAtomics(bool supported) {
+	g_buffer_pair_atomics.store(supported, std::memory_order_relaxed);
+}
+
+bool GetHostBufferPairAtomics() {
+	return g_buffer_pair_atomics.load(std::memory_order_relaxed);
+}
+
+static std::atomic<bool> g_mesh_layer_drop {false};
+void SetHostMeshLayerDrop(bool drop) {
+	g_mesh_layer_drop.store(drop, std::memory_order_relaxed);
+}
+bool GetHostMeshLayerDrop() {
+	return g_mesh_layer_drop.load(std::memory_order_relaxed);
+}
+
+static std::atomic<bool> g_coherent_load_vendor_barrier {false};
+void SetCoherentLoadVendorDefault(bool barrier) {
+	g_coherent_load_vendor_barrier.store(barrier, std::memory_order_relaxed);
+}
+
+CoherentLoadMode GetCoherentLoadMode() {
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_COHERENT_LOAD_MODE");
+		if (value == nullptr) return -1;
+		const std::string_view mode(value);
+		if (mode == "barrier") return static_cast<int>(CoherentLoadMode::Barrier);
+		if (mode == "acquire") return static_cast<int>(CoherentLoadMode::Acquire);
+		if (mode == "relaxed") return static_cast<int>(CoherentLoadMode::Relaxed);
+		if (mode == "plain" || mode == "off") return static_cast<int>(CoherentLoadMode::Plain);
+		return -1;
+	}();
+	if (forced >= 0) {
+		return static_cast<CoherentLoadMode>(forced);
+	}
+	static const int acquire = [] {
+		const char* value = std::getenv("KYTY_COHERENT_LOAD_ACQUIRE");
+		if (value == nullptr) return 0;
+		const std::string_view setting(value);
+		return setting == "1" ? 1 : setting == "auto" ? 2 : 0;
+	}();
+	const bool barrier =
+	    acquire == 1 || (acquire == 2 && g_coherent_load_vendor_barrier.load(std::memory_order_relaxed));
+	return barrier ? CoherentLoadMode::Barrier : CoherentLoadMode::Plain;
+}
+
+const char* CoherentLoadModeName(CoherentLoadMode mode) {
+	switch (mode) {
+		case CoherentLoadMode::Plain: return "plain";
+		case CoherentLoadMode::Barrier: return "barrier";
+		case CoherentLoadMode::Acquire: return "acquire";
+		case CoherentLoadMode::Relaxed: return "relaxed";
+	}
+	return "?";
+}
+
+static std::atomic<uint64_t> g_indirect_format_count_address {0};
+void SetIndirectFormatCountAddress(uint64_t address) {
+	g_indirect_format_count_address.store(address, std::memory_order_release);
+}
+uint64_t IndirectFormatCountAddress() {
+	return g_indirect_format_count_address.load(std::memory_order_acquire);
+}
+
+bool Emitter::BufferPairAtomicProgram(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		const char*           text = std::getenv("KYTY_BUFFER_PAIR_ATOMIC_HASHES");
+		while (text != nullptr && *text != '\0') {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
+			if (end == text) break;
+			list.push_back(value);
+			if (*end != ',') break;
+			text = end + 1;
+		}
+		return list;
+	}();
+	return hashes.empty() || std::find(hashes.begin(), hashes.end(), shader_hash) != hashes.end();
+}
+
 void SetHostImageFeatures(const HostImageFeatures& features) {
 	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
 	g_compute_derivatives.store(static_cast<uint8_t>(features.compute_derivatives),
@@ -540,6 +718,22 @@ HostImageFeatures GetHostImageFeatures() {
 	return {.min_lod             = g_image_min_lod.load(std::memory_order_relaxed),
 	        .compute_derivatives = static_cast<HostComputeDerivatives>(
 	            g_compute_derivatives.load(std::memory_order_relaxed))};
+}
+
+void SetHostFragmentInterlock(bool supported) {
+	g_fragment_interlock.store(supported, std::memory_order_relaxed);
+}
+
+bool GetHostFragmentInterlock() {
+	return g_fragment_interlock.load(std::memory_order_relaxed);
+}
+
+void SetHostComputeDerivativesLinear(bool supported) {
+	g_compute_derivatives_linear.store(supported, std::memory_order_relaxed);
+}
+
+bool GetHostComputeDerivativesLinear() {
+	return g_compute_derivatives_linear.load(std::memory_order_relaxed);
 }
 
 void SetHostGeometryGuard(const HostGeometryGuard& guard) {
@@ -555,11 +749,13 @@ HostGeometryGuard GetHostGeometryGuard() {
 void SetHostShaderClock(const HostShaderClock& clock) {
 	g_shader_clock_scope.store(static_cast<uint8_t>(clock.scope), std::memory_order_relaxed);
 	g_shader_clock_shift.store(std::clamp(clock.shift, -8, 8), std::memory_order_relaxed);
+	g_shader_clock_divisor.store(std::clamp(clock.divisor, 1u, 1024u), std::memory_order_relaxed);
 }
 
 HostShaderClock GetHostShaderClock() {
 	return {.scope = static_cast<HostClockScope>(g_shader_clock_scope.load(std::memory_order_relaxed)),
-	        .shift = g_shader_clock_shift.load(std::memory_order_relaxed)};
+	        .shift   = g_shader_clock_shift.load(std::memory_order_relaxed),
+	        .divisor = g_shader_clock_divisor.load(std::memory_order_relaxed)};
 }
 
 void SetHostWaveClusters(const HostWaveClusters& clusters) {
@@ -607,16 +803,67 @@ int32_t RealtimeClockShift(double timestamp_period_ns) {
 	return shift;
 }
 
+// KYTY_HUGE_HELPER_OUTLINE (CodegenOptions::huge_helper_outline): in a module of at least
+// HugeHelperWords words that already calls DontInline helpers, each of `helpers` with at least
+// HugeHelperCalls call sites gets the DontInline function control (the NVIDIA compiler spent 10-35 s
+// inlining them at every site). Only the function control word changes.
+void OutlineHugeModuleHelpers(std::vector<uint32_t>& words, std::span<const uint32_t> helpers) {
+	constexpr size_t   HugeHelperWords = 100'000;
+	constexpr uint32_t HugeHelperCalls = 16;
+	if (words.size() < HugeHelperWords) {
+		return;
+	}
+	std::array<uint32_t, 4> calls {};
+	EXIT_IF(helpers.size() > calls.size());
+	for (size_t i = 5; i < words.size();) {
+		const uint32_t op    = words[i] & 0xffffu;
+		const uint32_t count = words[i] >> 16u;
+		if (count == 0u || i + count > words.size()) {
+			return; // malformed: leave the module as it is
+		}
+		if (op == spv::OpFunctionCall && count >= 4u) {
+			for (size_t h = 0; h < helpers.size(); h++) {
+				calls[h] += helpers[h] != 0u && words[i + 3] == helpers[h] ? 1u : 0u;
+			}
+		}
+		i += count;
+	}
+	for (size_t i = 5; i < words.size();) {
+		const uint32_t op    = words[i] & 0xffffu;
+		const uint32_t count = words[i] >> 16u;
+		if (op == spv::OpFunction && count >= 5u) {
+			for (size_t h = 0; h < helpers.size(); h++) {
+				if (helpers[h] != 0u && words[i + 2] == helpers[h] && calls[h] >= HugeHelperCalls) {
+					words[i + 3] = (words[i + 3] & ~static_cast<uint32_t>(spv::FunctionControlInlineMask)) |
+					               spv::FunctionControlDontInlineMask;
+				}
+			}
+		}
+		i += count;
+	}
+}
+
+HostShaderClock RealtimeClockScale(double timestamp_period_ns, bool exact) {
+	HostShaderClock clock {};
+	clock.shift = RealtimeClockShift(timestamp_period_ns);
+	if (!exact || clock.shift <= 0 || timestamp_period_ns <= 0.0) {
+		return clock;
+	}
+	const auto period_ps = static_cast<uint32_t>(std::lround(timestamp_period_ns * 1000.0));
+	const auto divisor   = RealtimeClockDivisor(period_ps);
+	if (std::has_single_bit(divisor)) {
+		clock.shift = std::countr_zero(divisor);
+	} else {
+		clock.shift   = 0;
+		clock.divisor = divisor;
+	}
+	return clock;
+}
+
 std::vector<uint32_t> EmitProgram(const IR::Program& program,
                                   ShaderStageInputInfo input_info, bool mip_stats_records) {
 	using namespace Emitter;
 
-	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
-	    program.stage != ShaderType::Pixel && program.stage != ShaderType::Mesh &&
-	    program.stage != ShaderType::Local && program.stage != ShaderType::TessellationControl &&
-	    program.stage != ShaderType::TessellationEvaluation) {
-		Fail(program, "binary SPIR-V emitter received an unsupported shader stage");
-	}
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
 	    !program.shader_info_complete || !program.binding_layout_complete) {
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
@@ -672,6 +919,31 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 			}
 		}
 	}
+	// KYTY_LDS_SLOTS: one guest lane per invocation, every LDS access an own-lane dword (each key
+	// k reaches element LaneId + k of this invocation's array, so distinct keys never alias), and
+	// every lane's element in bounds (LaneId < wave_size), as the array's bounds check would allow.
+	if (state.requirements.function_lds && GetCodegenOptions().lds_slots) {
+		const auto& keys = state.requirements.lds_slot_keys; // sorted (AnalyzeProgramRequirements)
+		const uint64_t lanes = std::max<uint32_t>(program.wave_size, 1u);
+		state.lds_slot_plan  = state.lane_count == 1 && !state.requirements.lds_slots_blocked &&
+		                      !keys.empty() && keys.size() <= 64u &&
+		                      static_cast<uint64_t>(keys.back()) + lanes <= LdsDwordCount(state);
+		g_lds_slot_verdicts[state.lds_slot_plan ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+		static const bool log = [] {
+			const auto* value = std::getenv("KYTY_LDS_SLOTS_LOG");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (log) {
+			std::printf("LDS slots: stage %u 0x%016" PRIx64 ": %s (%u-dword function array, %zu "
+			            "offset(s)%s, lanes/invocation %u)\n",
+			            static_cast<unsigned>(program.stage), program.shader_hash,
+			            state.lds_slot_plan ? "slots in variables" : "array kept",
+			            LdsDwordCount(state), keys.size(),
+			            state.requirements.lds_slots_blocked ? ", an access is not an own-lane dword"
+			                                                 : "",
+			            state.lane_count);
+		}
+	}
 	state.wave_clusters = state.lane_count == 1 && WaveClustersActive(program);
 	if (state.wave_clusters && program.stage != ShaderType::Compute) {
 		NoteClusteredProgram(program);
@@ -679,12 +951,21 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	if (program.stage != ShaderType::Compute) {
 		NoteGraphicsAddTid(program, state.lane_count, state.wave_clusters);
 	}
+	if (program.stage == ShaderType::Mesh) {
+		state.mesh_passes = std::max(input_info.vertex->mesh.passes, 1u);
+	}
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 
-	return state.builder.Build();
+	auto words = state.builder.Build();
+	if (GetCodegenOptions().huge_helper_outline && !state.indirect_raw_functions.empty()) {
+		const std::array<uint32_t, 2> helpers {state.indirect_format_compact_function,
+		                                       state.bda_pointer_function};
+		OutlineHugeModuleHelpers(words, helpers);
+	}
+	return words;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

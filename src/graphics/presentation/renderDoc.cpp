@@ -4,21 +4,19 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <vector>
 #include <cstdio>
 #include <filesystem>
 #include <renderdoc_app.h>
 #include <string>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #else
 #include <dlfcn.h>
 #endif
@@ -162,17 +160,66 @@ static void StartCapture() {
 	CaptureStatus("capture started");
 }
 
+// KYTY_RENDERDOC_CAPTURE_FLIPS=<n>[,<n>...] (default none): request a capture at these guest flip
+// counts, as F1 would, for unattended runs.
+static void AutoCaptureOnFlip() {
+	static const std::vector<uint64_t> flips = [] {
+		std::vector<uint64_t> list;
+		const auto* value = std::getenv("KYTY_RENDERDOC_CAPTURE_FLIPS");
+		for (const char* p = value; p != nullptr && *p != '\0';) {
+			char* end = nullptr;
+			const auto n = std::strtoull(p, &end, 0);
+			if (end == p) break;
+			list.push_back(n);
+			p = *end == ',' ? end + 1 : end;
+		}
+		return list;
+	}();
+	// KYTY_RENDERDOC_CAPTURE_FILE=<path> (default unset): every 8th guest flip the file is checked;
+	// when it exists it is deleted and a capture is requested, so a test runner can capture at an
+	// event (a KYTY_EVENT line) instead of a guessed flip number.
+	static const char* trigger = [] {
+		const auto* value = std::getenv("KYTY_RENDERDOC_CAPTURE_FILE");
+		return value != nullptr && *value != '\0' ? value : nullptr;
+	}();
+	static uint64_t flip = 0;
+	++flip;
+	if (trigger != nullptr && (flip % 8u) == 0u) {
+		std::error_code error;
+		if (std::filesystem::exists(trigger, error) && std::filesystem::remove(trigger, error)) {
+			std::printf("RenderDoc: capture requested by KYTY_RENDERDOC_CAPTURE_FILE at guest flip %llu\n",
+			            static_cast<unsigned long long>(flip));
+			RenderDocRequestCapture();
+		}
+	}
+	if (flips.empty()) return;
+	for (const auto n: flips) {
+		if (n == flip) {
+			std::printf("RenderDoc: automatic capture at guest flip %llu (KYTY_RENDERDOC_CAPTURE_FLIPS)\n",
+			            static_cast<unsigned long long>(flip));
+			RenderDocRequestCapture();
+		}
+	}
+}
+
 void RenderDocOnGuestFlip(RenderContext& renderer) {
+	AutoCaptureOnFlip();
 	const auto state = g_state.load(std::memory_order_acquire);
-	if (g_api == nullptr || state == RenderDocState::Idle) {
+	if (state == RenderDocState::Idle) {
 		return;
 	}
 	if (state == RenderDocState::Capturing) {
 		// LOGF does not evaluate its arguments when printf output is Silent.
+		// KYTY_RENDERDOC_CAPTURE_LENGTH=<n> (default 2, diagnostic): guest flips per capture.
+		static const uint32_t length = [] {
+			const auto* value = std::getenv("KYTY_RENDERDOC_CAPTURE_LENGTH");
+			const auto  n     = value != nullptr ? std::strtoul(value, nullptr, 10) : 2ul;
+			return static_cast<uint32_t>(std::clamp(n, 1ul, 64ul));
+		}();
 		++g_captured_flips;
-		std::printf("RenderDoc: captured guest flip %u/2\n", g_captured_flips);
+		std::printf("RenderDoc: captured guest flip %u/%u\n", g_captured_flips, length);
 		std::fflush(stdout);
-		if (g_captured_flips < 2) {
+		if (g_captured_flips < length) {
 			return;
 		}
 	}

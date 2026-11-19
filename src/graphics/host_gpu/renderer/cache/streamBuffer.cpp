@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/ramStats.h"
@@ -63,6 +64,14 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 }
 
 } // namespace
+
+uint64_t HostBufferBytes() {
+	static const uint64_t bytes = []() -> uint64_t {
+		const char* value = std::getenv("KYTY_HOST_BUFFER_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0}) << 20u;
+	}();
+	return bytes;
+}
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
@@ -132,6 +141,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		                                VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 		allocation_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 	}
+	// KYTY_HOST_BUFFER_MB (default 0 = off; adapted from Senaxx/wolverine 75dea37fd): device-local
+	// buffers of at least this many MiB are placed in system memory, which the GPU reads over PCIe.
+	// A title's whole-heap mirror (one 2.7 GB buffer) otherwise takes a quarter of a 12 GB card;
+	// with the desktop's share on top the card fills and the machine stalls.
+	const bool in_host = usage == MemoryUsage::DeviceLocal && !host_cached &&
+	                     HostBufferBytes() != 0 && size >= HostBufferBytes();
+	if (in_host) {
+		allocation_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocation_info.preferredFlags = 0;
+	}
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
@@ -169,6 +188,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
+	if (in_host) {
+		static std::atomic<uint32_t> placed {0};
+		if (placed.fetch_add(1, std::memory_order_relaxed) < 16) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Kyty VRAM: a {} MB buffer at guest 0x{:x} placed in system memory (KYTY_HOST_BUFFER_MB)\n",
+			    size >> 20u, cpu_address));
+		}
+	}
 	m_buffer = native_buffer;
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};
@@ -201,7 +228,78 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, void* host_pointer, uint64_t size,
+               ImportHostTag)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::Stream), m_cpu_address(0),
+      m_size(size) {
+	if (!graphics.external_memory_host_enabled || host_pointer == nullptr || size == 0) {
+		return;
+	}
+	const auto handle_type = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = handle_type;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext = &external;
+	buffer_info.size  = size;
+	buffer_info.usage = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	vk::Buffer buffer = nullptr;
+	if (graphics.device.createBuffer(&buffer_info, nullptr, &buffer) != vk::Result::eSuccess) {
+		return;
+	}
+	vk::MemoryHostPointerPropertiesEXT pointer_properties {};
+	vk::MemoryRequirements             requirements {};
+	graphics.device.getBufferMemoryRequirements(buffer, &requirements);
+	uint32_t type = UINT32_MAX;
+	if (graphics.device.getMemoryHostPointerPropertiesEXT(handle_type, host_pointer, &pointer_properties) ==
+	    vk::Result::eSuccess) {
+		const auto memory    = graphics.physical_device.getMemoryProperties();
+		const auto candidate = pointer_properties.memoryTypeBits & requirements.memoryTypeBits;
+		// Prefer host-coherent memory (the probe's choice on NVIDIA: HOST_VISIBLE | HOST_COHERENT).
+		for (uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; i++) {
+			if ((candidate & (1u << i)) != 0 &&
+			    (memory.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+				type = i;
+			}
+		}
+		for (uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; i++) {
+			if ((candidate & (1u << i)) != 0) {
+				type = i;
+			}
+		}
+	}
+	vk::ImportMemoryHostPointerInfoEXT import_info {};
+	import_info.handleType   = handle_type;
+	import_info.pHostPointer = host_pointer;
+	vk::MemoryAllocateFlagsInfo flags {};
+	flags.pNext = &import_info;
+	flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	vk::MemoryAllocateInfo allocate {};
+	allocate.pNext           = &flags;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = type;
+	vk::DeviceMemory memory = nullptr;
+	if (type == UINT32_MAX || graphics.device.allocateMemory(&allocate, nullptr, &memory) != vk::Result::eSuccess ||
+	    graphics.device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess) {
+		if (memory != nullptr) {
+			graphics.device.freeMemory(memory, nullptr);
+		}
+		graphics.device.destroyBuffer(buffer, nullptr);
+		return;
+	}
+	m_buffer          = buffer;
+	m_imported_memory = memory;
+	m_coherent        = true;
+	vk::BufferDeviceAddressInfo address_info {};
+	address_info.buffer = m_buffer;
+	m_device_address    = graphics.device.getBufferAddress(address_info);
+}
+
 Buffer::~Buffer() {
+	if (m_imported_memory != nullptr) {
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+		m_graphics->device.freeMemory(m_imported_memory, nullptr);
+		return;
+	}
 	if (m_vram_bytes != 0) {
 		VramStats::Note(static_cast<VramStats::Kind>(m_vram_kind), m_vram_device_local,
 		                -static_cast<int64_t>(m_vram_bytes));
@@ -268,10 +366,36 @@ vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::Acce
 	return barrier;
 }
 
+// KYTY_DMA_BARRIER_BATCH (live, default off; needs the barrier batcher): Buffer::Fill and
+// Buffer::CopyFrom queue their before/after buffer barriers in the batch (render.h) instead of
+// recording each pair around the command: the before barriers join the pending batch (often a
+// guest RELEASE_MEM barrier) in one call, the after barriers join whatever is flushed next. Same
+// scopes; only the number of barrier commands changes.
+static Live::Switch g_dma_barrier_batch("KYTY_DMA_BARRIER_BATCH", Live::ParseDefaultOff);
+
+static vk::BufferMemoryBarrier2 Barrier2(const vk::BufferMemoryBarrier& barrier, vk::PipelineStageFlags2 src_stages,
+                                         vk::PipelineStageFlags2 dst_stages) {
+	vk::BufferMemoryBarrier2 out {};
+	out.srcStageMask        = src_stages;
+	out.srcAccessMask       = vk::AccessFlags2(static_cast<VkAccessFlags2>(static_cast<VkAccessFlags>(barrier.srcAccessMask)));
+	out.dstStageMask        = dst_stages;
+	out.dstAccessMask       = vk::AccessFlags2(static_cast<VkAccessFlags2>(static_cast<VkAccessFlags>(barrier.dstAccessMask)));
+	out.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	out.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	out.buffer              = barrier.buffer;
+	out.offset              = barrier.offset;
+	out.size                = barrier.size;
+	return out;
+}
+
+static vk::PipelineStageFlags2 Stages2(vk::PipelineStageFlags stages) {
+	return vk::PipelineStageFlags2(static_cast<VkPipelineStageFlags2>(static_cast<VkPipelineStageFlags>(stages)));
+}
+
 void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
                       uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
                       vk::AccessFlags destination_before, vk::AccessFlags source_after,
-                      vk::AccessFlags destination_after) {
+                      vk::AccessFlags destination_after, bool batch) {
 	KYTY_GPU_OP_SITE("buffer.copy");
 	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
 	    destination_offset > Size() || size > Size() - destination_offset) {
@@ -291,6 +415,29 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
+	auto after_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
+	if (static_cast<bool>((source_after | destination_after) & host_access)) {
+		after_stage |= vk::PipelineStageFlagBits::eHost;
+	}
+	if (batch && DmaBarrierBatchEnabled()) {
+		// KYTY_DMA_BARRIER_BATCH: the same barriers through the batch (see Fill).
+		for (const auto& barrier: before) {
+			command.RequestBufferBarrier(Barrier2(barrier, Stages2(before_stage), vk::PipelineStageFlagBits2::eTransfer),
+			                             BarrierOrigin::Upload);
+		}
+		const vk::BufferCopy copy {source_offset, destination_offset, size};
+		command.HelperSink().copyBuffer(source.Handle(), Handle(), 1, &copy);
+		MarkContentWritten();
+		const vk::BufferMemoryBarrier after[] = {
+		    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
+		    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
+		};
+		for (const auto& barrier: after) {
+			command.RequestBufferBarrier(Barrier2(barrier, vk::PipelineStageFlagBits2::eTransfer, Stages2(after_stage)),
+			                             BarrierOrigin::Upload);
+		}
+		return;
+	}
 	const auto native = command.HelperSink();
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
@@ -301,21 +448,80 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
 	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
 	};
-	auto after_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
-	if (static_cast<bool>((source_after | destination_after) & host_access)) {
-		after_stage |= vk::PipelineStageFlagBits::eHost;
-	}
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
 }
 
-void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
+void Buffer::CopyRegionsFrom(CommandBuffer& command, const Buffer& source, std::span<const vk::BufferCopy> regions,
+                             vk::AccessFlags source_before) {
+	KYTY_GPU_OP_SITE("buffer.copy");
+	if (regions.empty()) {
+		return;
+	}
+	uint64_t src_lo = UINT64_MAX, src_hi = 0, dst_lo = UINT64_MAX, dst_hi = 0;
+	for (const auto& r: regions) {
+		if (r.size == 0 || r.srcOffset > source.Size() || r.size > source.Size() - r.srcOffset ||
+		    r.dstOffset > Size() || r.size > Size() - r.dstOffset) {
+			EXIT("Buffer: invalid copy range\n");
+		}
+		src_lo = std::min(src_lo, r.srcOffset);
+		src_hi = std::max(src_hi, r.srcOffset + r.size);
+		dst_lo = std::min(dst_lo, r.dstOffset);
+		dst_hi = std::max(dst_hi, r.dstOffset + r.size);
+	}
+	if (source.Handle() == Handle()) {
+		EXIT("Buffer: self-copy of regions\n");
+	}
+	command.EndRendering();
+	const auto any_read_write = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	const vk::BufferMemoryBarrier before[] = {
+	    source.Barrier(src_lo, src_hi - src_lo, source_before, vk::AccessFlagBits::eTransferRead),
+	    Barrier(dst_lo, dst_hi - dst_lo, any_read_write, vk::AccessFlagBits::eTransferWrite),
+	};
+	auto before_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
+	if (static_cast<bool>(source_before & (vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite))) {
+		before_stage |= vk::PipelineStageFlagBits::eHost;
+	}
+	const auto native = command.HelperSink();
+	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion, 0,
+	                       nullptr, 2, before, 0, nullptr);
+	native.copyBuffer(source.Handle(), Handle(), static_cast<uint32_t>(regions.size()), regions.data());
+	MarkContentWritten();
+	const vk::BufferMemoryBarrier after[] = {
+	    source.Barrier(src_lo, src_hi - src_lo, vk::AccessFlagBits::eTransferRead, any_read_write),
+	    Barrier(dst_lo, dst_hi - dst_lo, vk::AccessFlagBits::eTransferWrite, any_read_write),
+	};
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
+}
+
+bool Buffer::DmaBarrierBatchEnabled() {
+	return g_dma_barrier_batch.On() && BarrierBatchEnabled();
+}
+
+void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value, bool batch) {
 	KYTY_GPU_OP_SITE("buffer.fill");
 	if (((offset | size) & 3u) != 0) {
 		EXIT("Buffer: fill range must be dword aligned\n");
 	}
 	auto& command = Scheduler().Current();
 	command.EndRendering();
+	if (batch && DmaBarrierBatchEnabled()) {
+		const auto before =
+		    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		            vk::AccessFlagBits::eTransferWrite);
+		command.RequestBufferBarrier(Barrier2(before, vk::PipelineStageFlagBits2::eAllCommands,
+		                                      vk::PipelineStageFlagBits2::eTransfer),
+		                             BarrierOrigin::Upload);
+		command.HelperSink().fillBuffer(Handle(), offset, size, value);
+		MarkContentWritten();
+		const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
+		                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+		command.RequestBufferBarrier(Barrier2(after, vk::PipelineStageFlagBits2::eTransfer,
+		                                      vk::PipelineStageFlagBits2::eAllCommands),
+		                             BarrierOrigin::Upload);
+		return;
+	}
 	const auto before =
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	            vk::AccessFlagBits::eTransferWrite);
@@ -398,10 +604,12 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	m_wait_bound  = wait_bound;
 	m_offset      = aligned_offset;
 	m_mapped_size = mapped_size;
+	m_reservation_pending = true;
 	return {Mapped().data() + m_offset, m_offset};
 }
 
 void StreamBuffer::Commit() {
+	m_reservation_pending = false;
 	if (Usage() != MemoryUsage::Download && m_mapped_size != 0) {
 		Flush(m_offset, m_mapped_size);
 	}

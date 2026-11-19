@@ -504,7 +504,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode()) &&
 				    !memory.SupportsIndirectRawLoad(inst.GetOpcode()) &&
 				    !(program.info.bda_writes &&
-				      memory.SupportsIndirectRawWrite(inst.GetOpcode()))) {
+				      (memory.SupportsIndirectRawWrite(inst.GetOpcode()) ||
+				       (GetCodegenOptions().IndirectFormatStoresFor(program.shader_hash) && memory.formatted &&
+				        !memory.typed && memory.data_bits == 32u &&
+				        BufferAccessOf(inst.GetOpcode()) == BufferAccess::Write)))) {
 					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
 				}
 				const auto access = BufferAccessOf(inst.GetOpcode());
@@ -821,18 +824,63 @@ size_t DropDeadPlanReferences(Program& program) {
 	return dropped;
 }
 
+std::unordered_set<const Inst*> PlanTableInstructions(const Program& program) {
+	std::unordered_set<const Inst*> named;
+	const auto add_value = [&](const Value& value) {
+		if (const auto* inst = value.TryInstruction(); inst != nullptr) {
+			named.insert(inst);
+		}
+	};
+	for (const auto& descriptor: program.descriptor_sources) {
+		for (const auto& value: descriptor.dwords) {
+			add_value(value);
+		}
+		if (descriptor.indirect_descriptor) {
+			add_value(descriptor.indirect_descriptor->key_count);
+			add_value(descriptor.indirect_descriptor->selector_first);
+			add_value(descriptor.indirect_descriptor->selector_mask);
+		}
+	}
+	for (const auto& block: program.control_flow) {
+		add_value(block.condition);
+	}
+	for (const auto& read: program.srt_reads) {
+		add_value(read.value);
+	}
+	for (const auto& recipe: program.evaluation_recipes) {
+		if (recipe.instruction != nullptr) named.insert(recipe.instruction);
+		add_value(recipe.selection_mask);
+	}
+	for (const auto& instruction: program.arithmetic_tape_instructions) {
+		if (instruction.instruction != nullptr) named.insert(instruction.instruction);
+	}
+	for (const auto& value: program.uniform_fill.values) {
+		add_value(value);
+	}
+	return named;
+}
+
 size_t ResolvePlanIdentities(Program& program) {
-	size_t resolved = 0;
+	// Only references to instructions the program still holds: a reference to one an earlier
+	// pass erased points at freed memory (DropDeadPlanReferences clears it later). Following it
+	// read an argument-less "identity" and stopped the emulator (index >= args.size(), Miles'
+	// call-split permutations).
+	const auto live     = LivePlanReferences(program);
+	size_t     resolved = 0;
 	ForEachPlanReference(
 	    program,
 	    [&](Value& value) {
+		    const auto* inst = value.TryInstruction();
+		    if (inst == nullptr || !live.contains(inst)) {
+			    return;
+		    }
 		    if (value.IsIdentity()) {
 			    value = value.Resolve();
 			    resolved++;
 		    }
 	    },
 	    [&](const Inst*& inst) {
-		    if (inst == nullptr || inst->GetOpcode() != ValueOpcode::Identity) {
+		    if (inst == nullptr || !live.contains(inst) || inst->GetOpcode() != ValueOpcode::Identity) {
 			    return;
 		    }
 		    // An identity of an immediate names no instruction: DropDeadPlanReferences clears it.

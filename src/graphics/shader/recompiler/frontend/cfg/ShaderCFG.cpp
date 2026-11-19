@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <iterator>
 #include <map>
@@ -67,10 +68,6 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 		case Opcode::S_SUBVECTOR_LOOP_END: return BranchCondition::ScalarInstruction;
 		default: return BranchCondition::Unknown;
 	}
-}
-
-bool IsRegister(const Decoder::Operand& operand, Decoder::OperandKind kind, uint32_t reg) {
-	return operand.kind == kind && operand.reg == reg;
 }
 
 bool ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code) {
@@ -516,24 +513,22 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 		return false;
 	}
 
-	const auto& setpc = program.instructions[setpc_index];
-	if (setpc.opcode != Opcode::S_SETPC_B64 || setpc.src0.kind != Decoder::OperandKind::Sgpr) {
+	const auto& setpc   = program.instructions[setpc_index];
+	uint32_t    pc_code = 0;
+	if (setpc.opcode != Opcode::S_SETPC_B64 || !ScalarOperandCode(setpc.src0, pc_code)) {
 		return false;
 	}
 
-	const auto pc_reg = setpc.src0.reg;
 	if (setpc_index >= 2u) {
 		const auto& arith = program.instructions[setpc_index - 1u];
 		const auto& getpc = program.instructions[setpc_index - 2u];
-		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
-		    getpc.dst.reg == pc_reg && arith.dst.kind == Decoder::OperandKind::Sgpr &&
-		    arith.dst.reg == pc_reg) {
+		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_code) &&
+		    IsScalarCode(arith.dst, pc_code)) {
 			uint32_t imm  = 0;
 			bool     adds = arith.opcode == Opcode::S_ADD_U32 || arith.opcode == Opcode::S_ADD_I32;
 			bool     subs = arith.opcode == Opcode::S_SUB_U32 || arith.opcode == Opcode::S_SUB_I32;
 			if ((adds || subs) &&
-			    (IsRegister(arith.src0, Decoder::OperandKind::Sgpr, pc_reg) ||
-			     IsRegister(arith.src1, Decoder::OperandKind::Sgpr, pc_reg)) &&
+			    (IsScalarCode(arith.src0, pc_code) || IsScalarCode(arith.src1, pc_code)) &&
 			    (IsImmediate(arith.src0, imm) || IsImmediate(arith.src1, imm))) {
 				const auto base = InstructionEndPc(getpc);
 				target          = (adds ? base + imm : base - imm) & ~3u;
@@ -544,14 +539,14 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 
 	if (setpc_index >= 1u) {
 		const auto& getpc = program.instructions[setpc_index - 1u];
-		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
-		    getpc.dst.reg == pc_reg) {
+		if (getpc.opcode == Opcode::S_GETPC_B64 && IsScalarCode(getpc.dst, pc_code)) {
 			target = InstructionEndPc(getpc);
 			return true;
 		}
 	}
 
-	return false;
+	// Long jump: s_getpc_b64; s_add_u32 lo, imm; s_addc_u32 hi, 0.
+	return ResolvePcRelativeBase(program, setpc_index, pc_code, &target);
 }
 
 bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,
@@ -722,8 +717,104 @@ void PruneUnreachableBlocks(Graph& graph) {
 	RebuildPredecessors(graph);
 }
 
+// Dominator sets through immediate dominators (Cooper, Harvey and Kennedy, "A Simple, Fast Dominance
+// Algorithm"): on large programs (an S_SWAPPC_B64 expansion has thousands of blocks) the iterative
+// set intersection below costs time and memory quadratic in the block count. `edges(block)` lists
+// the edges into a block in the direction of the analysis (predecessors for dominators, successors
+// for post-dominators), `roots` the blocks the analysis starts from. The sets equal the iterative
+// fixed point for every block a root reaches; false (nothing written) when some block is not
+// reached, so the caller keeps the iterative algorithm for those graphs.
+template <typename Edges, typename Forward, typename Store>
+bool ComputeDominatorSetsFast(const Graph& graph, const std::vector<uint32_t>& roots, Edges&& edges,
+                              Forward&& forward, Store&& store) {
+	const auto count   = static_cast<uint32_t>(graph.blocks.size());
+	const auto virtual_root = count; // joins several roots
+	// Reverse postorder of the forward walk from the roots.
+	std::vector<uint32_t> order_index(count + 1u, UINT32_MAX);
+	std::vector<uint32_t> postorder;
+	postorder.reserve(count + 1u);
+	{
+		std::vector<std::pair<uint32_t, uint32_t>> stack; // (block, next successor index)
+		std::vector<bool>                          visited(count + 1u, false);
+		visited[virtual_root] = true;
+		stack.emplace_back(virtual_root, 0u);
+		while (!stack.empty()) {
+			auto& [block, next] = stack.back();
+			const auto& successors = block == virtual_root ? roots : forward(block);
+			if (next < successors.size()) {
+				const auto successor = successors[next++];
+				if (successor < count && !visited[successor]) {
+					visited[successor] = true;
+					stack.emplace_back(successor, 0u);
+				}
+				continue;
+			}
+			postorder.push_back(block);
+			stack.pop_back();
+		}
+	}
+	if (postorder.size() != count + 1u) {
+		return false;
+	}
+	for (uint32_t i = 0; i < postorder.size(); i++) {
+		order_index[postorder[i]] = static_cast<uint32_t>(postorder.size()) - 1u - i;
+	}
+	std::vector<uint32_t> idom(count + 1u, UINT32_MAX);
+	idom[virtual_root] = virtual_root;
+	const auto intersect = [&](uint32_t a, uint32_t b) {
+		while (a != b) {
+			while (order_index[a] > order_index[b]) a = idom[a];
+			while (order_index[b] > order_index[a]) b = idom[b];
+		}
+		return a;
+	};
+	const auto is_root = [&](uint32_t block) { return Contains(roots, block); };
+	bool changed = true;
+	while (changed) {
+		changed = false;
+		for (auto it = postorder.rbegin(); it != postorder.rend(); ++it) {
+			const auto block = *it;
+			if (block == virtual_root) continue;
+			uint32_t next = is_root(block) ? virtual_root : UINT32_MAX;
+			for (const auto pred: edges(block)) {
+				if (pred >= count || idom[pred] == UINT32_MAX) continue;
+				next = next == UINT32_MAX ? pred : intersect(pred, next);
+			}
+			if (next != UINT32_MAX && idom[block] != next) {
+				idom[block] = next;
+				changed     = true;
+			}
+		}
+	}
+	std::vector<uint32_t> chain;
+	for (uint32_t block = 0; block < count; block++) {
+		chain.clear();
+		for (uint32_t at = block; at != virtual_root; at = idom[at]) {
+			chain.push_back(at);
+		}
+		std::sort(chain.begin(), chain.end());
+		store(block, chain);
+	}
+	return true;
+}
+
 void ComputeDominators(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
+	// The walk follows the edges the iterative algorithm reads (the predecessor lists), reversed.
+	std::vector<std::vector<uint32_t>> forward(count);
+	for (const auto& block: graph.blocks) {
+		for (const auto pred: block.predecessors) {
+			if (pred < count) forward[pred].push_back(block.id);
+		}
+	}
+	if (graph.entry_block < count &&
+	    ComputeDominatorSetsFast(
+	        graph, {graph.entry_block},
+	        [&](uint32_t block) -> const std::vector<uint32_t>& { return graph.blocks[block].predecessors; },
+	        [&](uint32_t block) -> const std::vector<uint32_t>& { return forward[block]; },
+	        [&](uint32_t block, const std::vector<uint32_t>& set) { graph.blocks[block].dominators = set; })) {
+		return;
+	}
 	const auto all   = AllBlockIds(count);
 
 	for (auto& block: graph.blocks) {
@@ -758,6 +849,25 @@ void ComputeDominators(Graph& graph) {
 
 void ComputePostDominators(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
+	std::vector<uint32_t> exits;
+	for (const auto& block: graph.blocks) {
+		if (block.successors.empty()) exits.push_back(block.id);
+	}
+	// The walk follows the successor lists (the edges the iterative algorithm reads), reversed.
+	std::vector<std::vector<uint32_t>> backward(count);
+	for (const auto& block: graph.blocks) {
+		for (const auto succ: block.successors) {
+			if (succ < count) backward[succ].push_back(block.id);
+		}
+	}
+	if (!exits.empty() &&
+	    ComputeDominatorSetsFast(
+	        graph, exits,
+	        [&](uint32_t block) -> const std::vector<uint32_t>& { return graph.blocks[block].successors; },
+	        [&](uint32_t block) -> const std::vector<uint32_t>& { return backward[block]; },
+	        [&](uint32_t block, const std::vector<uint32_t>& set) { graph.blocks[block].post_dominators = set; })) {
+		return;
+	}
 	const auto all   = AllBlockIds(count);
 
 	for (auto& block: graph.blocks) {
@@ -883,25 +993,49 @@ struct TarjanState {
 	std::vector<StronglyConnectedComponent> components;
 };
 
-void TarjanVisit(TarjanState& state, uint32_t block_id) {
-	state.index[block_id]   = state.next_index;
-	state.lowlink[block_id] = state.next_index;
-	state.next_index++;
-	state.stack.push_back(block_id);
-	state.on_stack[block_id] = true;
+void TarjanFinish(TarjanState& state, uint32_t block_id);
 
-	const auto* block = state.graph->FindBlock(block_id);
-	if (block != nullptr) {
-		for (auto succ: block->successors) {
+// Iterative (usa-ratt/KytyPS5-GT7 d7cff8c2f): a CFG with a long chain of blocks (an expanded
+// material shader) recursed deep enough to overflow the thread's stack (0xc00000fd in TarjanVisit,
+// GT7 loading a night race). The frames visit the successors in the same order and finish the
+// blocks in the same post-order, so the components come out exactly as before.
+void TarjanVisit(TarjanState& state, uint32_t root) {
+	struct Frame {
+		uint32_t block = 0;
+		size_t   next  = 0; // the next successor to look at
+	};
+	std::vector<Frame> frames;
+	const auto         enter = [&](uint32_t block_id) {
+		state.index[block_id]   = state.next_index;
+		state.lowlink[block_id] = state.next_index;
+		state.next_index++;
+		state.stack.push_back(block_id);
+		state.on_stack[block_id] = true;
+		frames.push_back({block_id, 0});
+	};
+	enter(root);
+	while (!frames.empty()) {
+		const auto  block_id = frames.back().block;
+		const auto* block    = state.graph->FindBlock(block_id);
+		if (block != nullptr && frames.back().next < block->successors.size()) {
+			const auto succ = block->successors[frames.back().next++];
 			if (state.index[succ] == UINT32_MAX) {
-				TarjanVisit(state, succ);
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.lowlink[succ]);
+				enter(succ);
 			} else if (state.on_stack[succ]) {
 				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
 			}
+			continue;
+		}
+		frames.pop_back();
+		TarjanFinish(state, block_id);
+		if (!frames.empty()) {
+			const auto parent     = frames.back().block;
+			state.lowlink[parent] = std::min(state.lowlink[parent], state.lowlink[block_id]);
 		}
 	}
+}
 
+void TarjanFinish(TarjanState& state, uint32_t block_id) {
 	if (state.lowlink[block_id] != state.index[block_id]) {
 		return;
 	}
@@ -1535,6 +1669,92 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 	return region;
 }
 
+// KYTY_CFG_CLONE_REGIONS (CodegenOptions::cfg_clone_regions): set while Structurize retries a
+// graph that failed every other way. A selection region that a block outside the selection
+// also enters (a jump into the middle of an if) then gets a private copy of the entered part
+// for those outside predecessors, instead of failing structurization.
+thread_local bool     g_clone_regions           = false;
+thread_local uint32_t g_clone_instructions_left = 0;
+
+// Copies the blocks of `region` reachable from `entered` (staying inside the region) once and
+// sends the predecessors of `entered` outside the region (other than the header) to the copy.
+// Edges from the copied part to blocks outside it keep their original targets. Refuses loop
+// headers, back-edge targets and indirect branches in the copied part.
+bool CloneEnteredRegion(Graph& graph, uint32_t header_id, const std::vector<uint32_t>& region,
+                        uint32_t entered) {
+	std::vector<uint32_t> shared;
+	std::vector<uint32_t> pending = {entered};
+	while (!pending.empty()) {
+		const auto id = pending.back();
+		pending.pop_back();
+		if (!Contains(region, id) || Contains(shared, id)) {
+			continue;
+		}
+		const auto* block = graph.FindBlock(id);
+		if (block == nullptr) {
+			return false;
+		}
+		shared.push_back(id);
+		pending.insert(pending.end(), block->successors.begin(), block->successors.end());
+	}
+	SortUnique(shared);
+	uint32_t instructions = 0;
+	for (const auto id: shared) {
+		const auto* block = graph.FindBlock(id);
+		if (id == header_id || id == graph.entry_block ||
+		    block->terminator.kind == TerminatorKind::IndirectBranch ||
+		    block->terminator.kind == TerminatorKind::Unsupported) {
+			return false;
+		}
+		if (std::ranges::any_of(graph.natural_loops, [&](const auto& loop) { return loop.header == id; }) ||
+		    std::ranges::any_of(graph.back_edges, [&](const auto& edge) { return edge.to == id; })) {
+			return false;
+		}
+		instructions += block->inst_end - block->inst_begin;
+	}
+	if (instructions > g_clone_instructions_left) {
+		return false;
+	}
+	std::vector<uint32_t> outside;
+	for (const auto predecessor: graph.FindBlock(entered)->predecessors) {
+		if (predecessor != header_id && !Contains(region, predecessor)) {
+			AddUnique(outside, predecessor);
+		}
+	}
+	if (outside.empty() ||
+	    std::ranges::any_of(outside, [&](uint32_t id) {
+		    const auto* block = graph.FindBlock(id);
+		    return block == nullptr || block->terminator.kind == TerminatorKind::IndirectBranch;
+	    })) {
+		return false;
+	}
+	g_clone_instructions_left -= instructions;
+
+	const auto base = static_cast<uint32_t>(graph.blocks.size());
+	const auto copy_of = [&](uint32_t id) {
+		const auto at = std::ranges::lower_bound(shared, id);
+		return base + static_cast<uint32_t>(at - shared.begin());
+	};
+	for (const auto id: shared) {
+		BasicBlock copy = *graph.FindBlock(id);
+		copy.id         = copy_of(id);
+		copy.predecessors.clear();
+		copy.dominators.clear();
+		copy.post_dominators.clear();
+		for (const auto target: shared) {
+			ReplaceValue(copy.successors, target, copy_of(target));
+			ReplaceTerminatorTarget(copy.terminator, target, copy_of(target));
+		}
+		graph.blocks.push_back(std::move(copy));
+	}
+	for (const auto id: outside) {
+		auto* block = graph.FindBlock(id);
+		ReplaceValue(block->successors, entered, copy_of(entered));
+		ReplaceTerminatorTarget(block->terminator, entered, copy_of(entered));
+	}
+	return true;
+}
+
 bool SplitOneSelectionMerge(Graph& graph) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
@@ -1579,6 +1799,9 @@ bool SplitOneSelectionMerge(Graph& graph) {
 			       });
 		});
 		if (external != region.end()) {
+			if (g_clone_regions && CloneEnteredRegion(graph, block_id, region, *external)) {
+				return true;
+			}
 			SetFailure(
 			    graph, FailureKind::StructuredControlFlow, block_id,
 			    fmt::format("selection header block {} has externally entered region block {}; "
@@ -2440,6 +2663,21 @@ bool Structurize(Graph& graph) {
 				graph = std::move(structured);
 				return true;
 			}
+		}
+	}
+	if (GetCodegenOptions().cfg_clone_regions && !graph.irreducible && !graph.unsupported) {
+		uint32_t instructions = 0;
+		for (const auto& block: graph.blocks) {
+			instructions += block.inst_end - block.inst_begin;
+		}
+		structured                = graph;
+		g_clone_regions           = true;
+		g_clone_instructions_left = std::max<uint32_t>(instructions, 256u);
+		const bool ok             = StructurizeImpl(structured);
+		g_clone_regions           = false;
+		if (ok) {
+			graph = std::move(structured);
+			return true;
 		}
 	}
 	SetFailure(graph, failure_kind, failure_block, failure_reason);

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
 #include <iterator>
@@ -47,6 +48,14 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 			}
 		}
 	}
+	if (info.indirect_vertex_base) {
+		// KYTY_INDIRECT_VERTEX_BASE: only when set, so other keys stay as they were.
+		key.push_back(0x1B5E0000u | (static_cast<uint32_t>(info.base_vertex_sgpr) & 0xffffu));
+	}
+	if (info.clip_space.vte_format != 0) {
+		// KYTY_VTE_CNTL: only when set, so other keys stay as they were.
+		key.push_back(0x7E7E0000u | info.clip_space.vte_format);
+	}
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -69,13 +78,20 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       mesh.split_groups});
+		                       mesh.split_groups, static_cast<uint32_t>(mesh.fast_launch),
+		                       mesh.passes});
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;
 		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.domain, tess.partitioning, tess.output_topology});
+		                       tess.domain, tess.partitioning, tess.output_topology, tess.min_tess_level,
+		                       tess.max_tess_level});
+		// KYTY_TESS_INDEXED: the patch-constant range both stages declare (0 without the switch).
+		if (tess.patch_size != 0u) key.insert(key.end(), {tess.patch_base, tess.patch_size});
+		// KYTY_TESS_MERGED_CARRY: the carried VGPR set (empty for every pair without it).
+		if (std::ranges::any_of(tess.carried_vgprs, [](uint32_t word) { return word != 0u; }))
+			key.insert(key.end(), tess.carried_vgprs.begin(), tess.carried_vgprs.end());
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -123,9 +139,23 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
 	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
+	if (info.target_half_float_mask != 0) {
+		// KYTY_FLOAT_STORE_CLAMP: only when set, so other keys stay as they were.
+		key.push_back(0x48460000u | info.target_half_float_mask);
+	}
+	if ((info.target_uint_mask | info.target_sint_mask) != 0) {
+		// KYTY_INT_MRT_OUTPUTS (upstream 26ca60923): integer-typed MRT outputs; only when set.
+		key.push_back(0x494e0000u | (uint32_t {info.target_sint_mask} << 8u) | info.target_uint_mask);
+	}
 	if (const auto mask = info.target_shader_mask; mask != UINT32_MAX) {
 		// KYTY_CB_SHADER_MASK_EXPORTS: which targets are written decides export locations.
 		key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
+	}
+	if (info.HasObjprimOutput()) {
+		// KYTY_OBJPRIM_ID: only with an ObjPrimID output, so every other key stays as it was.
+		key.push_back(0x0b1d0000u | info.objprim_slot |
+		              (static_cast<uint32_t>(info.objprim_push_dword) << 4u) |
+		              (static_cast<uint32_t>(info.objprim_add_prim_id) << 12u));
 	}
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
@@ -150,8 +180,10 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.lds_size_dwords | (info.lds_storage ? 0x80000000u : 0u));
 	key.push_back(info.scratch_size_dwords);
 	// Bit 1: an async compute queue (S_GETREG_B32 HW_ID2 answers only for graphics compute).
+	// Bit 2: thread counts read through a device address (KYTY_INDIRECT_THREADS_GPU).
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
-	              (static_cast<uint32_t>(info.async_compute) << 1u));
+	              (static_cast<uint32_t>(info.async_compute) << 1u) |
+	              (static_cast<uint32_t>(info.dispatch_dimensions_indirect) << 2u));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));

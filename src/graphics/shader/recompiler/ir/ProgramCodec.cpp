@@ -18,32 +18,33 @@ namespace {
 
 #if defined(_MSC_VER) && defined(_WIN64) && defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL == 0
 // Update the encoders and decoders below, then these sizes, when one of these types changes.
-// Members: Inst 7; Value 2 (type and one union member); MemoryInfo 25; BufferResource 16;
-// ImageResource 20; SamplerResource 7; SampledResourcePair 3; StageInput 5; StageOutput 4;
-// ShaderInfo 10; DescriptorBinding 2; BindingLayout 7; WriteRangeNode 6; WriteRangeAccess 5;
-// BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 3 (IndirectDescriptor
-// 11, SelectorRead 3); SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
+// Members: Inst 7; Value 2 (type and one union member); MemoryInfo 26; BufferResource 16;
+// ImageResource 22; SamplerResource 9; SampledResourcePair 3; StageInput 5; StageOutput 4;
+// ShaderInfo 11; DescriptorBinding 2; BindingLayout 8; WriteRangeNode 6; WriteRangeAccess 5;
+// BufferWriteRange 4; WriteRangeProgram 2; CompiledShaderInfo 11; DescriptorSource 4 (BindlessSampler 2, IndirectDescriptor
+// 18, SelectorRead 6 (MaskRanks 3));SrtRead 2; ResourceBlock 3; EvaluationOperand 3; EvaluationRecipe 6; ArithmeticTapeOperand 2;
 // ArithmeticTapeInstruction 5; ArithmeticTape 2; UniformFill 5; UniformFillPlan 2; ResourcePlan 29;
-// ResourceSpecialization 2 (Buffer 3, Image 10).
+// ResourceSpecialization 2 (Buffer 3, Image 12).
 static_assert(sizeof(Inst) == 104, "IR::Inst changed: update ProgramCodec");
 static_assert(sizeof(Value) == 16, "IR::Value changed: update ProgramCodec");
 static_assert(sizeof(MemoryInfo) == 72, "IR::MemoryInfo changed: update ProgramCodec");
 static_assert(sizeof(BufferResource) == 72, "IR::BufferResource changed: update ProgramCodec");
-static_assert(sizeof(ImageResource) == 80, "IR::ImageResource changed: update ProgramCodec");
-static_assert(sizeof(SamplerResource) == 16, "IR::SamplerResource changed: update ProgramCodec");
+static_assert(sizeof(ImageResource) == 96, "IR::ImageResource changed: update ProgramCodec");
+static_assert(sizeof(SamplerResource) == 24, "IR::SamplerResource changed: update ProgramCodec");
 static_assert(sizeof(SampledResourcePair) == 12, "IR::SampledResourcePair changed: update ProgramCodec");
 static_assert(sizeof(StageInput) == 56, "IR::StageInput changed: update ProgramCodec");
 static_assert(sizeof(StageOutput) == 48, "IR::StageOutput changed: update ProgramCodec");
-static_assert(sizeof(ShaderInfo) == 192, "IR::ShaderInfo changed: update ProgramCodec");
+static_assert(sizeof(ShaderInfo) == 240, "IR::ShaderInfo changed: update ProgramCodec");
 static_assert(sizeof(DescriptorBinding) == 32, "IR::DescriptorBinding changed: update ProgramCodec");
 static_assert(sizeof(BindingLayout) == 72, "IR::BindingLayout changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeNode) == 24, "IR::WriteRangeNode changed: update ProgramCodec");
 static_assert(sizeof(WriteRangeAccess) == 20, "IR::WriteRangeAccess changed: update ProgramCodec");
 static_assert(sizeof(BufferWriteRange) == 40, "IR::BufferWriteRange changed: update ProgramCodec");
-static_assert(sizeof(WriteRangeProgram) == 48, "IR::WriteRangeProgram changed: update ProgramCodec");
-static_assert(sizeof(CompiledShaderInfo) == 352, "IR::CompiledShaderInfo changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource) == 240, "IR::DescriptorSource changed: update ProgramCodec");
-static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 96,
+static_assert(sizeof(DmaReadAccess) == 60, "IR::DmaReadAccess changed: update ProgramCodec");
+static_assert(sizeof(WriteRangeProgram) == 80, "IR::WriteRangeProgram changed: update ProgramCodec");
+static_assert(sizeof(CompiledShaderInfo) == 432, "IR::CompiledShaderInfo changed: update ProgramCodec");
+static_assert(sizeof(DescriptorSource) == 304, "IR::DescriptorSource changed: update ProgramCodec");
+static_assert(sizeof(DescriptorSource::IndirectDescriptor) == 144,
               "IR::DescriptorSource::IndirectDescriptor changed: update ProgramCodec");
 static_assert(sizeof(SrtRead) == 24, "IR::SrtRead changed: update ProgramCodec");
 static_assert(sizeof(ResourceBlock) == 64, "IR::ResourceBlock changed: update ProgramCodec");
@@ -59,12 +60,12 @@ static_assert(sizeof(ResourcePlan::ArithmeticTape) == 8,
               "IR::ResourcePlan::ArithmeticTape changed: update ProgramCodec");
 static_assert(sizeof(UniformFill) == 28, "IR::UniformFill changed: update ProgramCodec");
 static_assert(sizeof(UniformFillPlan) == 96, "IR::UniformFillPlan changed: update ProgramCodec");
-static_assert(sizeof(ResourcePlan) == 712, "IR::ResourcePlan changed: update ProgramCodec");
+static_assert(sizeof(ResourcePlan) == 784, "IR::ResourcePlan changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization) == 48,
               "IR::ResourceSpecialization changed: update ProgramCodec");
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16,
               "IR::ResourceSpecialization::Buffer changed: update ProgramCodec");
-static_assert(sizeof(ResourceSpecialization::Image) == 36,
+static_assert(sizeof(ResourceSpecialization::Image) == 40,
               "IR::ResourceSpecialization::Image changed: update ProgramCodec");
 #endif
 
@@ -306,6 +307,7 @@ void Write(CodecWriter& w, const MemoryInfo& v) {
 	w.Bool(v.formatted);
 	w.Bool(v.image_has_mip);
 	w.Bool(v.image_r128);
+	w.Bool(v.image_cube);
 	w.Bool(v.idxen);
 	w.Bool(v.offen);
 	w.Bool(v.coherent);
@@ -334,6 +336,7 @@ void Read(CodecReader& r, MemoryInfo& v) {
 	v.formatted                = r.Bool();
 	v.image_has_mip            = r.Bool();
 	v.image_r128               = r.Bool();
+	v.image_cube               = r.Bool();
 	v.idxen                    = r.Bool();
 	v.offen                    = r.Bool();
 	v.coherent                 = r.Bool();
@@ -398,6 +401,11 @@ void Write(CodecWriter& w, const ImageResource& v) {
 	w.U32(v.indirect_root);
 	w.U32(v.indirect_mapping_offset);
 	w.U32(v.indirect_search_iterations);
+	w.Bool(v.bindless);
+	w.Bool(v.runtime);
+	w.Bool(v.clamp_half_float);
+	w.U32(v.table_access);
+	w.U32(v.max_array_index);
 	w.Words(v.indirect_resources);
 }
 
@@ -421,6 +429,11 @@ void Read(CodecReader& r, ImageResource& v) {
 	v.indirect_root              = r.U32();
 	v.indirect_mapping_offset    = r.U32();
 	v.indirect_search_iterations = r.U32();
+	v.bindless                   = r.Bool();
+	v.runtime                    = r.Bool();
+	v.clamp_half_float           = r.Bool();
+	v.table_access               = r.U32();
+	v.max_array_index            = r.U32();
 	v.indirect_resources         = r.Words();
 }
 
@@ -432,6 +445,8 @@ void Write(CodecWriter& w, const SamplerResource& v) {
 	w.Bool(v.depth_compare);
 	w.Bool(v.integer_border);
 	w.Bool(v.gather_lod);
+	w.Bool(v.bindless);
+	w.U32(v.bindless_mapping_offset);
 }
 
 void Read(CodecReader& r, SamplerResource& v) {
@@ -442,6 +457,8 @@ void Read(CodecReader& r, SamplerResource& v) {
 	v.depth_compare         = r.Bool();
 	v.integer_border        = r.Bool();
 	v.gather_lod            = r.Bool();
+	v.bindless              = r.Bool();
+	v.bindless_mapping_offset = r.U32();
 }
 
 void Write(CodecWriter& w, const SampledResourcePair& v) {
@@ -555,6 +572,10 @@ void Write(CodecWriter& w, const ResourceSpecialization::Image& v) {
 	w.U32(v.indirect_search_iterations);
 	w.Bool(v.cube);
 	w.Bool(v.fmask);
+	w.Bool(v.bindless);
+	w.Bool(v.runtime);
+	w.U32(v.fmask_fragments);
+	w.Bool(v.clamp_half_float);
 }
 
 void Read(CodecReader& r, ResourceSpecialization::Image& v) {
@@ -568,6 +589,10 @@ void Read(CodecReader& r, ResourceSpecialization::Image& v) {
 	v.indirect_search_iterations = r.U32();
 	v.cube                       = r.Bool();
 	v.fmask                      = r.Bool();
+	v.bindless                   = r.Bool();
+	v.runtime                    = r.Bool();
+	v.fmask_fragments            = static_cast<uint8_t>(r.U32());
+	v.clamp_half_float           = r.Bool();
 }
 
 void Write(CodecWriter& w, const ResourcePlan::EvaluationOperand& v) {
@@ -601,8 +626,12 @@ void Read(CodecReader& r, uint8_t& value) {
 }
 
 // Element types defined after the vector helpers (template lookup needs them declared first).
+void Write(CodecWriter& w, const std::array<uint32_t, 2>& v);
+void Read(CodecReader& r, std::array<uint32_t, 2>& v);
 void Write(CodecWriter& w, const BufferWriteRange& v);
 void Read(CodecReader& r, BufferWriteRange& v);
+void Write(CodecWriter& w, const DmaReadAccess& v);
+void Read(CodecReader& r, DmaReadAccess& v);
 
 template <typename T>
 void WriteVector(CodecWriter& w, const std::vector<T>& values) {
@@ -641,11 +670,22 @@ void Read(CodecReader& r, BufferWriteRange& v) {
 	ReadVector(r, v.accesses);
 }
 
+void Write(CodecWriter& w, const std::array<uint32_t, 2>& v) {
+	w.U32(v[0]);
+	w.U32(v[1]);
+}
+
+void Read(CodecReader& r, std::array<uint32_t, 2>& v) {
+	v[0] = r.U32();
+	v[1] = r.U32();
+}
+
 void Write(CodecWriter& w, const ShaderInfo& v) {
 	WriteVector(w, v.buffers);
 	WriteVector(w, v.images);
 	WriteVector(w, v.samplers);
 	WriteVector(w, v.sampled_pairs);
+	WriteVector(w, v.address_bases);
 	WriteVector(w, v.inputs);
 	WriteVector(w, v.outputs);
 	w.Raw(v.vertex_fetch_components.data(), v.vertex_fetch_components.size());
@@ -655,6 +695,12 @@ void Write(CodecWriter& w, const ShaderInfo& v) {
 	w.Bool(v.uses_dma);
 	w.Bool(v.uses_bvh);
 	w.Bool(v.bda_writes);
+	w.Bool(v.pops);
+	w.U32(v.ray_query_sites);
+	w.U32(v.ray_query_user_sgpr);
+	w.U32(v.ray_query_vsharp_offset);
+	w.U32(v.ray_query_header_offset);
+	w.U32(v.ray_query_root);
 }
 
 void Read(CodecReader& r, ShaderInfo& v) {
@@ -662,6 +708,7 @@ void Read(CodecReader& r, ShaderInfo& v) {
 	ReadVector(r, v.images);
 	ReadVector(r, v.samplers);
 	ReadVector(r, v.sampled_pairs);
+	ReadVector(r, v.address_bases);
 	ReadVector(r, v.inputs);
 	ReadVector(r, v.outputs);
 	const auto fetch = r.Take(v.vertex_fetch_components.size());
@@ -674,11 +721,18 @@ void Read(CodecReader& r, ShaderInfo& v) {
 	v.uses_dma             = r.Bool();
 	v.uses_bvh             = r.Bool();
 	v.bda_writes           = r.Bool();
+	v.pops                 = r.Bool();
+	v.ray_query_sites         = r.U32();
+	v.ray_query_user_sgpr     = r.U32();
+	v.ray_query_vsharp_offset = r.U32();
+	v.ray_query_header_offset = r.U32();
+	v.ray_query_root          = r.U32();
 }
 
 void Write(CodecWriter& w, const BindingLayout& v) {
 	w.U32(v.push_data_start_dword);
 	w.U32(v.dispatch_thread_dword);
+	w.U32(v.call_state_dword);
 	w.U32(v.memory_offset_dword);
 	w.U32(v.memory_offset_count);
 	w.U32(v.mip_stats_count);
@@ -689,6 +743,7 @@ void Write(CodecWriter& w, const BindingLayout& v) {
 void Read(CodecReader& r, BindingLayout& v) {
 	v.push_data_start_dword = r.U32();
 	v.dispatch_thread_dword = r.U32();
+	v.call_state_dword      = r.U32();
 	v.memory_offset_dword   = r.U32();
 	v.memory_offset_count   = r.U32();
 	v.mip_stats_count       = r.U32();
@@ -696,14 +751,58 @@ void Read(CodecReader& r, BindingLayout& v) {
 	ReadVector(r, v.descriptors);
 }
 
+void Write(CodecWriter& w, const DmaReadAccess& v) {
+	w.U8(static_cast<uint8_t>(v.kind));
+	w.Bool(v.scalar);
+	w.U8(v.table_words);
+	w.U32(v.base_low);
+	w.U32(v.base_high);
+	w.U32(v.offset);
+	w.I32(v.immediate);
+	w.U32(v.extent);
+	w.U32(v.table_offset);
+	w.U32(v.table_bits);
+	w.I32(v.table_immediate);
+	for (const auto word: v.words) {
+		w.U32(word);
+	}
+	w.U32(v.index);
+	w.U32(v.soffset);
+}
+
+void Read(CodecReader& r, DmaReadAccess& v) {
+	v.kind            = static_cast<DmaReadAccess::Kind>(r.U8());
+	v.scalar          = r.Bool();
+	v.table_words     = r.U8();
+	v.base_low        = r.U32();
+	v.base_high       = r.U32();
+	v.offset          = r.U32();
+	v.immediate       = r.I32();
+	v.extent          = r.U32();
+	v.table_offset    = r.U32();
+	v.table_bits      = r.U32();
+	v.table_immediate = r.I32();
+	for (auto& word: v.words) {
+		word = r.U32();
+	}
+	v.index   = r.U32();
+	v.soffset = r.U32();
+}
+
 void Write(CodecWriter& w, const WriteRangeProgram& v) {
 	WriteVector(w, v.nodes);
 	WriteVector(w, v.buffers);
+	w.Bool(v.dma.bounded);
+	w.U32(v.dma.reason);
+	WriteVector(w, v.dma.accesses);
 }
 
 void Read(CodecReader& r, WriteRangeProgram& v) {
 	ReadVector(r, v.nodes);
 	ReadVector(r, v.buffers);
+	v.dma.bounded = r.Bool();
+	v.dma.reason  = r.U32();
+	ReadVector(r, v.dma.accesses);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -742,6 +841,15 @@ public:
 					w.U32(image.selector->source);
 					w.U32(image.selector->stride);
 					w.U32(image.selector->offset);
+					w.Bool(image.selector->bitset);
+					w.Bool(image.selector->excluded.has_value());
+					if (image.selector->excluded) w.U32(*image.selector->excluded);
+					w.Bool(image.selector->ranks.has_value());
+					if (image.selector->ranks) {
+						w.U32(image.selector->ranks->source);
+						w.U32(image.selector->ranks->stride);
+						w.U32(image.selector->ranks->offset);
+					}
 				}
 				w.U32(image.table_source);
 				w.U32(image.table_offset);
@@ -750,10 +858,23 @@ public:
 				w.U32(image.table_record_bytes);
 				w.Bool(image.table_scalar);
 				w.U32(image.workgroup_axis);
+				w.Bool(image.bindless);
+				w.Bool(image.runtime);
+				w.U32(image.record_pointer);
+				w.U32(image.nested_vsharp);
+				w.U32(image.nested_heap);
+				w.U32(image.nested_keys);
+				w.U32(image.workgroup_multiplier);
+				w.U32(image.workgroup_shift);
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;
 				}
+			}
+			w.Bool(source.bindless_sampler.has_value());
+			if (source.bindless_sampler) {
+				w.U32(source.bindless_sampler->table_offset);
+				w.U32(source.bindless_sampler->stride);
 			}
 		}
 		w.U32(static_cast<uint32_t>(p.control_flow.size()));
@@ -803,6 +924,7 @@ public:
 			w.U8(instruction.operand_count);
 		}
 		WriteVector(w, p.clean_flat_slots);
+		WriteVector(w, p.gpu_fill_slots);
 		w.Bool(p.requires_specialization_memory);
 		w.Bool(p.has_address_writes);
 		w.Bool(p.srt_plan_complete);
@@ -974,6 +1096,14 @@ public:
 					selector.source = r.U32();
 					selector.stride = r.U32();
 					selector.offset = r.U32();
+					selector.bitset = r.Bool();
+					if (r.Bool()) selector.excluded = r.U32();
+					if (r.Bool()) {
+						auto& ranks  = selector.ranks.emplace();
+						ranks.source = r.U32();
+						ranks.stride = r.U32();
+						ranks.offset = r.U32();
+					}
 				}
 				image.table_source       = r.U32();
 				image.table_offset       = r.U32();
@@ -982,10 +1112,23 @@ public:
 				image.table_record_bytes = r.U32();
 				image.table_scalar       = r.Bool();
 				image.workgroup_axis     = r.U32();
+				image.bindless           = r.Bool();
+				image.runtime            = r.Bool();
+				image.record_pointer     = r.U32();
+				image.nested_vsharp      = r.U32();
+				image.nested_heap        = r.U32();
+				image.nested_keys        = r.U32();
+				image.workgroup_multiplier = r.U32();
+				image.workgroup_shift      = static_cast<uint8_t>(r.U32());
 				if (!ValueOf(image.key_count) || !ValueOf(image.selector_first) ||
 				    !ValueOf(image.selector_mask)) {
 					return false;
 				}
+			}
+			if (r.Bool()) {
+				auto& sampler = source.bindless_sampler.emplace(DescriptorSource::BindlessSampler {});
+				sampler.table_offset = r.U32();
+				sampler.stride       = r.U32();
 			}
 			if (r.Failed()) return false;
 		}
@@ -1045,6 +1188,7 @@ public:
 			if (r.Failed()) return false;
 		}
 		ReadVector(r, p.clean_flat_slots);
+		ReadVector(r, p.gpu_fill_slots);
 		p.requires_specialization_memory = r.Bool();
 		p.has_address_writes             = r.Bool();
 		p.srt_plan_complete              = r.Bool();
@@ -1156,6 +1300,29 @@ bool DecodeSpecialization(std::span<const uint8_t> bytes, ResourceSpecialization
 	CodecReader reader(bytes);
 	ReadVector(reader, value.buffers);
 	ReadVector(reader, value.images);
+	return reader.AtEnd();
+}
+
+bool DecodeSpecializationInt21(std::span<const uint8_t> bytes, ResourceSpecialization& value) {
+	CodecReader reader(bytes);
+	ReadVector(reader, value.buffers);
+	const auto count = reader.Count(1);
+	value.images.clear();
+	value.images.resize(count);
+	for (auto& v: value.images) {
+		// int21's image record: the fields up to fmask (the later ones keep their defaults).
+		v.numeric_class              = EnumFrom<Prospero::TextureNumericClass>(reader.U32());
+		v.dimension                  = EnumFrom<Decoder::ImageDimension>(reader.U32());
+		v.mip_count                  = reader.U32();
+		v.conversion_format          = EnumFrom<Prospero::BufferFormat>(reader.U32());
+		v.shader_swizzle             = reader.U32();
+		v.indirect_root              = reader.U32();
+		v.indirect_mapping_offset    = reader.U32();
+		v.indirect_search_iterations = reader.U32();
+		v.cube                       = reader.Bool();
+		v.fmask                      = reader.Bool();
+		if (reader.Failed()) return false;
+	}
 	return reader.AtEnd();
 }
 

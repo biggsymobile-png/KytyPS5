@@ -2,8 +2,10 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWPREP_DRAWPREP_H_
 
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/bookkeep.h"
 #include "graphics/host_gpu/renderer/drawPrep/packetClass.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/drawPrep/segment.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 
@@ -87,6 +89,23 @@ enum class CertMode : uint8_t { Value, Log };
 // with a connected profiler and KYTY_DRAW_PREP_FENCE_HISTOGRAM=1 (opt-in). The hook changes
 // nothing in off mode; it only classifies packets and counts.
 [[nodiscard]] bool PacketHookActive();
+// KYTY_SERVE_IN_WAITS bit 1 (live, default 0): the commit thread runs queued service commands
+// while it waits for a head a worker holds (Engine::CommitHead), not only after 2 ms.
+[[nodiscard]] bool ServeInHeadWait();
+// The GPU thread's "service commands are queued" test (GuestGpu::HasPendingCommands), set once by
+// the command processor; false while unset.
+void               SetServiceCommandsPending(bool (*pending)());
+[[nodiscard]] bool ServiceCommandsPending();
+// KYTY_SPEC_SEGMENTS (live, default 0; segment.h): 1 the commit thread splices the draw a preparing
+// thread encoded for a continuation the kernel takes, 2 verify.
+[[nodiscard]] Segment::Mode     SpecSegmentsMode();
+[[nodiscard]] Segment::Counters& SegmentCounters();
+// KYTY_BK_HANDOVER / KYTY_BK_ADOPT / KYTY_BK_RECORD / KYTY_BK_LEAN (live, default 0; bookkeep.h).
+[[nodiscard]] Bookkeep::Mode      BkHandoverMode();
+[[nodiscard]] Bookkeep::Mode      BkAdoptMode();
+[[nodiscard]] Bookkeep::Mode      BkRecordMode();
+[[nodiscard]] Bookkeep::Mode      BkLeanMode();
+[[nodiscard]] Bookkeep::Counters& BkCounters();
 
 // The register state a draw reads, copied when the draw packet is parsed.
 struct RegisterSnapshot {
@@ -153,6 +172,11 @@ struct PreparedDraw {
 	ShaderPixelInputInfo                                pixel_info;
 	PipelineCache::StagePrep                            vertex_prep;
 	PipelineCache::StagePrep                            pixel_prep;
+	// KYTY_DRAW_PREP_TESS: 3 for a tessellated draw, whose LS stage is vertex_info/vertex_prep and
+	// whose HS and TES stages are tess_info/tess_prep; 1 otherwise.
+	uint32_t                                            vertex_stages = 1;
+	std::array<ShaderVertexInputInfo, 2>                tess_info;
+	std::array<PipelineCache::StagePrep, 2>             tess_prep;
 	ReadSet                                             reads;
 	uint64_t                                            coherence_generation  = 0;
 	uint64_t                                            shader_map_generation = 0;
@@ -163,6 +187,10 @@ struct PreparedDraw {
 	// KYTY_CLEAN_UNTOUCHED: no page of a read or digest range had ever been touched by a GPU-side
 	// transition when the preparation finished (GpuTouched, checked by the preparing thread).
 	bool reads_untouched = false;
+	// KYTY_CLEAN_UNTOUCHED_RANGES: when not all were untouched, the read and digest ranges
+	// (reads.Ranges(), reads.DigestRanges()) that were touched, in that order (touched_valid).
+	std::vector<Coherence::Range> touched_reads;
+	bool                          touched_valid = false;
 	// KYTY_DRAW_PREP_DISPATCH: a dispatch slot's preparation (GetComputeProgram's outputs).
 	ShaderComputeInputInfo   compute_info;
 	PipelineCache::StagePrep compute_prep;
@@ -263,8 +291,9 @@ public:
 	// idle-GPU early submit). Commits happen at packet boundaries (before a fence packet or a
 	// service command, at the end of a slice) or at the start of a draw packet, before the
 	// packet records anything, so a flush there splits no packet.
+	// The hook is a direct call (`after_commit(after_commit_context)`), not a std::function.
 	Engine(RenderContext& renderer, std::function<void()> service_commands,
-	       std::function<void()> after_commit);
+	       void (*after_commit)(void*), void* after_commit_context);
 	~Engine();
 	Engine(const Engine&)            = delete;
 	Engine& operator=(const Engine&) = delete;
@@ -363,17 +392,45 @@ public:
 	// only matters for a fence (counted as FrameEvent DrawPrepFence<kind>).
 	void OnPacket(PacketClass packet_class, FenceKind fence_kind = FenceKind::Other);
 
+	// KYTY_DRAW_PREP_FENCE_OVERLAP=1 (default off; parallel mode, KYTY_CP_SEQ=0): a single-record
+	// indirect draw (with KYTY_DRAW_PREP_INDIRECT, default on) and a direct dispatch (with
+	// KYTY_DRAW_PREP_DISPATCH=1) no longer commit the window before their handler. The handler
+	// publishes the packet's preparation (PublishIndirect / PublishDispatch, from the registers it
+	// executes with) behind the pending draws, commits those (DrainBefore), and then executes the
+	// packet with the head slot offered (ExecuteIndirect / ExecuteDispatch). A worker prepares the
+	// packet's programs while the command processor records the draws before it; the order of
+	// execution is unchanged, and the preparation is used only under the same certificate as with
+	// the sequencer (Validate / ValidateDispatch). Without pending draws the command processor
+	// prepares the head itself (ReadyHead), as for any unclaimed head.
+	// Open: with KYTY_DRAW_PREP_VERIFY=1 a GT7 race logged 7 committed preparations (indirect draws)
+	// whose vertex or pixel resources differed from the serial ones (programs equal); not explained
+	// yet. GT7 CP time did not drop either (serial work moved into head waits), so it stays off.
+	[[nodiscard]] static bool FenceOverlapEnabled();
+	// Fence-overlap: OnPacket for the deferred fence (counted, nothing committed).
+	void NoteDeferredFence(FenceKind fence_kind);
+	// Commits pending draws in order up to, not including, window position `position`.
+	void DrainBefore(uint64_t position);
+	// Commits the head draw (a full window while the command processor publishes in direct mode).
+	void CommitOne();
+
 	struct Slot;
 
 private:
 	struct Workers;
 
 	void Commit(Slot& slot);
+	// P3b: what the resolver knows only at commit (CommitPublished).
+	struct HeadPatch {
+		uint64_t submit_id      = 0;
+		uint32_t instance_count = UINT32_MAX; // UINT32_MAX: keep the slot's
+	};
 	// `patch` (P3b): applied to the head once no other thread works on it, before its commit.
-	void CommitHead(const std::function<void(Slot&)>* patch = nullptr);
+	void CommitHead(const HeadPatch* patch = nullptr);
 	// The head slot once prepared (by a worker, or here); the caller commits or uses it, then
 	// retires it.
 	Slot& ReadyHead();
+	// KYTY_CERT_PREFETCH: the hints for the next positions once the head is ready.
+	void PrefetchAhead();
 	void NoteFence();
 	void FillSlot(Slot& slot, uint64_t submit_id, const DrawIndexArgs* index_args,
 	              const DrawAutoArgs* auto_args, const HW::Context& context,
@@ -382,7 +439,11 @@ private:
 	RenderContext&           m_renderer;
 	Mode                     m_mode;
 	std::function<void()>    m_service_commands;
-	std::function<void()>    m_after_commit;
+	void (*m_after_commit)(void*) = nullptr;
+	void*                    m_after_commit_context = nullptr;
+	// KYTY_BK_HANDOVER: positions the commit thread has seen finished (bookkeep.h).
+	Bookkeep::ReadyRun       m_ready_run;
+	bool                     m_bk_run_head = false; // the head being committed came from the run
 	std::unique_ptr<Slot>    m_inline_slot;
 	std::unique_ptr<Workers> m_workers; // parallel mode: the window and its threads
 	uint64_t                 m_draws_since_fence = 0;

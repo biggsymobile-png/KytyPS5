@@ -209,7 +209,7 @@ uint8_t *AllocateFixedGuestRange(uint64_t size, uintptr_t offset) {
 }
 
 uint8_t *Allocate(PageManager &manager, uint64_t pages) {
-  const auto size = manager.GetPageSize() * pages;
+  const auto size = Libs::Graphics::TRACKER_PAGE_SIZE * pages;
   return AllocateFixedGuestRange(size, 0x10000);
 }
 
@@ -271,7 +271,7 @@ void TestGuestRange() {
 void TestQueriesDoNotRequireMappedOwnership() {
   constexpr uint64_t address = 0x0000000203000000ull;
   TrackerHarness harness;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   Check(harness.tracker.IsRegionCpuModified(address, page_size) &&
             !harness.tracker.IsRegionGpuModified(address, page_size),
         "unowned tracker range did not expose its initial CPU-dirty state");
@@ -281,7 +281,7 @@ void TestConcurrentRegionPublication() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -315,7 +315,7 @@ void TestCpuDirtyUpload() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
   Check(tracker.IsRegionCpuModified(address + 16, 32),
@@ -471,7 +471,7 @@ void TestGpuReacquisitionAfterInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -518,7 +518,7 @@ void TestGpuDirtyBits() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -529,11 +529,18 @@ void TestGpuDirtyBits() {
             !tracker.IsRegionGpuModified(address + page_size, page_size) &&
             Protection(memory) == PAGE_NOACCESS,
         "GPU dirty state escaped the requested range");
+  // CPU-dirtying the next page does not conflict with the GPU-dirty one (upstream fe847be96).
+  tracker.MarkRegionAsCpuModified(address + page_size, page_size);
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   Check(!tracker.IsRegionGpuModified(address, page_size) &&
             Protection(memory) == PAGE_READONLY,
         "GPU dirty state did not restore write-only tracking");
+  // Nor does CPU-dirtying the previous page of a GPU-written one.
+  tracker.ForEachUploadRange(
+      address + page_size, page_size, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
   tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
   tracker.UntrackMemory(address, page_size * 2);
   Release(memory);
 }
@@ -770,7 +777,7 @@ void TestReadbackPendingUnmark() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 3);
   const auto address = reinterpret_cast<uint64_t>(memory);
   auto *second = reinterpret_cast<void *>(address + page_size);
@@ -824,7 +831,7 @@ void TestRangeGpuOwned() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
   Check(!tracker.IsRangeGpuOwned(address, page_size) &&
@@ -873,7 +880,7 @@ void TestExactDirtyIntervalsSharingTrackerPage() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -918,7 +925,7 @@ void TestGpuDownloadProtectionMirrors() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -1040,7 +1047,7 @@ void TestFaultAheadWindow() {
   policy.ahead_pages = 8;
   PolicyHarness harness(policy);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 16);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -1098,6 +1105,44 @@ void TestFaultAheadWindow() {
   Release(memory);
 }
 
+// KYTY_FAULT_AHEAD_SEQUENTIAL (FaultPolicy::sequential_ahead): an isolated write fault opens only
+// its own page; a fault whose page below is CPU-dirty already opens the window forward from it.
+void TestSequentialFaultAhead() {
+  MemoryTracker::FaultPolicy policy;
+  policy.ahead_pages = 8;
+  policy.sequential_ahead = true;
+  PolicyHarness harness(policy);
+  auto &tracker = harness.tracker;
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(harness.page_manager, 24);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  UploadAll(tracker, address, page_size * 24);
+
+  std::vector<std::pair<uint64_t, uint64_t>> ahead_runs;
+  Check(WriteFault(tracker, address + page_size * 6 + 8, &ahead_runs) == 0,
+        "sequential fault-ahead: isolated fault requested a GPU flush");
+  Check(ahead_runs.empty(), "sequential fault-ahead: an isolated fault opened a window");
+  for (uint64_t page = 0; page < 24; page++) {
+    Check(tracker.IsRegionCpuModified(address + page * page_size, page_size) == (page == 6),
+          "sequential fault-ahead: isolated fault state is wrong");
+  }
+  // Page 7: the page below (6) is CPU-dirty, so pages 8..14 open ahead (7 is the faulting page).
+  ahead_runs.clear();
+  Check(WriteFault(tracker, address + page_size * 7, &ahead_runs) == 0,
+        "sequential fault-ahead: sequential fault requested a GPU flush");
+  Check(ahead_runs.size() == 1 && ahead_runs[0].first == address + page_size * 8 &&
+            ahead_runs[0].second == page_size * 7,
+        "sequential fault-ahead: the forward window is wrong");
+  for (uint64_t page = 0; page < 24; page++) {
+    const bool dirty = page >= 6 && page < 15;
+    Check(tracker.IsRegionCpuModified(address + page * page_size, page_size) == dirty &&
+              IsWritable(memory + page * page_size) == dirty,
+          "sequential fault-ahead: window state is wrong");
+  }
+  tracker.UntrackMemory(address, page_size * 24);
+  Release(memory);
+}
+
 // The lock-free dirty mirrors are republished only for the pages a transition changes
 // (RegionManager::Publish*Mirror): transitions spanning mirror words (64 pages each) and a
 // 128-page fault-ahead window keep every word equal to the locked bits. The allocation starts 16
@@ -1107,7 +1152,7 @@ void TestMirrorsAcrossWords() {
   policy.ahead_pages = 128;
   PolicyHarness harness(policy);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr uint64_t pages = 160;
   auto *memory = Allocate(harness.page_manager, pages);
   const auto address = reinterpret_cast<uint64_t>(memory);
@@ -1155,7 +1200,7 @@ void TestHotPagePromotionAndUpload() {
   policy.hot_max = 8;
   PolicyHarness harness(policy, true);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -1227,7 +1272,7 @@ void TestHotPageDemotionPaths() {
   policy.hot_max = 1;
   PolicyHarness harness(policy);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -1282,7 +1327,7 @@ void TestFaultMutationEpochWithHotPages() {
   policy.hot_max = 8;
   PolicyHarness harness(policy, true);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -1345,7 +1390,7 @@ void TestDirtiedLog() {
   PolicyHarness harness(policy, true);
   auto &tracker = harness.tracker;
   tracker.EnableDirtiedLog();
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 16);
   const auto address = reinterpret_cast<uint64_t>(memory);
   RangeSet ranges;
@@ -1434,7 +1479,7 @@ void TestFaultAheadOverride() {
   PolicyHarness harness(policy, true);
   auto &tracker = harness.tracker;
   tracker.EnableDirtiedLog();
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 16);
   const auto address = reinterpret_cast<uint64_t>(memory);
   RangeSet ranges;
@@ -1470,7 +1515,7 @@ void TestFaultFoundDirty() {
   policy.ahead_pages = 4;
   PolicyHarness harness(policy, true);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 16);
   const auto address = reinterpret_cast<uint64_t>(memory);
   UploadAll(tracker, address, page_size * 16);
@@ -1490,7 +1535,7 @@ void TestForeignWatcherFaultsDoNotPromote() {
   policy.hot_max = 8;
   PolicyHarness harness(policy);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
   // The page is never uploaded, so it stays CPU-dirty: faults there belong to other watchers.
@@ -1507,7 +1552,7 @@ void TestForeignWatcherFaultsDoNotPromote() {
 void TestWrittenUploadCopiesOutsideLock() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 3);
   const auto address = reinterpret_cast<uint64_t>(memory);
   Check(tracker.IsRegionCpuModified(address, page_size * 3),
@@ -1574,7 +1619,7 @@ void TestDeferredFaultUnprotect() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 2);
   const auto address = reinterpret_cast<uint64_t>(memory);
   UploadAll(tracker, address, page_size * 2);
@@ -1677,7 +1722,7 @@ void TestFaultStressNoLostWrites(PageManager::DeferMode mode) {
   PolicyHarness harness(policy);
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr uint64_t pages = 32;
   auto *memory = Allocate(page_manager, pages);
   const auto address = reinterpret_cast<uint64_t>(memory);
@@ -1780,7 +1825,7 @@ void FaultBench() {
     TrackerHarness harness;
     auto &tracker = harness.tracker;
     auto &page_manager = harness.page_manager;
-    const auto page_size = page_manager.GetPageSize();
+    const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
     constexpr uint32_t writers = 8;
     constexpr uint64_t pages = 256;
     constexpr uint32_t rounds = 200;
@@ -1871,7 +1916,7 @@ void TestHotPageSettle() {
   policy.hot_max = 8;
   PolicyHarness harness(policy);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -1912,7 +1957,7 @@ void TestRangeSignature() {
   policy.hot_max = 8;
   PolicyHarness harness(policy, true);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto locked_signature = [&] { return tracker.RangeSignature(address, page_size * 4); };
@@ -2045,7 +2090,7 @@ void TestRangeDirtiedSignature() {
   policy.ahead_pages = 2;
   PolicyHarness harness(policy, true);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 4);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto dirtied = [&] { return tracker.RangeDirtiedSignature(address, page_size * 4); };
@@ -2101,7 +2146,7 @@ void TestRangeSignatureAcrossRegions() {
   constexpr uint64_t region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = static_cast<uint8_t *>(
       VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -2132,7 +2177,7 @@ void TestDirtyQueryAndGpuMirror() {
   constexpr uint64_t region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = static_cast<uint8_t *>(
       VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -2264,6 +2309,60 @@ void TestCrossRegionUpload() {
     tracker.UntrackMemory(address, region_size * 2);
   }
   Release(memory);
+}
+
+void TestDirtyRegionWalk() {
+  // KYTY_TRACKER_DIRTY_WALK (adapted from Senaxx 6625a63ec): a read-only upload over three
+  // existing regions that starts and ends inside them, with dirty pages in the first and last
+  // region only: exactly the dirty pages inside the range upload, and one just past its end stays
+  // dirty. Run with the walk off and on; both must agree.
+  constexpr uint64_t region_size = Libs::Graphics::TRACKER_REGION_SIZE;
+  for (const int walk : {0, 1}) {
+    MemoryTracker::SetDirtyWalk(walk);
+    TrackerHarness harness;
+    auto &tracker = harness.tracker;
+    const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+    auto *memory = AllocateFixedGuestRange(region_size * 3, region_size);
+    const auto address = reinterpret_cast<uint64_t>(memory);
+    tracker.ForEachUploadRange(address, region_size * 3, false,
+                               [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+    Check(!tracker.IsRegionCpuModified(address, region_size * 3),
+          "the first upload did not leave the three regions clean");
+
+    const auto begin = address + page_size * 3;
+    const auto end = address + region_size * 2 + page_size * 5;
+    tracker.MarkRegionAsCpuModified(address + page_size * 3, 16);
+    tracker.MarkRegionAsCpuModified(address + region_size * 2 + page_size * 4, 16);
+    tracker.MarkRegionAsCpuModified(address + region_size * 2 + page_size * 6, 16);
+    uint32_t ranges = 0;
+    bool first = false;
+    bool last = false;
+    tracker.ForEachUploadRange(
+        begin, end - begin, false,
+        [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+          Check(upload_size == page_size, "a dirty page uploaded with the wrong size");
+          first |= upload_address == address + page_size * 3;
+          last |= upload_address == address + region_size * 2 + page_size * 4;
+          ranges++;
+        },
+        []() noexcept {});
+    Check(ranges == 2 && first && last,
+          "the dirty walk did not upload exactly the dirty pages inside the range");
+    Check(tracker.IsRegionCpuModified(address + region_size * 2 + page_size * 6, 16) &&
+              !tracker.IsRegionCpuModified(begin, end - begin),
+          "the dirty walk cleared a page outside the range or left one inside dirty");
+    // A clean range uploads nothing and stays clean.
+    ranges = 0;
+    tracker.ForEachUploadRange(
+        begin, end - begin, false,
+        [&](uint64_t, uint64_t) noexcept { ranges++; }, []() noexcept {});
+    Check(ranges == 0, "a clean read-only upload reported pages");
+
+    tracker.MarkRegionAsCpuModified(address, region_size * 3);
+    tracker.UntrackMemory(address, region_size * 3);
+    Release(memory);
+  }
+  MemoryTracker::SetDirtyWalk(-1);
 }
 
 void TestConcurrentColdUploads() {
@@ -2595,7 +2694,7 @@ void TestCleanVerdictTrackerTransitionsBump() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -2710,7 +2809,7 @@ void TestCoherenceLogTrackerTransitions() {
   policy.hot_max = 8;
   PolicyHarness harness(policy);
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(harness.page_manager, 16);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto page = [&](uint64_t index) { return address + index * page_size; };
@@ -2794,7 +2893,7 @@ void TestCoherenceLogTrackerTransitions() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
-  const auto page_size = page_manager.GetPageSize();
+  const auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   auto *memory = Allocate(page_manager, 1);
   const auto address = reinterpret_cast<uint64_t>(memory);
   if (std::strcmp(name, "gpu-dirty-explicit-cpu") == 0) {
@@ -2971,6 +3070,7 @@ int main(int argc, char **argv) {
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
+  TestDirtyRegionWalk();
   TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
@@ -2980,6 +3080,7 @@ int main(int argc, char **argv) {
   TestCleanVerdictTrackerTransitionsBump();
   TestCleanVerdictCrossThreadInvalidation();
   TestFaultAheadWindow();
+  TestSequentialFaultAhead();
   TestMirrorsAcrossWords();
   TestHotPagePromotionAndUpload();
   TestHotPageDemotionPaths();

@@ -11,12 +11,15 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/streamCopyMemo.h"
 #include "graphics/host_gpu/writeTickMap.h"
 
 #include <array>
 #include <atomic>
+#include <string>
 #include <chrono>
 #include <deque>
+#include <unordered_map>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -33,6 +36,7 @@ class TextureCache;
 class UploadDma;
 struct UploadHostCopy;
 class CommandRecorder;
+class InplaceHeap;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
@@ -58,6 +62,12 @@ void NoteGuestWrite(uint64_t address, uint64_t size);
 // host copies that read the same bytes. NoteGuestWrite (labels written at CP time, WRITE_DATA,
 // flip labels) makes every queued host copy first.
 void NoteGpuOnlyWrite(uint64_t address, uint64_t size);
+// GPU thread, at a flip (the frame boundary): KYTY_UPLOAD_DMA_WRITE_DRAIN=frame makes every
+// queued host copy first (uploadDma.h).
+void NoteFrameBoundary();
+// GPU thread: KYTY_UPLOAD_DMA_WRITE_DRAIN=defer and host copies are queued, so a label written now
+// is to be written at its tick's completion instead (CommandProcessor::TryDeferLabel).
+[[nodiscard]] bool LabelWaitsForHostCopies();
 // The stream-copy part both share (internal).
 void NoteGuestWriteStream(uint64_t address, uint64_t size);
 } // namespace StreamCopyDefer
@@ -68,11 +78,30 @@ void NoteGuestWriteStream(uint64_t address, uint64_t size);
 // KYTY_BDA_WRITES=verify: dropped writes and written pages under a GPU-modified image are fatal.
 [[nodiscard]] bool BdaWritesVerify();
 
+// Reads an image's guest range when part of it is not mapped (streamed textures map only their
+// resident part): mapped bytes as they are, unmapped bytes as zero. False when nothing can be read.
+[[nodiscard]] bool ReadPartlyUnmappedImageBacking(uint64_t vaddr, void* data, uint64_t size);
+
 struct BufferContentRevision {
 	BufferId id;
 	uint64_t write_revision;
 	uint64_t global_epoch;
 	bool operator==(const BufferContentRevision&) const noexcept = default;
+};
+
+// KYTY_BDA_ACCESS_TAGS diagnostics, one counter per hop of a report (printed with BdaTags):
+// programs emitted with the tag check, fault-buffer scans recorded and read back on the host,
+// fault records read, and PrepareBda calls (operations that read through device addresses).
+struct BdaTagHops {
+	std::atomic<uint64_t> programs {0};
+	std::atomic<uint64_t> scans {0};
+	std::atomic<uint64_t> scans_read {0};
+	std::atomic<uint64_t> records {0};
+	std::atomic<uint64_t> prepares {0};
+	// KYTY_BDA_TAGS_GPU_COUNT: the GPU counters, accumulated from their readbacks.
+	std::atomic<uint64_t> gpu_calls {0};
+	std::atomic<uint64_t> gpu_zero {0};
+	std::atomic<uint64_t> gpu_untagged {0};
 };
 
 class BufferCache {
@@ -82,6 +111,12 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = uint64_t {1} << (40 - CACHING_PAGEBITS);
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// KYTY_RT_HW: the entry after the last page holds the device address of the native ray tracing
+	// context (NativeRayTracing); guest addresses never reach it (they index pages below
+	// CACHING_NUMPAGES). The page table buffer has room for it (BDA_PAGETABLE_ALLOCATION: one sparse
+	// block more; EnsureBdaPageTableEntry makes it resident in a sparse table).
+	static constexpr uint64_t NATIVE_RT_CONTEXT_PAGE = CACHING_NUMPAGES;
+	static constexpr uint64_t BDA_PAGETABLE_ALLOCATION = BDA_PAGETABLE_SIZE + 65536;
 	// Fault buffer layout: the fault bitmap (1 bit per page). With KYTY_BDA_WRITES it grows by the
 	// written-page bitmap of the same shape, the dropped-write counter (writes to pages without a
 	// cache buffer) and the store log (KYTY_BDA_STORE_LOG: a u32 count, then entries of 4 words
@@ -91,10 +126,23 @@ public:
 	static constexpr uint64_t BDA_WRITE_BITMAP_WORD   = FAULT_BITMAP_WORDS;
 	static constexpr uint64_t BDA_DROPPED_WRITES_WORD = 2 * FAULT_BITMAP_WORDS;
 	static constexpr uint64_t BDA_STORE_LOG_WORD      = BDA_DROPPED_WRITES_WORD + 4;
-	static constexpr uint64_t BDA_STORE_LOG_ENTRIES   = 4096;
+	// The log's capacity, a constant of the generated shaders: one dispatch's stores past it are
+	// dropped. A settle downloads the first BDA_STORE_LOG_PREFIX entries with the written-page list;
+	// a synchronous settle fetches the rest with a second copy when the log holds more
+	// (FaultManager::FetchBdaStoreLogTail), so a settle without such a dispatch costs what it did
+	// with a 4096-entry log. That capacity lost 16639 of the 20735 stores of a first dispatch into an
+	// output array without a cache buffer (one dword per thread group; another title), and the
+	// array's consumer hung the GPU.
+	static constexpr uint64_t BDA_STORE_LOG_ENTRIES   = 262144;
+	static constexpr uint64_t BDA_STORE_LOG_PREFIX    = 4096;
 	static constexpr uint64_t BDA_STORE_LOG_BYTES     = (4 + 4 * BDA_STORE_LOG_ENTRIES) * sizeof(uint32_t);
+	static constexpr uint64_t BDA_STORE_LOG_PREFIX_BYTES =
+	    (4 + 4 * BDA_STORE_LOG_PREFIX) * sizeof(uint32_t);
 	static constexpr uint64_t BDA_WRITES_FAULT_BUFFER_SIZE =
 	    BDA_STORE_LOG_WORD * sizeof(uint32_t) + BDA_STORE_LOG_BYTES;
+	// KYTY_BDA_TAGS_GPU_COUNT: get_bda_pointer calls, zero-entry calls, untagged-entry calls (u32,
+	// wrapping) after the largest layout; the fault buffer grows by 16 bytes for them.
+	static constexpr uint64_t BDA_TAG_COUNTER_WORD = BDA_WRITES_FAULT_BUFFER_SIZE / sizeof(uint32_t);
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
 	            TextureCache& texture_cache);
@@ -105,6 +153,90 @@ public:
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool write_fault = false);
 	// Once per completed guest flip (any thread): the frame clock of hot-page detection.
 	void                   AdvanceFrame() noexcept;
+	// KYTY_INPLACE (inplaceHeap.h): a command-processor CPU write of guest memory (DMA_DATA) is
+	// about to happen. Any thread.
+	void                   InplaceBeforeCpWrite(uint64_t vaddr, uint64_t size);
+	// KYTY_BDA_LIVE_PAGES = 0 | 1 | verify (bufferCacheLive.cpp; default 0, live; the state exists
+	// only when the variable is set at start). A CPU-dirty page of a BDA-mapped buffer that the full
+	// pass would upload is instead served to BDA reads from the guest bytes themselves: its page-table
+	// entry points into an imported window of the guest backing alias, and the page stays CPU-dirty
+	// and writable (no upload, no re-protection, no write fault). Invariants: rtskip DESIGN.md 4.
+	[[nodiscard]] int64_t BdaLivePagesMode() const;
+	[[nodiscard]] bool    BdaLivePagesBuilt() const { return m_bda_live != nullptr; }
+	// Before a full BDA pass (RenderContext::PrepareBda): restores the pages a tag report or the
+	// CP blacklist promoted, restores everything when the switch is 0, and uploads the forced set
+	// (entries given back without an upload). GPU thread.
+	void                   LivePagesPrePass();
+	// A command-processor or emulator write of guest memory is about to happen (any thread; waits on
+	// the GPU thread when it hits a page earlier recorded work can read live).
+	void                   LivePagesBeforeCpWrite(uint64_t vaddr, uint64_t size);
+	// The same for the StreamCopyDefer write hooks, on the cache that built the state (if any).
+	static void            LiveCpWriteHook(uint64_t vaddr, uint64_t size);
+	// Device-loss report lines of the state (SetDeviceLossNote; tries the lock, never waits).
+	static void            LiveDeviceLossNote();
+	// Guest unmap of [vaddr, vaddr + size): every redirect in it goes back (GPU thread).
+	void                   DropLivePages(uint64_t vaddr, uint64_t size);
+	// Whether the caching page of `vaddr` is served live (tests).
+	[[nodiscard]] bool     IsBdaLivePage(uint64_t vaddr) const;
+	// Whether it is served live and settled (a read upload made its cache copy current; tests).
+	[[nodiscard]] bool     IsBdaLivePageSettled(uint64_t vaddr) const;
+	// Tests only: marks the range GPU-dirty in the tracker without a written binding (the injection
+	// the V5 check must catch).
+	void                   TestingMarkGpuDirty(uint64_t vaddr, uint64_t size, bool mark = true);
+	// Verify V5 over the settled pages now (the pre-pass runs it in verify mode); returns the count.
+	uint64_t               CheckSettledLivePages();
+	struct BdaLiveTotals {
+		uint64_t redirects        = 0; // pages a full pass redirected instead of uploading
+		uint64_t held             = 0; // pages redirected now
+		uint64_t restore_upload   = 0; // restores: an upload covered the page
+		uint64_t restore_written  = 0; // restores: a written binding over the page
+		uint64_t restore_register = 0; // redirects dropped by a buffer (un)registration
+		uint64_t restore_unmap    = 0; // restores: guest unmap
+		uint64_t restore_read     = 0; // restores: a shader read the page live (tag report)
+		uint64_t restore_cp       = 0; // restores: CP blacklist
+		uint64_t restore_off      = 0; // restores: switch 0
+		uint64_t restore_writes   = 0; // restores: before a BDA-writing program
+		uint64_t forced_syncs     = 0; // forced-set ranges synchronized by the pre-pass
+		uint64_t live_reads       = 0; // tag reports of pages read through a redirect
+		uint64_t cp_hits          = 0; // CP / emulator writes over a redirected page
+		uint64_t cp_waits         = 0; // of them, GPU waits on the GPU thread
+		uint64_t cp_unordered     = 0; // of them, on another thread (counted only)
+		uint64_t rejects_window   = 0; // candidate pages without an imported window
+		uint64_t rejects_bound    = 0; // candidate pages a cache binding uploaded after a redirect
+		uint64_t blocked_passes   = 0; // passes with BDA-write settles pending (no redirects)
+		uint64_t faults           = 0; // guest write faults on tracked memory
+		uint64_t v1               = 0; // verify: CPU-dirty pages left on the cache entry (must be 0)
+		uint64_t v1_checks        = 0;
+		uint64_t v1_skipped       = 0; // checks skipped: the fault epoch moved during the pass
+		uint64_t v2               = 0; // verify: redirected pages that are GPU-dirty / hot / image-written
+		uint64_t v2_gpu           = 0; //   of them GPU-dirty (bits or bytes)
+		uint64_t v2_image         = 0; //   of them under a GPU-modified image range
+		uint64_t v2_hot           = 0; //   of them hot (a hot page is CPU-dirty: not a stale read by itself)
+		uint64_t v3               = 0; // verify: redirects alive at a BDA-writing program
+		uint64_t v4               = 0; // verify: forced pages still CPU-dirty after their upload (I3, must be 0)
+		uint64_t v4_checks        = 0;
+		uint64_t v5               = 0; // verify: settled pages GPU-dirty / image-written at the pre-pass (I-B1)
+		uint64_t v5_checks        = 0;
+		uint64_t v6               = 0; // entry writes while a staging reservation was open (I-S1, must be 0)
+		// KYTY_BDA_LIVE_BATCH (DESIGN.md 4.4)
+		uint64_t settled          = 0; // read uploads over a redirected page (restore left to the pre-pass)
+		uint64_t entry_copies     = 0; // page-table copy commands written for redirects / restores
+		uint64_t entry_copies_rendering = 0; // of them issued inside an active rendering instance
+		uint64_t entry_pages      = 0; // entries written by them
+		// Qualification (LiveSyncBufferRange)
+		uint64_t qual_calls       = 0; // calls during full passes
+		uint64_t qual_fast        = 0; // of them taking the no-dirty, no-redirect fast path
+		uint64_t qual_pages       = 0; // caching pages walked
+		uint64_t qual_dirty       = 0; // of them CPU-dirty candidates that reached the locked checks
+		uint64_t qual_segments    = 0; // SynchronizeBuffer calls the walk split the range into
+		uint64_t qual_ns          = 0; // time in LiveSyncBufferRange (includes those synchronizations)
+		uint64_t prepass_calls    = 0; // LivePagesPrePass calls (one per PrepareBda)
+		uint64_t prepass_work     = 0; // of them with something pending
+		uint64_t windows          = 0;
+		uint64_t pinned_bytes     = 0;
+		uint64_t import_failures  = 0;
+	};
+	[[nodiscard]] BdaLiveTotals GetBdaLiveTotals() const;
 	// While one is alive (GPU thread), CPU-dirty uploads are only queued on the current command
 	// buffer (KYTY_UPLOAD_BATCH, CommandBuffer::RequestUploadCopy); the outermost scope's end
 	// records them all behind one barrier. Every command recorded meanwhile through
@@ -129,6 +261,18 @@ public:
 	// (KYTY_READBACK_SIDE_WRITES may then leave the page clean for that second fault).
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
 	                                  bool retried_write = false);
+	// GPU thread (adapted from usa-ratt/KytyPS5-GT7 21246d78a and 41848bb9a, BufferCache::
+	// WriteClean): a game thread's faulting store of [vaddr, vaddr + size), done in place on both
+	// copies: guest memory through the backing store, the cached buffer in the command stream
+	// after the GPU's earlier writes. The page stays protected. `gpu_written`
+	// (KYTY_STORE_IN_PLACE): pages protected because the GPU wrote them, which then need no
+	// download first; `clean` (KYTY_STORE_CLEAN): CPU-clean pages watched for CPU writes, which
+	// then stay clean and protected instead of becoming CPU-dirty for the next sync to upload and
+	// protect again. False to decline (nothing to save, a readback or publication of these bytes
+	// is still to land, an image holds GPU-written bytes there, no cached buffer holds them): the
+	// fault then takes the normal path.
+	[[nodiscard]] bool     StoreInPlace(uint64_t vaddr, const void* data, uint64_t size,
+	                                    bool gpu_written, bool clean);
 	// Publishes (waiting if necessary) every pending side readback overlapping the range. Any
 	// thread; never waits for the current recording. Required before other ownership changes.
 	// Returns how many of them were eager copies.
@@ -153,10 +297,72 @@ public:
 	[[nodiscard]] bool TakeEagerFlushRequest(bool in_rendering);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// KYTY_DMA_PREFAULT_KB (GPU thread): a shader that reads guest memory through its page table
+	// (DMA) reads a page no cached buffer covers as zeros and only records the fault. The
+	// committed pages of [vaddr, vaddr + size) without a cached buffer get one, filled from guest
+	// memory; those with one are kept fresh in the LRU. Returns how many pages had none.
+	uint32_t MakeResident(uint64_t vaddr, uint64_t size);
+	// KYTY_BDA_HEAPS: a BDA access faulted at [vaddr, vaddr + size): the GPU-mapped allocation holding it
+	// becomes resident now and before every later BDA-writing dispatch (its other pages are the
+	// destinations of that and the next dispatches, which would drop their stores and atomics).
+	void NoteBdaFault(uint64_t vaddr, uint64_t size);
+	// KYTY_STREAM_COPY_REUSE (streamCopyMemo.h; command-processor thread): a packet that may write or
+	// wait on guest memory, or a new submission slice, was processed: no small stream copy made
+	// before it is reused after it.
+	void NewStreamEpoch() noexcept { m_stream_copy_memo.NewEpoch(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// KYTY_KEEP_BINDINGS (descriptors.cpp, RebindBuffers; GPU thread): a read binding (not written,
+	// not a texel read) whose ObtainBuffer was a cache-buffer result the binding memo now holds keeps
+	// that result for the next identical binding while nothing it depends on moved: no region serial
+	// anywhere (RegionManager::AnySerial, so every RangeSignature is unchanged), the same sync epoch
+	// and buffer structure epoch (the memo's guard). A normal lookup then hits the same memo entry
+	// (same key, signature, guard and epoch) and returns the same buffer and offset; the keep only
+	// repeats the hit's touch. KeepBegin is read before the lookup, KeepCapture after it.
+	struct KeepStamp {
+		uint64_t token     = 0; // 0: no capture
+		uint64_t epoch     = 0;
+		uint64_t structure = 0;
+	};
+	struct KeptRead {
+		KeepStamp stamp {};
+		uint64_t  vaddr   = 0;
+		uint64_t  size    = 0;
+		BufferId  id {};
+		Buffer*   buffer  = nullptr;
+		uint64_t  offset  = 0;
+		uint64_t  touched = UINT64_MAX;
+	};
+	[[nodiscard]] KeepStamp KeepBegin() const noexcept;
+	// True when `kept` now holds a result a later KeepValid may return.
+	bool KeepCapture(KeptRead& kept, const KeepStamp& stamp, uint64_t vaddr, uint64_t size, BufferId id,
+	                 const std::pair<Buffer*, uint64_t>& result);
+	// Whether ObtainBuffer(vaddr, size, false, false, id) would return kept's buffer and offset now
+	// (then touched as a hit is).
+	[[nodiscard]] bool KeepValid(KeptRead& kept, uint64_t vaddr, uint64_t size, BufferId id);
+	// KYTY_RAW_READ_IMAGE_SYNC=1 (default off; Ghost of Yotei preset): a shader's raw (unformatted)
+	// read-only binding whose range starts at a GPU-modified image takes the image's contents
+	// first, as a texel read does (SynchronizeBufferFromImage); the caller passes the buffer its
+	// ObtainBuffer returned. Without it such a read sees the buffer's stale bytes: Yotei's CS
+	// 4337635433d63234 copies the sky LUTs that CS 95c013c75f8e77ad writes as storage images
+	// through raw buffers and read zeros (cloud light direction wrong, cloud march skipped, dark
+	// shadow combine and water). Port of Erlou93/KytyPS5-Yotei SyncBufferFromWrittenImage (there
+	// inside ObtainBuffer, minus its image sources). Returns whether bytes were synchronized.
+	// GPU thread, outside every tracker and texture-cache lock.
+	[[nodiscard]] bool SyncRawReadFromWrittenImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static bool RawReadImageSyncEnabled();
+	// KYTY_RAW_READ_IMAGE_SYNC_OBTAINS=1 (default off; PPSA26344 preset; completes the port of
+	// Erlou93/KytyPS5-Yotei SyncBufferFromWrittenImage, which runs inside every read-only ObtainBuffer):
+	// the read-only obtains that are not shader bindings - index buffers, vertex buffer ranges, draw and
+	// dispatch indirect arguments and counts - take a GPU-written image's contents as raw shader reads
+	// do (SyncRawReadFromWrittenImage). Needs KYTY_RAW_READ_IMAGE_SYNC=1.
+	// KYTY_RAW_READ_IMAGE_SYNC_ONCE=1 (default off; PPSA26344 preset; Erlou's buffer_sync_serial gate):
+	// an image's contents are copied into a buffer once per image content serial (and buffer, start and
+	// size) instead of on every read while the image stays GPU-modified.
+	// Called before the obtain itself: the synchronization can join cache buffers, as ObtainBuffer can.
+	void PrepareReadRange(uint64_t vaddr, uint64_t size);
 	// KYTY_CP_BINDING_BATCH_PREFETCH (default on, live): a CPU cache hint for the binding memo
 	// slot a later ObtainBuffer(vaddr, size, false, false) on the GPU thread looks up. A stage's
 	// bindings issue all hints first (RenderExecutor::RebindBuffers), so the slots' cache misses
@@ -189,9 +395,31 @@ public:
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	// Both the first registration and the first consumer clear the table, so unowned entries read as zero.
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer();
+	// The page table entry index (one past the guest pages: NATIVE_RT_CONTEXT_PAGE) has memory.
+	void EnsureBdaPageTableEntry(uint64_t index);
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// The guest bytes of a range, staged for an image upload whatever buffer covers them (the
+	// caller knows the GPU wrote none of them; ObtainBufferForImage copies from such a buffer).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> StageGuestBytesForImage(uint64_t vaddr, uint64_t size);
+	// KYTY_PENDING_FILLS=1 (default off, read once; adapted from usa-ratt/KytyPS5-GT7 bdab60022): a
+	// GPU fill (FillBuffer's GPU path, or a compute shader's uniform fill, both recorded as known
+	// fills) that found no image still holds for its range, the bytes of it that were not mapped
+	// then among them: a render or depth target created later inside it starts as the fill
+	// (TextureCache::ClearFromKnownFill) instead of what its memory holds then.
+	[[nodiscard]] static bool PendingFillsEnabled();
+	// GPU thread, for a target made over [vaddr, vaddr + size): the dword of the known fill that
+	// holds all of it, when the mapped bytes of it are all still GPU-written. `take` forgets the
+	// range from the fill, which keeps the rest of it for other images.
+	[[nodiscard]] bool FillOfNewImage(uint64_t vaddr, uint64_t size, uint32_t& value, bool take);
+	// KYTY_PENDING_FILLS: a write over [vaddr, vaddr + size) the other paths do not see (an image's
+	// GPU write, a CPU-path fill or copy), newer than the fills there.
+	void ForgetFillsUnder(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// GPU thread, KYTY_SPARSE_FILLS: a GPU fill of the mapped `spans` of a range with holes in its
+	// mappings (a compute shader's fill of sparse memory), as the hardware's writes land there;
+	// the holes, where the hardware drops the writes, are left alone.
+	void FillMappedSpans(std::span<const std::pair<uint64_t, uint64_t>> spans, uint32_t value);
 	// CP WRITE_DATA to bytes owned by recorded GPU work: records the write (vkCmdUpdateBuffer)
 	// at its position in the GPU timeline and returns true; false leaves it to the CPU write.
 	[[nodiscard]] bool TryWriteDataGpu(uint64_t vaddr, const uint32_t* data, uint64_t size);
@@ -227,6 +455,22 @@ public:
 	// GPU-written bytes whose guest copy is not current: the exact GPU-dirty ranges, and the
 	// bytes an early release left to their publication (KYTY_FALSE_SHARING_WRITES).
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Every byte of the range is exact GPU-dirty data (upstream 9678c59b7, storage readback).
+	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) const {
+		return m_gpu_modified_ranges.Contains(vaddr, size);
+	}
+	// Diagnostics (KYTY_CS_VERIFY): the registered cache buffer holding [vaddr, vaddr + size) and the
+	// offset there, without any synchronization (nullptr: none). GPU thread.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> DebugPeekBuffer(uint64_t vaddr, uint64_t size);
+	// Diagnostics: whether [vaddr, vaddr + size) has CPU-modified (not yet uploaded) bytes.
+	[[nodiscard]] bool DebugCpuDirty(uint64_t vaddr, uint64_t size);
+	// KYTY_SRT_GPU_FILL (GPU thread): the guest dword at `vaddr` is GPU-written bytes that one
+	// registered buffer holds, with nothing newer elsewhere (no image over it, no pending
+	// publication or early release), so a GPU copy from that buffer reads its current value.
+	// The buffer's handle and the dword's offset in it go to `handle` / `offset` when not null.
+	// No buffer is created or synchronized.
+	[[nodiscard]] bool GpuFillSource(uint64_t vaddr, vk::Buffer* handle = nullptr,
+	                                 uint64_t* offset = nullptr);
 	// KYTY_READBACK_FLUSH_SIDE (bufferCache.cpp): guest reads served by a side copy after the
 	// command processor submitted the recording that wrote their bytes (process-wide; tests).
 	[[nodiscard]] static uint64_t ReadbackFlushSideCopies() noexcept;
@@ -252,6 +496,9 @@ public:
 	                                               uint64_t tick);
 	void EndBackingPublication(uint64_t token);
 	[[nodiscard]] bool HasPendingBackingPublication(uint64_t vaddr, uint64_t size) const;
+	// GPU thread (KYTY_DIRECT_READ_WAIT): waits until no queued backing publication covers the range,
+	// so a direct read of guest memory sees the bytes a download in flight is about to publish.
+	void WaitBackingPublications(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::optional<uint64_t> PendingBackingPublicationTick(uint64_t vaddr,
 	                                                                  uint64_t size) const;
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
@@ -268,11 +515,71 @@ public:
 	};
 	[[nodiscard]] PageStates CountPageStates(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool GpuDirtyMirrorMatches(uint64_t vaddr, uint64_t size);
-	void               ProcessFaultBuffer();
+	void               ProcessFaultBuffer(const std::vector<std::pair<uint64_t, uint64_t>>& mapped = {});
 	// Caller holds the mapped-range lock. Cache/tracker iteration remains on the GPU thread.
 	void               SynchronizeBdaBuffers(const RangeSet& mapped_ranges);
 	// Map/unmap callers may run outside the GPU thread, under the mapped-range lock.
 	void               InvalidateBdaSynchronization() noexcept;
+	// KYTY_BDA_REGISTER_LOG: a new registered buffer's range, logged for the next BDA pass
+	// (ChangeRegister<true>); every other structure change goes through
+	// InvalidateBdaSynchronization.
+	void               NoteBdaRegistered(uint64_t vaddr, uint64_t size);
+	// KYTY_BDA_REACH (bufferCacheReach.cpp; based on TheCruZ/KytyPS5-GTA SynchronizeDmaFootprint):
+	// uploads the CPU writes of the buffers in `spans` (sorted, disjoint, caching-page aligned,
+	// inside the GPU mappings) for an operation whose device-address reads cannot reach other
+	// memory, instead of a full BDA pass. verify: the checks described in bufferCacheReach.cpp.
+	// Returns the upload bytes. GPU thread.
+	uint64_t           SynchronizeBdaReach(std::span<const std::pair<uint64_t, uint64_t>> spans, bool verify);
+	// After a full BDA pass (or its skip) and whenever verification is off: every page-table entry
+	// the verification left zero gets its buffer's address back. GPU thread.
+	// keep_verifying false: the switch left verify (the verification stops).
+	void               RestoreBdaReachTraps(bool keep_verifying);
+	// The 4-byte aligned dwords at `address` as the GPU will read them: from the backing store, when
+	// the range is not GPU-modified (no newer bytes on the GPU). False otherwise.
+	[[nodiscard]] bool ReadGuestForBdaReach(uint64_t address, std::span<uint32_t> words);
+	// Verification totals since start (any thread reads them for the report).
+	struct BdaReachVerifyTotals {
+		uint64_t checks          = 0; // limited synchronizations checked
+		uint64_t inside_dirty    = 0; // normal CPU-dirty tracker pages left inside the reach (must be 0)
+		uint64_t trapped         = 0; // caching pages whose entry was zeroed (dirty, outside the reach)
+		uint64_t restored        = 0; // entries given back
+		uint64_t trap_faults     = 0; // GPU page faults on pages the verification zeroed (must be 0)
+		uint64_t log_overflows   = 0; // reach-log losses (pages dirtied then are not trapped)
+	};
+	[[nodiscard]] BdaReachVerifyTotals GetBdaReachVerifyTotals() const;
+	// FaultManager: a page fault the GPU recorded at [start, start + size).
+	void               NoteBdaReachFault(uint64_t start, uint64_t size);
+	// KYTY_BDA_ACCESS_TAGS (bufferCacheTags.cpp; based on upstream KytyPS5 0ec2cd5d5): bit 0 of a
+	// page-table entry tags a page a DMA shader accessed (shaders built with the codegen option
+	// report untagged pages through the fault bitmap). Live policy, only with that codegen option:
+	// 0 = the full BDA pass; 1 = the full pass uploads only tagged pages and buffers registered
+	// since the last pass; verify = the full pass, plus the miss count described in
+	// bufferCacheTags.cpp.
+	static constexpr vk::DeviceAddress BDA_ACCESSED = 1;
+	[[nodiscard]] int64_t BdaAccessTagsMode() const;
+	[[nodiscard]] bool    BdaAccessTagsBuilt() const { return m_bda_tags != nullptr; }
+	// The 10 s console line (BdaTags) while the codegen option is on. GPU thread.
+	void               ReportBdaTags();
+	// The tagged pass (mode 1) over the GPU mappings. Returns the upload bytes. GPU thread.
+	uint64_t           SynchronizeBdaTagged(const RangeSet& mapped_ranges);
+	// Mode verify, before the full pass: records the CPU-dirty pages the tagged pass would skip.
+	void               PrepareBdaTagVerify();
+	// After a full pass (modes 0 and verify): the buffers registered so far are uploaded, so they
+	// leave the pending set (verify then models a tagged pass that ran at the same points).
+	void               NoteBdaTagFullPass();
+	// FaultManager: pages a DMA shader reported (after FindBuffer made them backed where possible).
+	void               NoteBdaTagFault(uint64_t start, uint64_t size);
+	struct BdaTagTotals {
+		uint64_t tagged_pages   = 0; // pages tagged so far
+		uint64_t tagged_passes  = 0; // mode 1 passes
+		uint64_t tagged_bytes   = 0; // their uploads
+		uint64_t verify_passes  = 0; // mode verify passes
+		uint64_t would_skip     = 0; // pages a verify pass found the tagged pass would leave stale
+		uint64_t misses         = 0; // such pages a DMA shader then reported (must be 0)
+		uint64_t log_overflows  = 0; // reach-log losses during verify
+	};
+	[[nodiscard]] BdaTagTotals GetBdaTagTotals() const;
+	inline static BdaTagHops s_tag_hops; // KYTY_BDA_ACCESS_TAGS diagnostics (above the class)
 	void               RunGarbageCollector();
 	// KYTY_VRAM_STATS report lines (vramStats.h): guest buffers by age, the largest buffers of
 	// every kind, the guest address span they cover, the GC thresholds (GPU thread).
@@ -286,8 +593,64 @@ public:
 	// processor continues) and takes every page it wrote into GPU ownership exactly as a writable
 	// binding over the page would, so no later reader sees the page as clean. GPU thread.
 	void SettleBdaWrites(uint64_t shader_hash);
+	// KYTY_BDA_CPU_MERGE=1 (default 0): before a BDA-writing dispatch is prepared (before any
+	// upload), the guest bytes of the pages this shader's earlier settles found CPU-dirty
+	// (the guest wrote them while the dispatch ran). GPU thread.
+	void SnapshotBdaMergePages(uint64_t shader_hash);
+	// KYTY_CP_FAULT_WRITERS=1 (diagnostics): a read fault the command processor took on GPU-written
+	// bytes, with its handler time: aggregated by the newest recorded GPU writer of the address
+	// (shader, ticks between that write and the fault) and the op being prepared, every 10 s.
+	void NoteCpFault(uint64_t vaddr, uint64_t handler_ns);
+	// Diagnostics (KYTY_INDIRECT_ARGS_DIAG / KYTY_READINESS_DIAG, needs KYTY_CP_FAULT_WRITERS=1): the
+	// newest recorded GPU buffer write over `vaddr` ("<kind> 0x<hash> <ticks> ticks ago"), or "none".
+	[[nodiscard]] std::string DescribeNewestWriter(uint64_t vaddr);
+	// KYTY_BDA_ASYNC_SETTLE (bufferCache.cpp): finishes the settles whose dispatch completed (with
+	// wait_oldest, waits for the oldest first). GPU thread.
+	void ProcessPendingBdaSettles(bool wait_oldest);
 
 private:
+	void SettleBdaWritesAsync(uint64_t shader_hash);
+	struct PendingBdaSettle {
+		uint64_t tick = 0;
+		uint64_t hash = 0;
+		uint32_t slot = 0;
+		RangeSet predicted;
+	};
+	static constexpr uint32_t BdaWarmSettles    = 16;
+	static constexpr uint32_t BdaRelearnSettles = 4;
+	struct BdaPrediction {
+		RangeSet newer;
+		RangeSet older;
+		uint32_t sync_left = BdaWarmSettles;
+	};
+	struct BdaAsyncTotals {
+		uint64_t settles = 0, sync_learn = 0, predicted_pages = 0, late_pages = 0, stores = 0, dropped = 0,
+		         overflows = 0;
+	};
+	std::deque<PendingBdaSettle>                 m_bda_pending;
+	std::unordered_map<uint64_t, BdaPrediction>  m_bda_predict;
+	// KYTY_BDA_CPU_MERGE: per shader, the pages its settles found CPU-dirty; the snapshots of them
+	// taken before the current dispatch (page -> 4 KiB); a host-visible page for the GPU bytes.
+	std::unordered_map<uint64_t, std::vector<uint64_t>> m_bda_merge_pages;
+	std::unordered_map<uint64_t, std::vector<uint8_t>>  m_bda_merge_snapshots;
+	std::unique_ptr<Buffer>                             m_bda_merge_download;
+	// KYTY_CP_FAULT_WRITERS
+	struct CpFaultWriter {
+		uint64_t    vaddr = 0, size = 0, tick = 0, hash = 0;
+		const char* kind  = "";
+	};
+	struct CpFaultStats {
+		uint64_t    faults = 0, ns = 0, sample = 0, tick_delta = 0, reader = 0;
+		const char* kind   = "";
+		const char* reader_kind = "";
+	};
+	std::vector<CpFaultWriter>                    m_cp_fault_writers;
+	size_t                                        m_cp_fault_writer_next = 0;
+	std::unordered_map<uint64_t, CpFaultStats>    m_cp_fault_stats;
+	std::chrono::steady_clock::time_point         m_cp_fault_print {};
+	BdaAsyncTotals                               m_bda_async_totals;
+	std::chrono::steady_clock::time_point        m_bda_async_print {};
+
 	friend struct BufferCacheTestAccess;
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainImageStagingBuffer(uint64_t size);
 
@@ -339,6 +702,8 @@ private:
 		uint64_t verify_fault_epoch     = 0;
 		uint64_t verify_structure_epoch = 0;
 		uint64_t verify_mismatch_pages  = 0;
+		// KYTY_BDA_REACH: a footprint-limited synchronization (upload accounting only).
+		bool     reach                  = false;
 	};
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size, BdaSyncStats* stats);
 	// KYTY_BDA_HOT_SYNC pass: re-synchronizes only the hot page runs the last full pass recorded.
@@ -354,7 +719,10 @@ private:
 	// KYTY_BDA_DIRTY_LOG pass (SynchronizeBdaBuffersNow): synchronizes the ranges the tracker
 	// logged since the last pass (m_bda_dirtied) and the recorded hot runs, instead of every
 	// mapped buffer. False (nothing done) when a recorded hot run's buffer is gone.
-	[[nodiscard]] bool SynchronizeBdaDirtied(const RangeSet& mapped_ranges);
+	// `registered` (KYTY_BDA_REGISTER_LOG, may be null): the ranges of buffers registered since the
+	// last pass, synchronized as well.
+	[[nodiscard]] bool SynchronizeBdaDirtied(const RangeSet& mapped_ranges,
+	                                         const RangeSet* registered = nullptr);
 	// The BDA synchronization pass itself (SynchronizeBdaBuffers decides whether it runs).
 	void SynchronizeBdaBuffersNow(const RangeSet& mapped_ranges);
 	// KYTY_BUFFER_LOOKUP_STATS: the kind of the last SynchronizeBdaBuffersNow (BufferLookupStats::Part).
@@ -498,6 +866,9 @@ private:
 		uint64_t        vaddr     = 0;
 		uint32_t        size      = 0;
 		BindingMemoKind kind      = BindingMemoKind::Empty;
+		// KYTY_BINDING_CROSS_SETTLED: a cross-epoch check (relaxed and locked CPU-dirty queries)
+		// passed under `signature`.
+		bool            settled   = false;
 		uint64_t        epoch     = 0;
 		uint64_t        signature = 0;
 		uint64_t        guard     = 0; // stream: tick; cached: buffer structure epoch
@@ -582,6 +953,12 @@ private:
 	void SettleHotPages(uint64_t vaddr, uint64_t size);
 	void MaintainHotPages();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// `nothing` (optional): set when the call provably synchronized nothing because no image
+	// starts at or overlaps the range (KYTY_TEXEL_SYNC_MEMO).
+	[[nodiscard]] bool SynchronizeBufferFromImageCounted(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                                     bool* nothing);
+	[[nodiscard]] bool SynchronizeBufferFromImageImpl(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                                  bool* nothing);
 	// The texel-read download of one image that owns all of its bytes and starts at the read
 	// (SynchronizeBufferFromImage's image found by TextureCache::FindImageFromRange).
 	[[nodiscard]] bool SynchronizeBufferFromOwner(Buffer& buffer, Common::SlotId image_id);
@@ -610,6 +987,11 @@ private:
 		std::vector<uint8_t>    snapshot; // verify: their guest bytes when the pages were released
 		bool                    verify = false;
 	};
+	// KYTY_BDA_CPU_MERGE: a settled page the guest also wrote during the dispatch keeps both
+	// writers' bytes, as on the hardware: the dwords the dispatch changed (GPU bytes unlike the
+	// snapshot) are written into guest memory before the page's upload. False: no snapshot (the
+	// guest's page wins, as before).
+	bool MergeBdaCpuDirtyPage(Buffer& buffer, uint64_t page, uint64_t shader_hash);
 	// SettleBdaWrites for the written pages [vaddr, vaddr + size): the parts inside cache buffers.
 	void SettleBdaWrittenRange(uint64_t vaddr, uint64_t size, uint64_t shader_hash,
 	                           uint64_t& settled_pages);
@@ -629,8 +1011,46 @@ private:
 		uint64_t size       = 0;
 		bool     downloaded = false;
 	};
-	// The drain path: GPU thread only.
-	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace);
+	// KYTY_ASYNC_DRAIN (adapted from usa-ratt/KytyPS5-GT7's KYTY_ASYNC_READBACK): the download a
+	// guest thread's drain records is submitted and the GPU thread goes on; the guest thread waits
+	// for its publication, then FinishAsyncDrain releases the window on the GPU thread.
+	struct AsyncDrain {
+		uint64_t tick         = 0; // 0: nothing to wait for (done, or drained synchronously)
+		uint64_t window_begin = 0;
+		uint64_t window_end   = 0;
+	};
+	[[nodiscard]] static bool AsyncDrainEnabled();
+	// The drain path: GPU thread only. With `async` (guest-thread faults only) a recorded download
+	// is submitted without waiting and its tick returned in *async.
+	void ReadMemoryDrain(uint64_t vaddr, uint64_t size, bool is_write, ReadMemoryTrace& trace,
+	                     AsyncDrain* async = nullptr);
+	// GPU thread, after the guest thread waited for async.tick's publication: the window's pages
+	// lose their GPU-written protection when nothing was written to them since (else the drain is
+	// redone synchronously), and a write's bytes become CPU-dirty, as the synchronous drain does.
+	void FinishAsyncDrain(uint64_t vaddr, uint64_t size, bool is_write, const AsyncDrain& async,
+	                      ReadMemoryTrace& trace);
+	// KYTY_CLEAN_PAGE=1 (adapted from usa-ratt/KytyPS5-GT7 ba83f1a64, its round 135), GPU thread:
+	// the faulting pages [page_begin, page_end) are no longer GPU-written for the tracker and hold
+	// no GPU-written bytes, no bytes of a readback or publication still to land, and no GPU-written
+	// image: another thread's read made them current between the fault and now. The access then
+	// needs nothing (a write only its CPU-dirty transition), instead of a download of the window's
+	// other GPU-written ranges that it waits for. False when the switch is off.
+	// With KYTY_FAULT_PAGE_LIFT=1 also true when TryLiftFaultPages lifted the pages.
+	[[nodiscard]] bool FaultPagesCurrent(uint64_t page_begin, uint64_t page_end);
+	// KYTY_FAULT_PAGE_LIFT=1 (live, default off; adapted from usa-ratt/KytyPS5-GT7 6f3465806), GPU
+	// thread: the faulting pages are still protected as GPU-written but hold no GPU-written bytes,
+	// no bytes of a readback or publication still to land, no GPU-written image, and no address-
+	// writing shader is still running. Their protection is lifted (UnmarkRegionAsGpuModified)
+	// without a download, and true is returned. Without it the fault copies the window's other
+	// GPU-written ranges and waits for their writer.
+	[[nodiscard]] bool TryLiftFaultPages(uint64_t page_begin, uint64_t page_end);
+	// KYTY_CLEAN_READ=1 (default off; adapted from usa-ratt/KytyPS5-GT7 19b6c5cfb), GPU thread: a
+	// guest load of [vaddr, vaddr + size) faulted on a page protected because the GPU wrote other
+	// bytes of it. When none of these bytes is GPU-written, on its way back from the GPU (pending
+	// publication, early release), in a GPU-written image, or within reach of a running address-
+	// writing shader, copies them from guest memory into `data` and returns true: the fault
+	// handler completes the load with them and the page stays protected.
+	[[nodiscard]] bool TryReadCleanBytes(uint64_t vaddr, uint64_t size, void* data);
 	// KYTY_FALSE_SHARING_WRITES (default off; =1 on). A guest write fault on a GPU-owned tracker
 	// page whose written bytes the GPU never wrote (m_gpu_modified_ranges is byte-exact while
 	// protection is per page: e.g. a per-frame CPU block right after a GPU-written binding that
@@ -676,6 +1096,45 @@ private:
 	[[nodiscard]] bool OverlapsPendingSideReadback(uint64_t begin, uint64_t end) const;
 	// Every GPU-side write of cached buffer contents for a guest range (GPU thread).
 	void NoteBufferContentWrite(uint64_t vaddr, uint64_t size);
+
+public:
+	// Colour metadata watches (KYTY_DCC_GPU_WIDE, TextureCache::TryMaterializeGpuMetadataClear; after
+	// usa-ratt/KytyPS5-GT7's WatchMetadata): WatchMetadata starts watching [vaddr, vaddr + size) as
+	// written by nothing since; any GPU write noted for the buffer cache (NoteBufferContentWrite),
+	// an upload of CPU-dirty bytes, a CPU-side invalidation or an unbounded GPU write over it marks it
+	// written. MetadataUnwritten: the exact range is watched, unwritten and not CPU-modified now.
+	// Byte-exact, unlike a buffer's content revision (any write anywhere in the buffer).
+	void               WatchMetadata(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool MetadataUnwritten(uint64_t vaddr, uint64_t size);
+	// KYTY_CP_DECISION_MEMORY (graphicsRun.cpp): the same byte-exact watch, in its own set, for the
+	// guest bytes a command-processor write put on the GPU timeline (TryWriteDataGpu) with a value the
+	// command processor knows. CpValueUnwritten: the exact range is watched, unwritten since and not
+	// CPU-modified now, so the known value is still the bytes' value.
+	void               WatchCpValue(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool CpValueUnwritten(uint64_t vaddr, uint64_t size);
+	// KYTY_CP_WRITE_THROUGH=1 (live, default off; based on Erlou93/KytyPS5-Yotei's
+	// BufferCache::TryCpWriteThrough), GPU thread: a command-processor write (record-time label,
+	// WRITE_DATA) of [vaddr, vaddr + size) into a page the GPU modified, none of whose written bytes
+	// the GPU owns (not GPU-dirty, no pending publication or side readback, no GPU-modified image):
+	// written to the backing (no fault, no drain) and to the cached GPU copy at this point of the
+	// command stream, so both copies hold it and the page stays GPU-owned. False: the caller writes
+	// it as before.
+	[[nodiscard]] static bool CpWriteThroughEnabled();
+	[[nodiscard]] bool        TryCpWriteThrough(uint64_t vaddr, const void* data, uint64_t size);
+
+private:
+	void NoteMetadataWrite(uint64_t vaddr, uint64_t size);
+	struct MetadataWatch {
+		uint64_t end     = 0;
+		bool     written = false;
+	};
+	std::mutex                        m_metadata_watch_mutex;
+	std::map<uint64_t, MetadataWatch> m_metadata_watches; // by first byte
+	uint64_t                          m_metadata_watch_span = 0;
+	std::atomic<size_t>               m_metadata_watch_count {0};
+	std::map<uint64_t, MetadataWatch> m_cp_value_watches; // m_metadata_watch_mutex
+	uint64_t                          m_cp_value_watch_span = 0;
+	std::atomic<size_t>               m_cp_value_watch_count {0};
 	// A reader needed a readback of [vaddr, vaddr + size): its pages become read-hot (GPU thread).
 	void NoteEagerRead(uint64_t vaddr, uint64_t size, bool gpu_thread_reader);
 	[[nodiscard]] EagerReadbackPages::IssueResult TryIssueEagerReadback(uint64_t page,
@@ -721,7 +1180,65 @@ private:
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
+	// KYTY_BDA_HEAPS: allocations made resident by NoteBdaFault, re-ensured before BDA writers.
+	std::mutex                                        m_bda_heaps_mutex;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_bda_heaps;
+	bool                                              m_bda_heaps_loaded = false;
 	PageTable                                         m_page_table;
+	// KYTY_BDA_REACH=verify state (bufferCacheReach.cpp), created on first use.
+	struct BdaReachVerify;
+	// shared_ptr: the type is complete only in bufferCacheReach.cpp.
+	std::shared_ptr<BdaReachVerify>                   m_bda_reach;
+	// KYTY_BDA_ACCESS_TAGS state (bufferCacheTags.cpp), created when the codegen option is on.
+	struct BdaTags;
+	std::shared_ptr<BdaTags>                          m_bda_tags;
+	void CreateBdaTags();
+	// ChangeRegister: tags the accessed pages among `entries` (page-table entries from first_page)
+	// and queues a registered range for the next tagged pass.
+	void ApplyBdaTags(uint64_t first_page, std::span<vk::DeviceAddress> entries, bool insert);
+	// The entry of `page` with its accessed tag (0 stays 0).
+	[[nodiscard]] vk::DeviceAddress TaggedBdaEntry(uint64_t page, vk::DeviceAddress entry) const;
+	// Whether a DMA shader reported the caching page (false without tags).
+	[[nodiscard]] bool BdaTagAccessed(uint64_t page) const;
+	// ChangeRegister: page-table entries of [first_page, last_page) were rewritten.
+	void NoteBdaReachRegister(uint64_t first_page, uint64_t last_page, bool insert);
+	// KYTY_BDA_LIVE_PAGES state (bufferCacheLive.cpp), created when the variable is set at start.
+	struct BdaLive;
+	std::shared_ptr<BdaLive>                          m_bda_live;
+	// Pages redirected now (lock-free fast path of the hooks).
+	std::atomic<uint64_t>                             m_bda_live_count {0};
+	// Guest write faults (any thread), for the report line.
+	std::atomic<uint64_t>                             m_bda_live_faults {0};
+	// Set by SynchronizeBdaBuffers around the full pass: SynchronizeBuffersInRange redirects then.
+	bool                                              m_bda_live_pass = false;
+	void CreateBdaLive();
+	// SynchronizeBuffersInRange during a full pass with the switch on: qualifying caching pages of
+	// [start, start + size) of `buffer` are redirected, the rest synchronized as before.
+	void LiveSyncBufferRange(BufferId id, uint64_t start, uint64_t size, BdaSyncStats* stats);
+	// The redirect entry of `page` (0 when not redirected); with its tag when tags exist and the page
+	// was reported.
+	[[nodiscard]] vk::DeviceAddress LiveEntry(uint64_t page) const;
+	enum class LiveRestore : uint8_t { Upload, Written, Register, Unmap, Read, Cp, Off, Writes };
+	// Gives the redirected pages of [vaddr, vaddr + size) their cache entries back (0 without a buffer)
+	// and queues them in the forced set. Register: the caller rewrote the entries already. GPU thread.
+	// With `writes` the entries are appended there for one later flush (WriteLiveEntries).
+	void RestoreLivePages(uint64_t vaddr, uint64_t size, LiveRestore why,
+	                      std::vector<std::pair<uint64_t, vk::DeviceAddress>>* writes = nullptr);
+	// KYTY_BDA_LIVE_BATCH (I-B1): a read upload over redirected pages of [vaddr, vaddr + size) marks
+	// them settled (restored at the next pre-pass) instead of restoring them; 0 = restore at once.
+	void SettleLivePages(uint64_t vaddr, uint64_t size);
+	// Writes page-table entries (page, entry): one copy when batching, else one copy per run.
+	void WriteLiveEntries(std::vector<std::pair<uint64_t, vk::DeviceAddress>>& writes, bool batch);
+	// The redirect entries a full pass queued (I-B2), written before the operation.
+	void FlushLiveRedirects();
+	// NoteBdaTagFault: a shader reported `page`; a redirected one is restored at the next pre-pass (I5).
+	void LiveNoteTagRead(uint64_t page);
+	// After a full pass ran: V1/V2 (verify), and the tick later CP writes wait for.
+	void LivePagesAfterPass(const RangeSet& mapped_ranges, uint64_t fault_epoch_before);
+	// KYTY_BDA_WRITES: before a BDA-writing program, every redirect is restored and uploaded (I-W1).
+	void LivePagesBeforeBdaWrites();
+	// Faults counter (InvalidateMemory on a write fault) and the 10 s report (AdvanceFrame).
+	void ReportBdaLive();
 	RangeSet                                          m_gpu_modified_ranges;
 	uint64_t                                          m_unregister_epoch = 0;
 	struct KnownFillRange {
@@ -769,6 +1286,9 @@ private:
 	// uploads; a page every BDA draw re-examines but the CPU rewrites about once a frame costs
 	// hundreds of 4 KiB compares per frame instead of one fault.
 	uint32_t                                          m_hot_check_limit  = 64;
+	// KYTY_INDIRECT_FORMAT_COUNT (CodegenOptions.h): per-format call counters of the full decoder.
+	std::unique_ptr<Buffer>                           m_format_counts;
+	uint32_t                                          m_format_count_frames = 0;
 	// KYTY_BUFFER_RANGE_MEMO (nullptr when disabled).
 	std::unique_ptr<RangeMemo[]>                      m_range_memo;
 	// Always counted (GPU thread; the BufferRangeMemo* frame events need a connected profiler).
@@ -796,6 +1316,11 @@ private:
 	uint32_t                                          m_binding_memo_shift = 53; // 64 - log2(slots)
 	int                                               m_binding_memo_verify = 0;
 	bool                                              m_binding_memo_cross  = false;
+	// KYTY_BINDING_CROSS_SETTLED (ObtainReadBindingMemo) outcomes.
+	struct CrossEpochTotals {
+		uint64_t fast = 0, verify_checks = 0, verify_mismatches = 0;
+	};
+	CrossEpochTotals                                  m_cross_epoch_totals;
 	struct BindingMemoTotals {
 		uint64_t hot_hits          = 0; // successful hits through the optional front tier
 		uint64_t stream_hits       = 0;
@@ -860,6 +1385,21 @@ private:
 	bool                                              m_bda_log_baseline = false;
 	int                                               m_bda_log_verify   = 0;
 	RangeSet                                          m_bda_dirtied;
+	// KYTY_BDA_REGISTER_LOG=1 (default off; needs KYTY_BDA_DIRTY_LOG; adapted from the GT7 fork's
+	// b970ba6fe, whose BDA walk visits only the regions where pages turned CPU-dirty or a buffer
+	// was registered since the last walk). A new registered buffer moves the structure epoch, and
+	// the pass after it used to scan every mapped buffer. With the log, a pass whose structure
+	// changed only by new buffers (the layout epoch, moved by unregistrations and GPU mapping
+	// changes, held) synchronizes the logged CPU-dirty ranges plus the new buffers' ranges.
+	// m_bda_registered and the structure epoch move together under m_bda_registered_mutex, so a
+	// pass takes the log with the epoch it accounts for.
+	bool                                              m_bda_register_log = false;
+	std::mutex                                        m_bda_registered_mutex;
+	RangeSet                                          m_bda_registered;
+	bool                                              m_bda_registered_overflow = false;
+	std::atomic_uint64_t                              m_bda_layout_epoch {1};
+	uint64_t                                          m_bda_scanned_layout_epoch = 0;
+	uint64_t                                          m_bda_register_passes      = 0;
 	struct BdaLogTotals {
 		uint64_t passes                = 0;
 		uint64_t ranges                = 0;
@@ -906,7 +1446,14 @@ private:
 	StreamBuffer                                      m_staging_buffer;
 	// After the staging ring: destroyed first, waiting for its copies that read the ring.
 	std::unique_ptr<UploadDma>                        m_upload_dma;
+	// KYTY_INPLACE (inplaceHeap.h), null when off.
+	std::unique_ptr<InplaceHeap>                      m_inplace;
+	// GPU thread: [vaddr, +size) bound to an imported window when every page is a candidate and
+	// guest memory holds its current bytes.
+	[[nodiscard]] bool TryInplaceBinding(uint64_t vaddr, uint64_t size, std::pair<Buffer*, uint64_t>& result);
 	StreamBuffer                                      m_stream_buffer;
+	// KYTY_STREAM_COPY_REUSE (streamCopyMemo.h): the small stream copies of the current tick and epoch.
+	StreamCopyMemo                                    m_stream_copy_memo;
 	// KYTY_STREAM_COPY_DEFER: copies encoded for the recorder that it may not have executed yet
 	// (ring position after each), in encoding order from m_deferred_head; [lo, hi) bounds them.
 	struct DeferredCopy {

@@ -13,11 +13,15 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/lodStats.h"
 #include "graphics/host_gpu/renderer/occlusion.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <atomic>
+#include <span>
+#include <string>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -112,6 +116,9 @@ private:
 	RenderMutex& m_mutex;
 };
 
+class NativeRayTracing;
+struct ShaderStageRuntime;
+
 class RenderContext {
 public:
 	explicit RenderContext(GraphicContext& graphics);
@@ -137,8 +144,19 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionCounter&   GetOcclusionCounter() { return m_occlusion_counter; }
 	LodStatsCounter&    GetLodStats() { return m_lod_stats; }
+	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
+	// KYTY_RT_HW (nativeRayTracing.h): created at its first use, on the GPU thread.
+	NativeRayTracing&   GetNativeRayTracing();
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Store in place (KYTY_STORE_IN_PLACE / KYTY_STORE_CLEAN, adapted from usa-ratt/KytyPS5-GT7
+	// 21246d78a and 41848bb9a). A game thread's write fault: whether its store may be done in place
+	// (a cheap hint; the GPU thread decides).
+	[[nodiscard]] bool IsStoreInPlaceCandidate(uint64_t fault_vaddr) noexcept;
+	// The store at `pc` that faulted at fault_vaddr: [vaddr, vaddr + size) written to both copies
+	// by the GPU thread (BufferCache::StoreInPlace), the page left protected. False to decline.
+	[[nodiscard]] bool TryStoreInPlace(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr,
+	                                   const void* data, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// A host write of the whole of [vaddr, vaddr + size) is about to happen (an APR file read):
 	// when resource tracking watches any of its pages, one invalidation of the range (as the
@@ -147,6 +165,9 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// GPU preparation only, outside texture-cache/tracker locks. Does not download dirty images.
 	[[nodiscard]] bool SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
+	// Diagnostics: why a read of [vaddr, vaddr + size) is not clean (mapping, GPU-dirty bytes, a
+	// pending publication, GPU-modified images over it, the newest recorded buffer writer).
+	[[nodiscard]] std::string DescribeGpuBackingForRead(uint64_t vaddr, uint64_t size);
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	// The host protection of the range was replaced behind the page tracker (PageManager::
@@ -154,7 +175,27 @@ public:
 	void ResyncHostProtection(uint64_t vaddr, uint64_t size) {
 		m_page_manager.ResyncHostProtection(vaddr, size);
 	}
+	// KYTY_MPROTECT_TRACKED_ONCE (PageManager::ProtectGuestWritable).
+	void ProtectGuestWritable(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode guest_mode) {
+		m_page_manager.ProtectGuestWritable(vaddr, size, guest_mode);
+	}
 	void               PrepareBda();
+	// KYTY_BDA_REACH=1|verify (default off, live; renderContextReach.cpp; based on TheCruZ/KytyPS5-GTA
+	// SynchronizeDmaFootprint): the stages of one draw or dispatch. When every stage that reads
+	// through device addresses has a reach proven for its inputs (ShaderInfo write_ranges.dma), only
+	// the buffers inside the reach are synchronized; otherwise, and with the switch off, PrepareBda().
+	struct BdaReachStage {
+		const ShaderStageRuntime*                 runtime = nullptr;
+		// Bindless patches of the stage's flattened SRT (PreparedBindings::bindless_patches).
+		std::span<const std::array<uint32_t, 3>> bindless_patches;
+		std::array<uint32_t, 3>                  groups {};
+		bool                                     has_groups = false;
+		// A mesh stage's index bytes [mesh_index_begin, mesh_index_end), when known (may be empty).
+		bool                                     mesh_index_known = false;
+		uint64_t                                 mesh_index_begin = 0;
+		uint64_t                                 mesh_index_end   = 0;
+	};
+	void               PrepareBda(std::span<const BdaReachStage> stages);
 	void               RunGarbageCollector();
 	// KYTY_VRAM_STATS (vramStats.h): one GPU memory report (GPU thread).
 	void               ReportVram();
@@ -191,6 +232,9 @@ private:
 		int                                 event_id = 0;
 	};
 
+	// Waits for the image write-backs over the range's pages; returns whether any overlapped.
+	bool WaitWriteBacks(uint64_t vaddr, uint64_t size);
+
 	GraphicContext&           m_graphics;
 	RenderMutex               m_mutex;
 	RenderExecutor            m_render_executor;
@@ -203,6 +247,8 @@ private:
 	TextureCache              m_texture_cache;
 	OcclusionCounter          m_occlusion_counter;
 	LodStatsCounter           m_lod_stats;
+	// Created empty; its Vulkan objects exist only once a bindless program runs (EnsureCreated).
+	BindlessTable             m_bindless_table;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
@@ -210,8 +256,11 @@ private:
 	std::shared_mutex         m_gpu_notify_mutex;
 	GuestGpu*                 m_gpu_notify = nullptr;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
+	std::unique_ptr<NativeRayTracing> m_native_ray_tracing;
 	bool                      m_fault_process_pending = false;
-	bool                      m_bda_logged = false;
+	// KYTY_BDA_REACH state (renderContextReach.cpp; shared_ptr: complete only there).
+	struct BdaReach;
+	std::shared_ptr<BdaReach> m_bda_reach;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

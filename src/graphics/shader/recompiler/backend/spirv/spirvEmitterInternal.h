@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -18,6 +19,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
 #include <type_traits>
@@ -39,6 +41,7 @@ struct OutputBinding : IR::StageOutput {
 
 using ImageDimension = Decoder::ImageDimension;
 
+// Component counts are the guest's; 1D images are host 2D images one texel high.
 struct ImageDimensionInfo {
 	ImageDimension dimension;
 	uint32_t       spirv_dimension;
@@ -46,16 +49,17 @@ struct ImageDimensionInfo {
 	uint32_t       spatial_components;
 	uint32_t       arrayed;
 	uint32_t       multisampled;
+	bool           one_dimensional;
 };
 
 constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
-    {ImageDimension::Dim1D, spv::Dim1D, 1, 1, 0, 0},
-    {ImageDimension::Dim1DArray, spv::Dim1D, 2, 1, 1, 0},
-    {ImageDimension::Dim2D, spv::Dim2D, 2, 2, 0, 0},
-    {ImageDimension::Dim2DArray, spv::Dim2D, 3, 2, 1, 0},
-    {ImageDimension::Dim3D, spv::Dim3D, 3, 3, 0, 0},
-    {ImageDimension::Dim2DMsaa, spv::Dim2D, 2, 2, 0, 1},
-    {ImageDimension::Dim2DMsaaArray, spv::Dim2D, 3, 2, 1, 1},
+    {ImageDimension::Dim1D, spv::Dim2D, 1, 1, 0, 0, true},
+    {ImageDimension::Dim1DArray, spv::Dim2D, 2, 1, 1, 0, true},
+    {ImageDimension::Dim2D, spv::Dim2D, 2, 2, 0, 0, false},
+    {ImageDimension::Dim2DArray, spv::Dim2D, 3, 2, 1, 0, false},
+    {ImageDimension::Dim3D, spv::Dim3D, 3, 3, 0, 0, false},
+    {ImageDimension::Dim2DMsaa, spv::Dim2D, 2, 2, 0, 1, false},
+    {ImageDimension::Dim2DMsaaArray, spv::Dim2D, 3, 2, 1, 1, false},
 }};
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
@@ -68,8 +72,15 @@ struct SpirvRequirements {
 	// Native subgroup reductions of DPP row scans (IR::MatchLaneReduction, KYTY_LANE_REDUCTIONS).
 	bool subgroup_arithmetic          = false;
 	bool compute_derivatives          = false;
+	// KYTY_IMPLICIT_LOD_STAGES: a compute program with implicit-LOD samples (ComputeImplicitLod).
+	bool implicit_compute_lod         = false;
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
+	// KYTY_LDS_SLOTS (CodegenOptions::lds_slots): the element offsets k of a non-compute stage's
+	// function-scope LDS accesses when each is a dword access of element LaneId + k
+	// (StaticLdsSlot), and whether some access is not (then the array stays).
+	std::vector<uint32_t> lds_slot_keys;
+	bool                  lds_slots_blocked = false;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	// A pixel shader's DS_APPEND/DS_CONSUME elect a non-helper lane (KYTY_PS_APPEND_LIVE_ELECTION).
@@ -79,15 +90,41 @@ struct SpirvRequirements {
 	bool buffer_u16                   = false;
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
+	// KYTY_COHERENT_GLC_ONLY: a coherent buffer access narrower than 32 bits (u8/u16 alias), a
+	// BUFFER_GL0/GL1_INV, and an image store or atomic; each keeps whole-program coherence.
+	bool coherent_narrow              = false;
+	bool coherent_dcache              = false;
+	bool image_writes                 = false;
 	// A buffer store or atomic anywhere in the program; without one (and without coherent loads)
 	// the storage buffers are declared NonWritable (CodegenOptions::readonly_buffers).
 	bool buffer_writes                = false;
 	bool float64                      = false;
+	// KYTY_NATIVE_F16: HalfPk* operations (Float16 and the 16-bit float controls).
+	bool native_half                  = false;
 	// S_MEMREALTIME reads the host shader clock (OpReadClockKHR, VK_KHR_shader_clock).
 	bool shader_clock                 = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+// KYTY_BUFFER_PAIR_ATOMIC_HASHES=<hex>[,<hex>...]: limits KYTY_BUFFER_PAIR_ATOMIC to those programs
+// (the large Miles RT kernels hit "Shader Instruction Error" device losses with it); unset = all.
+[[nodiscard]] bool BufferPairAtomicProgram(uint64_t shader_hash);
+
+// KYTY_LANE2_SHARE (spirvEmitterLaneShare.cpp): with lane_count 2 every IR instruction is emitted once
+// per wave half; a value proven the same in both halves is emitted by the low half only.
+struct LaneShareState {
+	bool active = false;
+	// Instructions the high half does not emit (uniform minus the whole-wave ones it already reuses).
+	std::unordered_set<const IR::Inst*> shared;
+	// Every instruction proven to have the same value in both halves.
+	std::unordered_set<const IR::Inst*> uniform;
+	size_t   instructions = 0;
+	uint64_t reused       = 0;
+};
+
+struct EmitterState;
+// KYTY_COHERENT_GLC_ONLY bookkeeping (KYTY_COHERENT_GLC_LOG=1 logs each coherent program).
+void CountCoherentProgram(const EmitterState& state, bool per_access);
 
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
@@ -114,6 +151,9 @@ struct EmitterState {
 	uint32_t                                        i32_type = 0;
 	uint32_t                                        f32_type = 0;
 	uint32_t                                        f64_type = 0;
+	// KYTY_NATIVE_F16: float16 and f16vec2 (EmitHalfPk).
+	uint32_t                                        f16_type = 0;
+	uint32_t                                        f16_pair_type = 0;
 	uint32_t                                        u32_pair_type = 0;
 	uint32_t                                        i32_pair_type = 0;
 	uint32_t                                        function_type = 0;
@@ -122,11 +162,13 @@ struct EmitterState {
 	std::array<uint32_t, 3>                          i32_vector_types {};
 	std::array<uint32_t, 3>                          f32_vector_types {};
 	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
+	uint32_t                                         tess_patch_base     = 0;
 	uint32_t                                         tess_inner_variable = 0;
 
 	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	LaneShareState                                   lane_share;
 	// KYTY_WAVE64_WARPS (split wave): a wave64 compute workgroup of one wave runs as two 32-wide
 	// host subgroups, one guest lane per invocation (lane_count 1). Cross-lane operations
 	// exchange the halves through workgroup memory (ExchangeWaveValue), and DS accesses
@@ -142,6 +184,8 @@ struct EmitterState {
 	std::unordered_set<const IR::Block*>*            wave_sync_blocks        = nullptr;
 	// DS instructions write the LDS, so DS reads must wait for the other half too.
 	bool                                             ds_writes_lds           = false;
+	// KYTY_SPLIT_LDS_WRITE_SYNC: no LDS read since the last split-wave barrier in this block.
+	bool                                             lds_split_synced        = false;
 	// KYTY_WAVE32_CLUSTERS (Spirv::WaveClustersActive): a wave32 program on a host subgroup that may
 	// hold two guest waves keeps each to its own 32 lanes (EmitSubgroupLocalInvocationId,
 	// EmitHostLane, EmitWaveBallot).
@@ -152,12 +196,27 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u8_variable = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
+	// KYTY_COHERENT_GLC_ONLY: the Coherent alias the GLC/DLC 32-bit buffer accesses use (0 = none:
+	// every alias carries the program's coherence).
+	uint32_t                                         storage_buffer_coherent_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	// KYTY_RT_FUNCTION: the module's one software BVH node test function (DefineBvhNodeTestFunction).
 	uint32_t                                         bvh_node_test_function  = 0;
+	// Native ray tracing (spirvEmitterRayQuery.cpp): function variables per site and emulated half.
+	struct RayQuerySiteVariables {
+		std::array<uint32_t, 2> query {}, state {}, instance {}, node {}, word {}, saved_t {}, saved_node {},
+		    saved_inst {}, nodes {}, slots {}, keep {};
+		uint32_t selected = 0;
+		uint32_t rounds   = 0;
+	};
+	std::array<RayQuerySiteVariables, 4>             ray_query {};
+	bool                                             ray_query_keep = false;
+	// PS5 Pro IMAGE_BVH8_INTERSECT_RAY: its result struct and module function (spirvEmitterBvh8.cpp).
+	uint32_t                                         bvh8_result_type        = 0;
+	uint32_t                                         bvh8_intersect_function = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -167,6 +226,36 @@ struct EmitterState {
 	// the mip_stats binding stays declared, but no sample records GET_LOD_STATS feedback.
 	bool                                             mip_stats_records            = true;
 	uint32_t                                         flattened_srt_variable  = 0;
+	// KYTY_SRT_UNIFORM: flattened_srt_variable is a uniform block (FlattenedSrtElementPointerType).
+	bool                                             flattened_srt_uniform   = false;
+	// Bindless images: set-1 runtime arrays by image type, the key -> slot translation buffer,
+	// the feedback buffer, and the slot of the image instruction being emitted.
+	std::map<uint32_t, uint32_t>                     bindless_image_variables;
+	uint32_t                                         bindless_translation_variable = 0;
+	uint32_t                                         bindless_feedback_variable    = 0;
+	uint32_t                                         bindless_slot                 = 0;
+	// KYTY_BINDLESS_SAMPLERS: the sampler array of set 1, and the slot of the current instruction's
+	// bindless sampler (0: its sampler is not bindless).
+	uint32_t                                         bindless_sampler_variable     = 0;
+	uint32_t                                         bindless_sampler_slot         = 0;
+	// KYTY_BINDLESS_3D_AS_ARRAY: the raw translation entry behind bindless_slot
+	// (BindlessSlotArrayFlag marks a 2D or 2D-array texture a 3D image instruction samples).
+	uint32_t                                         bindless_translation_raw      = 0;
+	// KYTY_RUNTIME_IMAGES: the runtime image table and request buffer (set 1, bindings 7 and 8).
+	uint32_t                                         runtime_image_table_variable    = 0;
+	uint32_t                                         runtime_image_requests_variable = 0;
+	// While image_override_index names a resource, ImageResourceAt() returns image_override for
+	// it: the same instruction emitted against another view type of its texture.
+	uint32_t                                         image_override_index          = UINT32_MAX;
+	IR::ImageResource                                image_override {};
+	// The module's decoder of formatted loads through a computed V# (DefineIndirectFormatFunction).
+	uint32_t                                         indirect_format_function      = 0;
+	// KYTY_INDIRECT_RAW_OUTLINE: the module's raw-load functions through a computed V#, by shape
+	// (IndirectRawKey / IndirectRawElementKey in spirvEmitterMemory.cpp).
+	std::map<uint32_t, uint32_t>                     indirect_raw_functions;
+	// KYTY_INDIRECT_FORMAT_COMPACT: the compact decoder when its function control is the default one
+	// (no KYTY_INDIRECT_FORMAT_COMPACT_CONTROL), for KYTY_HUGE_HELPER_OUTLINE (SpirvEmitter.cpp).
+	uint32_t                                         indirect_format_compact_function = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	// StorageBuffer LDS (KYTY_LDS_DEVICE_BUFFER), set at function entry: the workgroup's first dword
 	// in the buffer, and the bound of its accesses (LdsDwordCount, or 0 when the bound range holds
@@ -174,9 +263,18 @@ struct EmitterState {
 	uint32_t                                         lds_base_dwords         = 0;
 	uint32_t                                         lds_length              = 0;
 	uint32_t                                         lds_variable            = 0;
+	// With lds_slot_plan, one Function variable per element offset (lds_slot_keys) in place of the
+	// function-scope LDS array (KYTY_LDS_SLOTS).
+	bool                                             lds_slot_plan = false;
+	std::map<uint32_t, uint32_t>                     lds_slot_variables;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	// KYTY_IMAGE_GLC_COHERENT / KYTY_POPS_INTERLOCK: Coherent aliases of storage image bindings with
+	// coherent accesses (0: none), and whether the access being emitted uses them
+	// (CoherentImageScope, ImageDescriptorPointer).
+	std::array<uint32_t, IR::ImageBindingCount>      image_coherent_variables {};
+	bool                                             coherent_image_access = false;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
@@ -184,6 +282,14 @@ struct EmitterState {
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
+	uint32_t                   mesh_zero_position_mask               = 0;
+	uint32_t                   mesh_zero_position_words              = 0;
+	// A subgroup larger than the host workgroup runs in mesh_passes passes (ShaderMeshInputInfo):
+	// mesh_pass_variable holds the current pass, and the guest program is cut at its barriers
+	// into mesh_segment_funcs, each called once per pass.
+	uint32_t                   mesh_passes                           = 1;
+	uint32_t                   mesh_pass_variable                    = 0;
+	std::vector<uint32_t>      mesh_segment_funcs;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
@@ -192,6 +298,9 @@ struct EmitterState {
 	uint32_t                   helper_invocation_variable            = 0;
 	// KYTY_LOOP_GUARD: the invocation's loop-iteration count (a Function variable).
 	uint32_t                   loop_guard_variable                   = 0;
+	// KYTY_CALL_LOOP_CAP: rounds of the bracketed callee bodies' loops this invocation ran
+	// (CFG::Terminator::call_loop; a Function variable).
+	uint32_t                   call_loop_variable                    = 0;
 	// KYTY_RT_NODE_BUDGET / KYTY_RT_NODE_STATS: BVH instruction executions of this invocation
 	// (Function u32; both halves of a two-lane invocation add to it).
 	uint32_t                   bvh_node_count_variable               = 0;
@@ -201,9 +310,12 @@ struct EmitterState {
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
+	uint32_t                   layer_limit_constant                  = 0; // KYTY_LAYER_CLAMP
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
 	uint32_t                   sample_mask_variable                  = 0;
+	// KYTY_OBJPRIM_ID: the pixel shader's ObjPrimID output (StageOutputKind::ObjPrimId).
+	uint32_t                   objprim_output_variable               = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
@@ -229,6 +341,7 @@ uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
+uint32_t TypeBvh8Result(EmitterState& state); // spirvEmitterBvh8.cpp
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
@@ -243,13 +356,32 @@ uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
 uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
+// The pointer type of one dword of flattened_srt_variable (storage buffer, or KYTY_SRT_UNIFORM's
+// uniform block).
+uint32_t FlattenedSrtElementPointerType(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 // The module declares 64-bit integers and physical storage buffer addresses.
 bool UsesPhysicalAddresses(const EmitterState& state);
+// KYTY_INDIRECT_THREADS_GPU: a thread-dimension compute dispatch whose counts the shader reads
+// from GPU memory (ShaderComputeInputInfo::dispatch_dimensions_indirect).
+[[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
 uint32_t TypePhysicalU64Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
+
+// KYTY_BINDLESS_3D_AS_ARRAY: a bindless sampled 3D image whose key may name a 2D or 2D-array
+// texture instead (adapted from KytyPS5-Frank fed216ce8).
+inline bool BindlessVolumeMayBeArray(const IR::ImageResource& image) {
+	return GetCodegenOptions().bindless_3d_as_array && image.bindless && !image.cube &&
+	       image.resource_class == IR::ImageResourceClass::Sampled &&
+	       image.dimension == Decoder::ImageDimension::Dim3D;
+}
+
+inline const IR::ImageResource& ImageResourceAt(const EmitterState& state, uint32_t index) {
+	return index == state.image_override_index ? state.image_override
+	                                           : state.program.info.images.at(index);
+}
 
 inline void EmitLabel(EmitterState& state, uint32_t label) {
 	state.current_label = label;
@@ -331,8 +463,6 @@ struct ValueEmitContext {
 	uint32_t                                                           half       = 0;
 };
 
-enum class VertexInputScalarKind { Float, Sint, Uint };
-
 constexpr uint32_t NoImageComponent = 0xffffffffu;
 
 struct DppTargetLane {
@@ -363,14 +493,14 @@ bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr);
 
 bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr);
 
-VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location);
+Format::ComponentType VertexParameterScalarKind(const EmitterState& state, uint32_t location);
 
 uint32_t VertexParameterComponentCount(const InputBinding& input);
 
-uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
-
+uint32_t VertexParameterScalarType(EmitterState& state, Format::ComponentType kind);
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
+uint32_t MrtOutputType(EmitterState& state, uint32_t index);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
@@ -400,6 +530,7 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                                 uint32_t array_index = 0);
 
+void DefineIndirectFormatFunction(EmitterState& state);
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
                              uint32_t array_index = 0);
 
@@ -413,8 +544,6 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
                            uint32_t texel);
 
 spv::ExecutionModel ExecutionModelForStage(ShaderType stage);
-
-uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t ConstantI32(EmitterState& state, int32_t value);
 
@@ -431,6 +560,9 @@ uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
                                  const char* name);
 void     DefineModule(EmitterState& state);
+// The float-control capabilities, extension and execution modes of state.main_func that every
+// module declares (part of DefineModule; also the KYTY_F32_FLUSH_HOST self-test module's header).
+void     DeclareFloatControls(EmitterState& state);
 void     DefineTessellationInterfaces(EmitterState& state);
 void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
@@ -440,16 +572,7 @@ void     EmitGeometryOutputDefaults(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
-
-DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
-                                    uint32_t lane_bits);
-
-DppTargetLane EmitDppRowShiftTargetLane(EmitterState& state, uint32_t subid, uint32_t amount,
-                                        bool left);
-
-DppTargetLane EmitDppRowRotateRightTargetLane(EmitterState& state, uint32_t subid, uint32_t amount);
-
-DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool half_row);
+uint32_t MeshLaneSlot(EmitterState& state);
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags);
 
@@ -488,6 +611,33 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
 // the host subgroup's lane (lane & 31): two lanes per invocation or a split wave.
 [[nodiscard]] inline bool HalfWaveHost(const EmitterState& state) {
 	return state.lane_count == 2 || state.split_wave;
+}
+// KYTY_IMAGE_GLC_COHERENT: a GLC/DLC storage image access; KYTY_POPS_INTERLOCK: any storage image
+// access of a POPS program (its ordered read-modify-write must see the previous fragment's store).
+[[nodiscard]] bool ImageAccessCoherent(const EmitterState& state, const IR::MemoryInfo& mem);
+// Sets EmitterState::coherent_image_access for the descriptor loads of one image access.
+class CoherentImageScope {
+public:
+	CoherentImageScope(EmitterState& state, bool coherent)
+	    : m_state(state), m_saved(state.coherent_image_access) {
+		state.coherent_image_access = coherent;
+	}
+	~CoherentImageScope() { m_state.coherent_image_access = m_saved; }
+	CoherentImageScope(const CoherentImageScope&)            = delete;
+	CoherentImageScope& operator=(const CoherentImageScope&) = delete;
+private:
+	EmitterState& m_state;
+	bool          m_saved;
+};
+// KYTY_IMPLICIT_LOD_STAGES: this compute program's implicit-LOD samples keep implicit LOD, with
+// derivatives over groups of four consecutive invocations (DerivativeGroupLinear: the RDNA2 lane
+// quad). Needs one guest lane per invocation (no wave64 split), a workgroup of a multiple of 4
+// invocations and computeDerivativeGroupLinear.
+[[nodiscard]] bool ComputeImplicitLod(const EmitterState& state);
+// KYTY_POPS_INTERLOCK: this pixel program runs its body as a fragment shader interlock section.
+[[nodiscard]] inline bool PopsInterlockActive(const EmitterState& state) {
+	return GetCodegenOptions().pops_interlock && state.program.stage == ShaderType::Pixel &&
+	       state.program.info.pops && GetHostFragmentInterlock();
 }
 // The invocation's lane in its host subgroup (0-31 for a split wave).
 uint32_t EmitHostSubgroupLane(EmitterState& state);
@@ -543,6 +693,9 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// KYTY_STORAGE_LENGTH_ZERO: a length of 0 means unbounded (NVIDIA's OpArrayLength of a binding
+	// of 2 GiB or more).
+	bool                  zero_length_unbounded = false;
 };
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
@@ -555,6 +708,10 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+// EmitMemoryElementInBounds, or true for storage buffers the device bounds-checks
+// (KYTY_ROBUST_BUFFER_STORES); only plain stores use it (loads: DeviceChecksDwordLoad).
+uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                    uint32_t index);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
@@ -562,14 +719,10 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                          uint32_t index, uint32_t pointer_type);
 
-uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);
-
 inline constexpr auto EmitTBufferSelectF32 =
     EmitNative<spv::OpSelect, IR::Type::F32, uint32_t, uint32_t, uint32_t>;
 
 bool IsSignedFormatComponent(Format::ComponentType type);
-
-uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
@@ -591,6 +744,11 @@ inline constexpr auto EmitSelectValueU32 =
     EmitNative<spv::OpSelect, IR::Type::U32, uint32_t, uint32_t, uint32_t>;
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask);
+
+// KYTY_FLOAT_STORE_CLAMP: the bits of a 32-bit float (u32) bound for a 16-bit float format, the
+// guest GPU's way: a finite value beyond the half range becomes the largest half of its sign
+// (65504); infinity and NaN pass unchanged.
+uint32_t EmitClampToHalfRangeBits(EmitterState& state, uint32_t f32_bits);
 
 uint32_t EmitShiftRightConstant(EmitterState& state, uint32_t value, uint32_t shift);
 
@@ -628,9 +786,6 @@ F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
 
 F32Class EmitClassifyF32(EmitterState& state, uint32_t value);
 
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match);
-
 uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
 uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
 
@@ -639,6 +794,19 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
+// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off: this program's stage skips the flushes
+// (EmitFlushF32DenormToSignedZero then returns its operand).
+bool     DenormFlushSkipped(const EmitterState& state);
+// KYTY_F32_FLUSH_HOST in a program without f64: the host's default f32 mode flushes denormal
+// inputs of compares and transcendentals, for the op classes (F32FlushClass*) it is on for.
+bool     F32FlushHost(const EmitterState& state, uint8_t op_class);
+// KYTY_NATIVE_F16: two f16 lanes packed in a u32, one f16vec2 operation.
+enum class HalfPkOp : uint32_t { Add, Mul, Min, Max, Fma };
+uint32_t EmitHalfPk(EmitterState& state, HalfPkOp op, uint32_t a, uint32_t b, uint32_t c = 0);
+// KYTY_LDS_SLOTS: the element offset k of a dword LDS access whose dword index is LaneId + k
+// (address (LaneId << 2) + c, or LaneId * 4 + c, plus the DS offset; k = c >> 2), or none.
+std::optional<uint32_t> StaticLdsSlot(const IR::Program& program, const IR::Inst& inst);
+uint64_t DenormFlushCounter(uint32_t stage_index);
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
 
@@ -647,8 +815,14 @@ inline constexpr auto EmitFNegateValue = EmitNative<spv::OpFNegate, IR::Type::F3
 inline constexpr auto EmitFAbsValue = EmitGlsl<GLSLstd450FAbs, IR::Type::F32, uint32_t>;
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
+uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
+
+void LaneShareClassify(EmitterState& state);
+// Defines `inst` in the high half with the low half's id when the classification shares it.
+bool LaneShareReuse(ValueEmitContext& low, ValueEmitContext& high, const IR::Inst& inst);
+void LaneShareReport(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
 

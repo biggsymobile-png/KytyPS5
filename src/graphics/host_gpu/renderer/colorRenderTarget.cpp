@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "common/staticOnce.h"
 
+#include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
@@ -28,10 +30,12 @@ namespace Libs::Graphics {
 static std::atomic<uint32_t> g_render_color_log_count = 0;
 
 bool TargetDescMemoEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_TARGET_DESC_MEMO");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -41,6 +45,14 @@ bool CmaskFastClearEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_CMASK_FAST_CLEAR");
 		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool EqaaMixedTargets() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_EQAA_MIXED");
+		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
 	return enabled;
 }
@@ -195,6 +207,7 @@ bool SameRenderColorInfo(const RenderColorInfo& a, const RenderColorInfo& b) {
 ImageId RenderExecutor::FindTargetImage(TextureCache::ImageDesc& desc, bool exact_format,
                                         TextureCache::RepeatLookup* record) {
 	auto& cache = m_context.GetTextureCache();
+	ImgSide::Count(ImgSide::C::FindTarget);
 	if (record == nullptr || !DrawSequenceEnabled(DrawSequencePart::Targets)) {
 		return cache.FindImage(desc, exact_format);
 	}
@@ -222,6 +235,7 @@ ImageId RenderExecutor::FindTargetImage(TextureCache::ImageDesc& desc, bool exac
 	}
 	totals.target_repeats++;
 	Profiler::CountFrameEvent(Profiler::FrameEvent::DrawSequenceTargetRepeats);
+	ImgSide::Count(ImgSide::C::FindTargetRep);
 	CommitStats::AddItems(CommitStats::Item::TargetRepeat, 1);
 	if (!verify) {
 		return record->image;
@@ -331,12 +345,27 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	// TODO(PPSA24156): Replace this 2x MSAA approximation with proper 4-coverage/2-fragment EQAA.
-	const bool approximate_eqaa = rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1;
+	bool approximate_eqaa = rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1;
+	// KYTY_EQAA_MIXED=1 (from usa-ratt/KytyPS5-GT7 18979e65b): any EQAA target (NUM_SAMPLES,
+	// the coverage count, above NUM_FRAGMENTS, the stored colours; both log2). The guest surface
+	// layout follows the fragment count, so the host image does too; the extra coverage samples
+	// reach only the depth attachment (mixed attachment samples, PipelineCache) and the FMASK
+	// emulation maps each sample onto an existing fragment. GT7's countdown and replay passes:
+	// 2 depth samples, 1 colour.
+	if (rt.attrib.num_samples > rt.attrib.num_fragments && EqaaMixedTargets()) {
+		approximate_eqaa = render_sample_count(rt.attrib.num_samples) != 0;
+	}
 	if (approximate_eqaa) {
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
-			Log::WriteToConsoleAndLog(
-			    "Warning: approximating 4-coverage/2-fragment EQAA with 2x MSAA.\n");
+			if (rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1) {
+				Log::WriteToConsoleAndLog(
+				    "Warning: approximating 4-coverage/2-fragment EQAA with 2x MSAA.\n");
+			} else {
+				LOGF("EQAA colour target (KYTY_EQAA_MIXED): %ux coverage, %ux fragments, the host "
+				     "image has %u samples\n",
+				     render_sample_count(rt.attrib.num_samples), samples, samples);
+			}
 		}
 	}
 	if (samples == 0 || (rt.attrib.num_samples != rt.attrib.num_fragments && !approximate_eqaa)) {
@@ -344,19 +373,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
 	const uint32_t levels = rt.attrib2.num_mip_levels + 1u;
-	if (levels == 0 || levels > 16 || rt.view.current_mip_level >= levels) {
+	if (levels > 16) {
 		EXIT("unsupported render-target mip range: current=%u levels=%u\n",
 		     rt.view.current_mip_level, levels);
 	}
-	static constexpr std::array image_types {Prospero::ImageType::kColor1D,
-	                                         Prospero::ImageType::kColor2D,
-	                                         Prospero::ImageType::kColor3D};
-	if (rt.attrib3.dimension >= image_types.size()) {
+	if (rt.attrib3.dimension > 2u) {
 		EXIT("unsupported render-target dimension: %u\n", rt.attrib3.dimension);
 	}
-	const auto image_type = image_types[rt.attrib3.dimension];
-	const bool is_1d      = image_type == Prospero::ImageType::kColor1D;
-	const bool volume     = image_type == Prospero::ImageType::kColor3D;
+	// 1D targets are 2D images one texel high (upstream e6cc1ce30).
+	const bool is_1d  = rt.attrib3.dimension == 0u;
+	const bool volume = rt.attrib3.dimension == 2u;
 	if (is_1d && rt.attrib2.height != 0) {
 		EXIT("1D render target has nonzero height: %u\n", rt.attrib2.height);
 	}
@@ -411,13 +437,17 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	uint32_t   pitch  = 0;
 	uint64_t   size   = 0;
 	bool       tile   = false;
+	// Experimental Pro mode: Miles Morales renders to 256B-tiled targets (the PSSR output layout);
+	// they are texture-tiled like the 4KB ones. Base PS5 titles never reached this (it stopped here).
+	const bool     standard256  = rt.attrib3.tile_mode == Prospero::TileMode::kStandard256B;
 	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
-	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
 	const bool     depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
-	const bool     texture_tile = standard4 || standard64 || depth_tile;
+	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
+	const bool     texture_tile = standard256 || standard4 || standard64 || depth_tile;
 
 	switch (rt.attrib3.tile_mode) {
 		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard256B:
 		case Prospero::TileMode::kStandard4KB:
 		case Prospero::TileMode::kStandard64KB:
 		case Prospero::TileMode::kDepth:
@@ -442,6 +472,24 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		EXIT("render-target format has no valid element size\n");
 	}
 	const auto transfer_format = ImageOps::RenderTargetTransferFormat(bytes_per_element);
+	// PPSA28068: the linear EULA target and its sampled view must share the padded pitch.
+	const auto padded_pitch = [&](uint32_t level_width) {
+		return !tile || volume || texture_tile
+		           ? TileGetTexturePitch(transfer_format, level_width, rt.attrib3.tile_mode)
+		           : TileGetRenderTargetPitch(level_width, bytes_per_element,
+		                                      rt.attrib.num_fragments);
+	};
+	// A surface with one stored level starts every MIP_LEVEL at the base address, so a level with
+	// mip 0's padded pitch aliases mip 0's top-left texels (upstream 4a305a95e).
+	uint32_t mip = rt.view.current_mip_level;
+	if (mip != 0 && levels == 1 && samples == 1 && !volume &&
+	    padded_pitch(std::max(width >> mip, 1u)) == padded_pitch(width)) {
+		mip = 0;
+	}
+	if (mip >= levels) {
+		EXIT("unsupported render-target mip range: current=%u levels=%u\n",
+		     rt.view.current_mip_level, levels);
+	}
 	TileTextureBlockLayout texture_tile_layout {};
 	if (texture_tile &&
 	    (!TileGetTextureBlockLayout(transfer_format, rt.attrib3.tile_mode, volume,
@@ -459,19 +507,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     rt.attrib.num_fragments, bytes_per_element, rt.cmask.addr, rt.fmask.addr,
 		     rt.dcc_addr.addr);
 	}
-	if ((standard64 || depth_tile) &&
-	    (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 ||
-	     (depth_tile && (view.base_layer != 0 || view.image_layers != 1)))) {
-		EXIT("unsupported 64KB texture-tiled render-target view: dimension=%u depth=%u"
+	if (depth_tile && (is_1d || volume || view.base_layer != 0 || view.image_layers != 1)) {
+		EXIT("unsupported depth-tiled color render-target view: dimension=%u depth=%u"
 		     " layer=%u/%u\n",
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
 	}
-	// PPSA28068: the linear EULA target and its sampled view must share the padded pitch.
-	if (!tile || volume || texture_tile) {
-		pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
-	} else {
-		pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
-	}
+	pitch = padded_pitch(width);
 	if (pitch == 0) {
 		EXIT("unsupported render-target pitch: width=%u bytes=%u\n", width, bytes_per_element);
 	}
@@ -534,8 +575,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		EXIT("render-target backing range is invalid\n");
 	}
 
-	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
-	                                  std::max(height >> rt.view.current_mip_level, 1u)};
+	const vk::Extent2D view_extent = {std::max(width >> mip, 1u), std::max(height >> mip, 1u)};
 
 	// Only the first 128 decisions are logged; skip the atomic increment afterwards.
 	const auto decision_log_id = g_render_color_log_count.load(std::memory_order_relaxed) < 128
@@ -545,7 +585,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		LOGF("RenderColorTarget: slot=%" PRIu32 " addr=0x%010" PRIx64 " size=0x%016" PRIx64
 		     " extent=%ux%ux%u view_mip=%u view_extent=%ux%u levels=%u pitch=%u"
 		     " fmt=0x%08" PRIx32 " nfmt=0x%08" PRIx32 " order=0x%08" PRIx32 " samples=%u tile=%s\n",
-		     rt_slot, rt.base.addr, backing_size, width, height, depth, rt.view.current_mip_level,
+		     rt_slot, rt.base.addr, backing_size, width, height, depth, mip,
 		     view_extent.width, view_extent.height, levels, pitch,
 		     static_cast<uint32_t>(rt.info.format), static_cast<uint32_t>(rt.info.channel_type),
 		     static_cast<uint32_t>(rt.info.channel_order), samples, tile ? "tiled" : "linear");
@@ -556,7 +596,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.info.data         = {rt.base.addr, backing_size};
 	desc.info.pixel_format = target_format.format;
 	desc.info.guest_format = target_format.guest_format;
-	desc.info.type         = image_type;
+	desc.info.type         = volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
 	desc.info.extent       = {width, height, depth};
 	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
 	desc.info.pitch        = pitch;
@@ -615,15 +655,10 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		};
 	}
 	desc.view_info.format = target_format.format;
-	if (is_1d) {
-		desc.view_info.type =
-		    view.layer_count == 1 ? vk::ImageViewType::e1D : vk::ImageViewType::e1DArray;
-	} else {
-		desc.view_info.type =
-		    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
-	}
+	desc.view_info.type =
+	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
 	desc.view_info.aspect      = vk::ImageAspectFlagBits::eColor;
-	desc.view_info.base_level  = rt.view.current_mip_level;
+	desc.view_info.base_level  = mip;
 	desc.view_info.level_count = 1;
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
@@ -633,14 +668,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		memo->mask              = mask;
 		memo->slice_offset      = render_target_slice_offset;
 		memo->desc              = desc;
-		memo->guest_mip_level   = rt.view.current_mip_level;
+		memo->guest_mip_level   = mip;
 		memo->guest_array_layer = view.base_layer;
 		memo->export_mapping    = target_format.export_mapping;
 		memo->lookup            = {};
 		memo->valid             = true;
 	}
 	r.desc                     = std::move(desc);
-	r.guest_mip_level          = rt.view.current_mip_level;
+	r.guest_mip_level          = mip;
 	r.guest_array_layer        = view.base_layer;
 	r.image_id = FindTargetImage(r.desc, exact_format, memo != nullptr ? &memo->lookup : nullptr);
 	r.export_mapping           = target_format.export_mapping;

@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <cstdlib>
 
 namespace Libs::Graphics::HW {
 
@@ -384,6 +385,16 @@ struct Viewport {
 	bool  viewport_scissor_window_offset_enable = false;
 };
 
+// KYTY_CLIP_RECT_DEFAULT=1 (upstream 4eb5ee110, via Erlou93/KytyPS5-Yotei): clip rects the game never
+// wrote cover (0,0)-(16384,16384), so a clip rule other than 0xffff does not empty the scissor.
+inline int ClipRectDefaultExtent() {
+	static const int extent = [] {
+		const char* value = std::getenv("KYTY_CLIP_RECT_DEFAULT");
+		return value != nullptr && value[0] == '1' ? 16384 : 0;
+	}();
+	return extent;
+}
+
 struct ScreenViewport {
 	Viewport viewports[16];
 	uint32_t transform_control                    = 1087;
@@ -412,8 +423,10 @@ struct ScreenViewport {
 	uint16_t clip_rect_rule                       = 0xffffu;
 	int      clip_rect_left[4]                    = {};
 	int      clip_rect_top[4]                     = {};
-	int      clip_rect_right[4]                   = {};
-	int      clip_rect_bottom[4]                  = {};
+	int      clip_rect_right[4]                   = {ClipRectDefaultExtent(), ClipRectDefaultExtent(),
+	                                                 ClipRectDefaultExtent(), ClipRectDefaultExtent()};
+	int      clip_rect_bottom[4]                  = {ClipRectDefaultExtent(), ClipRectDefaultExtent(),
+	                                                 ClipRectDefaultExtent(), ClipRectDefaultExtent()};
 	bool     clip_rect_window_offset_enable[4]    = {};
 };
 
@@ -613,8 +626,12 @@ struct VertexShaderInfo {
 	UserSgprInfo     hs_user_sgpr;
 	UserSgprInfo     gs_user_sgpr;
 	// The GS user SGPR the CP writes the draw's start instance into: an indirect draw's
-	// START_INST_LOC (-1: none).
+	// START_INST_LOC (-1: none; 32 + n: HS user SGPR n, for a tessellated draw).
 	int32_t start_instance_user_sgpr = -1;
+	// KYTY_INDIRECT_VERTEX_BASE: an indirect draw's index VGPR excludes its record's base vertex,
+	// which the CP writes only to the GS user SGPR at BASE_VTX_LOC (-1: none, or the switch off).
+	bool    indirect_vertex_base   = false;
+	int32_t base_vertex_user_sgpr  = -1;
 };
 
 struct PixelShaderInfo {
@@ -864,6 +881,11 @@ public:
 	void SetAaSampleControl(const AaSampleControl& control) { m_aa_sample_control = control; }
 	[[nodiscard]] const AaConfig& GetAaConfig() const { return m_aa_config; }
 	void                          SetAaConfig(const AaConfig& config) { m_aa_config = config; }
+	// PA_SC_AA_MASK_X0Y0_X1Y0 (0) and PA_SC_AA_MASK_X0Y1_X1Y1 (1): the samples each pixel of a 2x2
+	// quad may cover (16 bits a pixel). Kept only with KYTY_AA_MASK_COVERAGE=1 (aaMaskCoverage.h);
+	// all ones otherwise.
+	[[nodiscard]] uint32_t GetAaMask(uint32_t index) const { return m_aa_mask[index & 1u]; }
+	void SetAaMask(uint32_t index, uint32_t value) { m_aa_mask[index & 1u] = value; }
 
 	[[nodiscard]] float GetDepthClearValue() const { return m_depth_clear_value; }
 	void                SetDepthClearValue(float clear_value) { m_depth_clear_value = clear_value; }
@@ -878,6 +900,14 @@ public:
 	void                   SetLineWidth(float width) { m_line_width = width; }
 	[[nodiscard]] uint32_t GetPrimitiveResetIndex() const { return m_primitive_reset_index; }
 	void SetPrimitiveResetIndex(uint32_t index) { m_primitive_reset_index = index; }
+
+	// VGT_DRAW_PAYLOAD_CNTL (bit 0 OBJPRIM_ID_EN) and PA_CL_OBJPRIM_ID_CNTL (bit 0 OBJ_ID_SEL, bit 1
+	// ADD_PIPED_PRIM_ID, bit 2 EN_32BIT_OBJPRIMID): the hardware ObjPrimID write (KYTY_OBJPRIM_ID,
+	// PipelineCache ObjprimIdSlot).
+	[[nodiscard]] uint32_t GetDrawPayloadControl() const { return m_draw_payload_cntl; }
+	void                   SetDrawPayloadControl(uint32_t value) { m_draw_payload_cntl = value; }
+	[[nodiscard]] uint32_t GetObjprimIdControl() const { return m_objprim_id_cntl; }
+	void                   SetObjprimIdControl(uint32_t value) { m_objprim_id_cntl = value; }
 
 	[[nodiscard]] const ShaderRegisters& GetShaderRegisters() const { return m_sh_regs; }
 
@@ -960,9 +990,12 @@ public:
 		f(Viewport, &m_clip_control, sizeof(m_clip_control));
 		f(Raster, &m_line_width, sizeof(m_line_width));
 		f(Raster, &m_primitive_reset_index, sizeof(m_primitive_reset_index));
+		f(Raster, &m_draw_payload_cntl, sizeof(m_draw_payload_cntl));
+		f(Raster, &m_objprim_id_cntl, sizeof(m_objprim_id_cntl));
 		f(Raster, &m_scan_mode_control, sizeof(m_scan_mode_control));
 		f(Raster, &m_aa_sample_control, sizeof(m_aa_sample_control));
 		f(Raster, &m_aa_config, sizeof(m_aa_config));
+		f(Raster, m_aa_mask, sizeof(m_aa_mask));
 		f(Raster, &m_mode_control, sizeof(m_mode_control));
 		f(Raster, &m_poly_offset, sizeof(m_poly_offset));
 		f(Raster, &m_eqaa_control, sizeof(m_eqaa_control));
@@ -973,6 +1006,8 @@ public:
 private:
 	float    m_line_width            = 1.0f;
 	uint32_t m_primitive_reset_index = 0xffffffffu;
+	uint32_t m_draw_payload_cntl     = 0;
+	uint32_t m_objprim_id_cntl       = 0;
 
 	BlendControl    m_blend_control[8];
 	BlendColor      m_blend_color;
@@ -987,6 +1022,7 @@ private:
 
 	AaSampleControl m_aa_sample_control;
 	AaConfig        m_aa_config;
+	uint32_t        m_aa_mask[2] = {0xffffffffu, 0xffffffffu};
 
 	uint32_t m_shader_stages = 0;
 
@@ -1128,6 +1164,10 @@ public:
 	}
 
 	void SetStartInstanceUserSgpr(int32_t id) { m_vs.start_instance_user_sgpr = id; }
+	void SetIndirectVertexBase(bool indirect, int32_t base_vertex_sgpr) {
+		m_vs.indirect_vertex_base  = indirect;
+		m_vs.base_vertex_user_sgpr = indirect ? base_vertex_sgpr : -1;
+	}
 
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }

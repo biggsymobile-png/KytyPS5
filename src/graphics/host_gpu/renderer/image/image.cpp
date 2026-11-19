@@ -1,8 +1,12 @@
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "common/staticOnce.h"
 
+#include "graphics/host_gpu/renderer/drawPrep/imgSide.h"
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/skipInvalid.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -11,9 +15,13 @@
 #include "kernel/memory.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 
+#include <vulkan/vulkan_format_traits.hpp>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -35,7 +43,7 @@ struct TransitSkipConfig {
 	int  verify  = 0; // 1: count and log mismatches, 2: exit on one
 };
 const TransitSkipConfig& TransitSkip() {
-	static const TransitSkipConfig config = [] {
+	static constexpr auto config_init = [] {
 		TransitSkipConfig result;
 		const auto* value = std::getenv("KYTY_IMAGE_TRANSIT_SKIP");
 		result.enabled    = value == nullptr || std::strcmp(value, "0") != 0;
@@ -44,19 +52,26 @@ const TransitSkipConfig& TransitSkip() {
 			result.verify = std::strcmp(verify, "exit") == 0 ? 2 : 1;
 		}
 		return result;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(config_init())>> config_once;
+	const TransitSkipConfig& config = config_once.Get(config_init);
 	return config;
 }
 
 // KYTY_GUEST_STORAGE_REPEAT (Image::GuestTransitScope): default off.
 bool GuestStorageRepeatEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_GUEST_STORAGE_REPEAT");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 thread_local bool g_guest_transit = false;
+
+// KYTY_IMAGE_STAGE_NARROW (Image::Transit): live, default off.
+static Live::Switch g_image_stage_narrow("KYTY_IMAGE_STAGE_NARROW", Live::ParseDefaultOff);
 
 constexpr vk::AccessFlags2 TransitWriteAccess = vk::AccessFlagBits2::eTransferWrite |
                                                 vk::AccessFlagBits2::eShaderWrite |
@@ -85,7 +100,6 @@ bool CopyViaBufferBatchEnabled() {
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
-		case Prospero::ImageType::kColor1D: return vk::ImageType::e1D;
 		case Prospero::ImageType::kColor3D: return vk::ImageType::e3D;
 		case Prospero::ImageType::kColor2D: return vk::ImageType::e2D;
 		default: EXIT("non-base image type: %u\n", static_cast<uint32_t>(type));
@@ -459,6 +473,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 
 	state = {destination_stage, destination_access, destination_layout, guest};
 	NoteImageStateChange();
+	// A slot of the bindless table samples it in a read-only layout (E5 restores it).
+	NoteBindlessStateChange(*this);
 	return barriers;
 }
 
@@ -485,6 +501,66 @@ bool Image::TransitIsNoOp(vk::ImageLayout                             destinatio
 	       !static_cast<bool>(state.access_mask & TransitWriteAccess);
 }
 
+// KYTY_ZERO_NEW_IMAGES=1 (default off; chenxiao07/KytyPS5 2f9d9604a, c0a4d2465, redone at image
+// creation): a new image's memory is the PS5's fresh memory, zeroed, not whatever the VRAM had.
+bool ZeroNewImagesEnabled() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_ZERO_NEW_IMAGES");
+		const bool  zero  = value != nullptr && value[0] == '1';
+		if (zero) {
+			std::printf("Zero new images: on (KYTY_ZERO_NEW_IMAGES=1)\n");
+		}
+		return zero;
+	}();
+	return on;
+}
+
+bool Image::ZeroFresh() {
+	if (!backing.image || backing.sparse || backing.state.layout != vk::ImageLayout::eUndefined ||
+	    !backing.subresource_states.empty() ||
+	    !(backing.usage & vk::ImageUsageFlagBits::eTransferDst) ||
+	    vk::blockExtent(backing.format)[0] != 1 || !m_scheduler.Active()) {
+		return false;
+	}
+	KYTY_GPU_OP_SITE("image.zero");
+	const auto aspect = FullAspectMask(backing.format);
+	vk::ImageSubresourceRange whole {};
+	whole.aspectMask = aspect;
+	whole.levelCount = VK_REMAINING_MIP_LEVELS;
+	whole.layerCount = VK_REMAINING_ARRAY_LAYERS;
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	barrier.oldLayout           = vk::ImageLayout::eUndefined;
+	barrier.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = backing.image;
+	barrier.subresourceRange    = whole;
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	// Recorded through the scheduler's helper sink (recorder-aware), outside rendering, before
+	// any use of the image: no caller holds a transition target for it yet.
+	m_scheduler.EndRendering();
+	const auto command = m_scheduler.Current().HelperSink();
+	command.pipelineBarrier2(dependency);
+	if (!(aspect & vk::ImageAspectFlagBits::eColor)) {
+		const vk::ClearDepthStencilValue zero {0.0f, 0};
+		command.clearDepthStencilImage(backing.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1,
+		                               &whole);
+	} else {
+		vk::ClearColorValue zero {};
+		zero.uint32 = std::array<uint32_t, 4> {0u, 0u, 0u, 0u};
+		command.clearColorImage(backing.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &whole);
+	}
+	backing.state = {vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+	                 vk::ImageLayout::eTransferDstOptimal};
+	NoteImageStateChange();
+	return true;
+}
+
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
                     bool deferrable) {
@@ -492,8 +568,10 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	const auto& skip       = TransitSkip();
 	const bool  predicted  = skip.enabled && TransitIsNoOp(destination_layout, destination_access,
 	                                                      range);
+	ImgSide::Count(ImgSide::C::Transit);
 	if (predicted && skip.verify == 0) {
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageTransitSkips);
+		ImgSide::Count(ImgSide::C::TransitNoOp);
 		return;
 	}
 	KYTY_GPU_OP_SITE("image.transition");
@@ -503,8 +581,22 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (static_cast<bool>(destination_access & transfer_access)) {
 		destination_stage |= vk::PipelineStageFlagBits2::eTransfer;
 	}
-	if (!destination_access ||
-	    static_cast<bool>(destination_access & ~vk::AccessFlags2 {transfer_access})) {
+	// KYTY_IMAGE_STAGE_NARROW=1 (live, default 0): an access made only of color (or only of depth/stencil)
+	// attachment bits happens only in the attachment stages (load/store/clear operations, blending,
+	// resolves, depth tests), so the transition's second scope - and the image's tracked stage, the first
+	// scope of its next barrier - is those stages instead of every graphics stage plus compute.
+	constexpr vk::AccessFlags2 ColorAccess =
+	    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+	constexpr vk::AccessFlags2 DepthAccess =
+	    vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	const bool color_only = destination_access && !(destination_access & ~ColorAccess);
+	const bool depth_only = destination_access && !(destination_access & ~DepthAccess);
+	if (g_image_stage_narrow.On() && (color_only || depth_only)) {
+		destination_stage |= color_only ? vk::PipelineStageFlags2 {vk::PipelineStageFlagBits2::eColorAttachmentOutput}
+		                                : vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+		                                      vk::PipelineStageFlagBits2::eLateFragmentTests;
+	} else if (!destination_access ||
+	           static_cast<bool>(destination_access & ~vk::AccessFlags2 {transfer_access})) {
 		destination_stage |=
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
@@ -645,9 +737,9 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 	}
 	if (source_type == destination_type) {
 		source_layers = destination_layers = std::min(source_layers, destination_layers);
-	} else if (source_type == vk::ImageType::e2D && destination_type == vk::ImageType::e3D) {
+	} else if (source_type == vk::ImageType::e2D) {
 		source_layers = depth;
-	} else if (source_type == vk::ImageType::e3D && destination_type == vk::ImageType::e2D) {
+	} else {
 		destination_layers = depth;
 	}
 	return {source_layers, destination_layers};
@@ -666,7 +758,13 @@ void Image::CopyDepthColorImage(Image& source) {
 	CopyImageRegions(source);
 }
 
-void Image::CopyImageRegions(Image& source) {
+void Image::CopyDepthStencilImage(Image& source) {
+	KYTY_GPU_OP_SITE("image.copy_depth_stencil");
+	EXIT_IF(source.backing.format != backing.format);
+	CopyImageRegions(source, true);
+}
+
+void Image::CopyImageRegions(Image& source, bool stencil) {
 	NoteContentWrite();
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
@@ -677,9 +775,11 @@ void Image::CopyImageRegions(Image& source) {
 	                                ? backing.extent.depth
 	                                : source.backing.extent.depth;
 	const auto     source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    stencil ? FullAspectMask(source.backing.format)
+	            : FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    stencil ? FullAspectMask(backing.format)
+	            : FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {
@@ -747,15 +847,23 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	const auto destination_height =
 	    std::max(backing.extent.height >> destination_range.base_level, 1u);
 	const bool copy = source.backing.samples == 1;
-	EXIT_IF(layers == 0 || info.extent.width > source_width || info.extent.height > source_height ||
-	        info.extent.width > destination_width || info.extent.height > destination_height ||
+	EXIT_IF(layers == 0 ||
 	        (copy ? !ImageViewOps::FormatsCompatible(source.backing.format, backing.format)
 	              : source.backing.format != backing.format));
 	auto resolved_source_range             = source_range;
 	auto resolved_destination_range        = destination_range;
 	resolved_source_range.layer_count      = layers;
 	resolved_destination_range.layer_count = layers;
-	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
+	// The image's extent while both levels hold it; a target the texture cache placed at a smaller
+	// level of a larger image (KYTY_RESOLVE_CACHE_VIEW) resolves the levels' common extent instead
+	// of stopping the emulator (upstream 17a0f53d3).
+	const bool fits = info.extent.width <= source_width && info.extent.height <= source_height &&
+	                  info.extent.width <= destination_width &&
+	                  info.extent.height <= destination_height;
+	const vk::Extent3D resolve_extent =
+	    fits ? vk::Extent3D {info.extent.width, info.extent.height, 1}
+	         : vk::Extent3D {std::min(source_width, destination_width),
+	                         std::min(source_height, destination_height), 1};
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
@@ -818,9 +926,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 
 	vk::BufferMemoryBarrier2 barrier {};
 	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
-	barrier.srcAccessMask       = vk::AccessFlagBits2::eTransferRead;
 	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
-	barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.buffer              = buffer.Handle();
@@ -880,9 +986,26 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 		destination_copies.clear();
 		used = 0;
 	};
+	// KYTY_SKIP_INVALID (usa-ratt/KytyPS5-GT7 42e9c7e38): each level's extent within both images,
+	// as CopyImage: the source's extent alone wrote past a smaller destination. A block-compressed
+	// source is cut on a block boundary (a partial block only where it ends both images).
+	const bool clamp_to_destination = Common::SkipInvalidEnabled();
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width             = std::max(source.backing.extent.width >> level, 1u);
-		const auto height            = std::max(source.backing.extent.height >> level, 1u);
+		const auto fit = [&](uint32_t source_size, uint32_t destination_size) {
+			const uint32_t source_texels = std::max(source_size >> level, 1u);
+			if (!clamp_to_destination) {
+				return source_texels;
+			}
+			const uint32_t destination_texels = std::max(destination_size >> level, 1u);
+			const uint32_t texels             = std::min(source_texels, destination_texels);
+			return source_texels == destination_texels ? texels
+			                                           : texels / source_block * source_block;
+		};
+		const auto width             = fit(source.backing.extent.width, backing.extent.width);
+		const auto height            = fit(source.backing.extent.height, backing.extent.height);
+		if (width == 0 || height == 0) {
+			continue;
+		}
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;
@@ -970,6 +1093,62 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command.Identity());
 }
 
+void Image::CopyBlockMip(Image& source, uint32_t mip, uint32_t layer) {
+	KYTY_GPU_OP_SITE("image.copy_block_mip");
+	NoteContentWrite();
+	EXIT_IF(source.backing.samples != 1 || backing.samples != 1 || mip >= backing.mip_levels ||
+	        layer >= backing.layers || source.backing.image_type != vk::ImageType::e2D ||
+	        backing.image_type != vk::ImageType::e2D);
+	m_scheduler.EndRendering();
+	// Between an uncompressed and a compressed image the extent is in source texels, one per
+	// destination block; the blocks must lie inside the destination level.
+	const auto width  = std::max(backing.extent.width >> mip, 1u);
+	const auto height = std::max(backing.extent.height >> mip, 1u);
+	EXIT_IF(source.backing.extent.width != (width + 3) / 4 ||
+	        source.backing.extent.height != (height + 3) / 4);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, mip, layer, 1};
+	copy.extent         = {source.backing.extent.width, source.backing.extent.height, 1};
+	const auto command  = m_scheduler.Current().HelperSink();
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command.Identity());
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command.Identity());
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command.Identity());
+}
+
+bool ImageLevelClampEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_LEVEL_CLAMP");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool ClampImageLevelsToExtent(ImageInfo& info, ImageViewInfo& view) {
+	if (!ImageLevelClampEnabled() || info.samples > 1) {
+		return false;
+	}
+	const auto valid = static_cast<uint32_t>(std::bit_width(std::max(
+	    {info.extent.width, info.extent.height, info.IsVolume() ? info.extent.depth : 1u})));
+	if (valid == 0 || info.resources.levels <= valid) {
+		return false;
+	}
+	static std::atomic<uint32_t> clamped {0};
+	if (const auto n = clamped.fetch_add(1, std::memory_order_relaxed) + 1u; n <= 4u || std::has_single_bit(n)) {
+		std::printf("KYTY_IMAGE_LEVEL_CLAMP #%u: guest=0x%016" PRIx64 " %ux%ux%u levels %u -> %u (view %u+%u)\n",
+		            n, info.data.address, info.extent.width, info.extent.height, info.extent.depth,
+		            info.resources.levels, valid, view.base_level, view.level_count);
+	}
+	info.resources.levels = valid;
+	view.base_level       = std::min(view.base_level, valid - 1u);
+	view.level_count      = std::max(1u, std::min(view.level_count, valid - view.base_level));
+	return true;
+}
+
 namespace ImageOps {
 
 void Validate(const ImageInfo& info) {
@@ -1000,11 +1179,6 @@ void Validate(const ImageInfo& info) {
 	}
 
 	switch (info.type) {
-		case Prospero::ImageType::kColor1D:
-			if (info.extent.height != 1 || info.extent.depth != 1) {
-				EXIT("invalid 1D image shape\n");
-			}
-			break;
 		case Prospero::ImageType::kColor3D:
 			if (info.resources.layers != 1) {
 				EXIT("3D images cannot have array layers\n");
@@ -1145,12 +1319,34 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+	// KYTY_ADDRESS_BINDING_REPORT: the image's place in its memory block (the driver reports the
+	// block's range for every image bound in it), and images with more levels than their extent
+	// allows (VUID-VkImageCreateInfo-mipLevels-00958).
+	VmaAllocationInfo placement {};
+	if (AddressBindingReportActive()) {
+		const auto valid = static_cast<uint32_t>(std::bit_width(
+		    std::max({create.extent.width, create.extent.height, create.extent.depth})));
+		if (create.mipLevels > valid) {
+			static std::atomic<uint32_t> invalid {0};
+			const auto n = invalid.fetch_add(1, std::memory_order_relaxed) + 1u;
+			if (n <= 16u || std::has_single_bit(n)) {
+				std::printf("KYTY_ADDRESS_BINDING_REPORT: image #%u with %u levels > %u valid: guest=0x%016" PRIx64
+				            " %ux%ux%u format=%d\n",
+				            n, create.mipLevels, valid, info.data.address, create.extent.width,
+				            create.extent.height, create.extent.depth, static_cast<int>(create.format));
+			}
+		}
+	}
+	if (AddressBindingReportActive() && backing.allocation != nullptr) {
+		vmaGetAllocationInfo(graphics.allocator, backing.allocation, &placement);
+	}
 	SetVulkanObjectNameF(
 	    graphics.device, backing.image,
-	    "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} samples={}]",
+	    "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} samples={} "
+	    "block_off=0x{:x} alloc=0x{:x}]",
 	    info.data.address, info.data.size, info.extent.width, info.extent.height, info.extent.depth,
 	    static_cast<uint32_t>(info.pixel_format), info.resources.levels, info.resources.layers,
-	    info.samples);
+	    info.samples, placement.offset, placement.size);
 }
 
 uint64_t Image::HashGuestEdges() const {
@@ -1174,8 +1370,12 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	const bool note_dead = DeadViewScrubEnabled();
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
+			if (note_dead) {
+				NoteImageViewDestroyed(cached.view, info.data.address, info.pixel_format);
+			}
 			m_graphics.device.destroyImageView(cached.view, nullptr);
 		}
 	}

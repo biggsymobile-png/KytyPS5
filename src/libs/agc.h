@@ -5,6 +5,9 @@
 #include "common/common.h"
 #include "kernel/eventQueue.h"
 
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 
 struct Shader;
@@ -35,6 +38,12 @@ namespace Gen5 {
 
 struct CommandBuffer;
 struct Label;
+
+// KYTY_CONTEXT_CLEAR_DEFAULTS: the context registers (offset from the context space, value) that
+// libSceAgc's context-state clear loads for the register defaults version the title passed to
+// AgcInit (public then internal defaults, the last value of an offset winning; empty before
+// AgcInit). From superkeka/KytyPS5-bc250 7053a76e/08d150a2.
+const std::vector<std::pair<uint32_t, uint32_t>>& AgcContextClearDefaults();
 
 int KYTY_SYSV_ABI   AgcInit(uint32_t* state, uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver);
@@ -156,10 +165,10 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
                                         const volatile void* index_addr, uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexGetSize();
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t index_count,
-                                                      const volatile void* index_addr,
+uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t instance_count,
                                                       const volatile void* object_ids,
-                                                      uint32_t instance_count, uint64_t modifier);
+                                                      const volatile void* index_addr,
+                                                      uint32_t index_count, uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexMultiInstancedGetSize();
 int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
                                        const volatile uint32_t* target, uint32_t size_in_dwords,
@@ -216,6 +225,8 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint8_t cache_policy, const volatile void* address,
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles);
 uint64_t KYTY_SYSV_ABI  AgcAcbWaitOnAddressGetSize(uint8_t size);
+uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
+                                           uint8_t mailbox, uint8_t signal_type, uint8_t op);
 uint32_t* KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                       uint64_t dst_address_or_offset, uint8_t src,
                                       uint8_t  src_cache_policy,

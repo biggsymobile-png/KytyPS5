@@ -35,8 +35,21 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+// KYTY_HOST_BUFFER_MB in bytes (0: off): device-local buffers at least this large live in system
+// memory.
+[[nodiscard]] uint64_t HostBufferBytes();
+
+// Buffer over imported host memory (KYTY_INPLACE, InplaceHeap).
+struct ImportHostTag {};
+
 class Buffer {
 public:
+	// A buffer whose memory is the host range [host_pointer, +size) imported with
+	// VK_EXT_external_memory_host (GraphicContext::external_memory_host_enabled), usable as
+	// uniform, storage, vertex, index and indirect buffer and by device address. CpuAddress() is 0:
+	// the owner computes offsets. Handle() is null when the import failed.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, void* host_pointer, uint64_t size,
+	       ImportHostTag);
 	// transfer_shared: concurrent sharing with the upload DMA transfer queue family
 	// (GraphicContext::transfer_queue_family), when the device has that queue.
 	// host_cached: mapped cached host memory (CPU writes stay in the CPU caches, the GPU reads
@@ -77,8 +90,17 @@ public:
 	              vk::AccessFlags source_after       = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite);
-	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	                                                   vk::AccessFlagBits::eMemoryWrite,
+	              bool            batch              = false);
+	// Several non-overlapping regions from `source` in one copy command, with one barrier pair over
+	// the spans the regions cover (KYTY_BDA_LIVE_BATCH page-table entry writes).
+	void CopyRegionsFrom(CommandBuffer& command, const Buffer& source, std::span<const vk::BufferCopy> regions,
+	                     vk::AccessFlags source_before = vk::AccessFlagBits::eMemoryWrite);
+	// batch: the caller records nothing through a native handle obtained before this call until the
+	// next barrier flush point, so KYTY_DMA_BARRIER_BATCH may leave the after barriers queued.
+	void Fill(uint64_t offset, uint64_t size, uint32_t value, bool batch = false);
+	// KYTY_DMA_BARRIER_BATCH (streamBuffer.cpp; live, default off).
+	[[nodiscard]] static bool DmaBarrierBatchEnabled();
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
@@ -86,6 +108,11 @@ public:
 	size_t lru_id       = 0;
 	// KYTY_BUFFER_LRU_SKIP=1 (BufferCache::TouchBuffer): the tick the LRU item last received.
 	mutable uint64_t lru_tick = 0;
+	// KYTY_GC_ASYNC_DOWNLOAD=1: collected with its download in flight (BufferCache::
+	// RunGarbageCollector), and whether a draw or dispatch used it again before the download
+	// landed (then it stays).
+	bool         gc_pending = false;
+	mutable bool gc_reused  = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -104,6 +131,7 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	vk::DeviceMemory              m_imported_memory = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	bool                          m_sparse   = false;
@@ -126,6 +154,10 @@ public:
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// A Map() whose Commit() has not run yet: any Map() / Copy() now reuses its bytes.
+	[[nodiscard]] bool ReservationPending() const noexcept { return m_reservation_pending; }
+	// The caller drops its Map() without committing it (nothing was staged that a copy reads).
+	void AbandonReservation() noexcept { m_reservation_pending = false; }
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -144,6 +176,7 @@ private:
 
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
+	bool                  m_reservation_pending = false;
 	std::vector<Watch>    m_current_watches;
 	size_t                m_current_watch_cursor = 0;
 	std::optional<size_t> m_invalidation_mark;

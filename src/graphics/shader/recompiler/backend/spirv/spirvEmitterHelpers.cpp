@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+namespace {
 
 DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
                                     uint32_t lane_bits) {
@@ -60,6 +61,8 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 	               ConstantU32(state, half_row ? 7u : 15u)),
 	        ConstantBool(state, true)};
 }
+
+} // namespace
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags) {
 	const auto subid = EmitSubgroupLocalInvocationId(state);
@@ -310,13 +313,23 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
-	const auto value = state.builder.AllocateId();
+	auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
 	if (state.lane_count == 2) {
 		const auto wave_base =
 		    EmitBinaryU32(state, spv::OpBitwiseAnd, value, ConstantU32(state, ~31u));
-		return EmitAddU32(state, EmitAddU32(state, value, wave_base),
-		                  ConstantU32(state, state.lane_half * 32));
+		value = EmitAddU32(state, EmitAddU32(state, value, wave_base),
+		                   ConstantU32(state, state.lane_half * 32));
+	}
+	if (state.mesh_pass_variable != 0) {
+		// Each pass runs the next Waves() / passes waves of the subgroup.
+		const auto& mesh = state.input_info.vertex->mesh;
+		const auto  pass = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), pass, state.mesh_pass_variable);
+		value = EmitAddU32(
+		    state, value,
+		    EmitBinaryU32(state, spv::OpIMul, pass,
+		                  ConstantU32(state, mesh.Waves() / state.mesh_passes * mesh.wave_size)));
 	}
 	return value;
 }
@@ -337,7 +350,7 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 		state.builder.AddFunction(spv::OpLoad, scalar_type, raw, pointer);
 	}
 
-	if (kind == VertexInputScalarKind::Uint) {
+	if (kind == Format::ComponentType::Uint) {
 		return raw;
 	}
 

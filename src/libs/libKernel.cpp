@@ -3,6 +3,9 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/fpEnv.h"
+#include "common/hostException.h"
+#include "common/kytyEvents.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -20,6 +23,7 @@
 #include "libs/network.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
+#include "loader/systemContent.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -40,9 +44,6 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <csignal>
@@ -956,17 +957,6 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 #endif
 }
 
-static int SignalDispatchHostSignal() {
-#if defined(__APPLE__)
-	// macOS has no realtime signals; SIGUSR1 is otherwise unused on the host side (the
-	// guest's SIGUSR1 is an emulated signal number, not a host registration).
-	static const int host_signal = SIGUSR1;
-#else
-	static const int host_signal = SIGRTMIN + 3;
-#endif
-	return host_signal;
-}
-
 static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
                                       void* native_context) {
 	Pthread current = PthreadSelfOrNull();
@@ -1004,7 +994,8 @@ static bool EnsureHostSignalDispatchInstalled() {
 		action.sa_sigaction = HostSignalDispatchHandler;
 		sigemptyset(&action.sa_mask);
 		action.sa_flags = SA_SIGINFO | SA_RESTART;
-		return ::sigaction(SignalDispatchHostSignal(), &action, nullptr) == 0;
+		const int signal_number = Common::HostException::GuestSignalDispatchSignal();
+		return ::sigaction(signal_number, &action, nullptr) == 0;
 	}();
 	return installed;
 }
@@ -1068,7 +1059,7 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 
 void KernelDispatchPendingSignalForCurrentThread() {
 	Pthread current = PthreadSelfOrNull();
-	if (current == nullptr) {
+	if (!PthreadHasAnyPendingSignal(current)) {
 		return;
 	}
 
@@ -1197,7 +1188,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		}
 
 		PthreadQueuePendingSignal(thread, signum);
-		if (!PthreadKillHost(thread, SignalDispatchHostSignal())) {
+		if (!PthreadKillHost(thread, Common::HostException::GuestSignalDispatchSignal())) {
 			PthreadTakePendingSignal(thread, signum);
 			LOGF("\t pthread_kill failed for target thread\n");
 			return KERNEL_ERROR_EINVAL;
@@ -1335,22 +1326,21 @@ static void* KYTY_SYSV_ABI KernelGetProcParam() {
 }
 
 static int KYTY_SYSV_ABI KernelIsTrinityMode() {
-	static std::atomic_uint32_t call_count {0};
-
-	auto count = call_count.fetch_add(1, std::memory_order_relaxed);
-	if (count < 8 || (count % 1024) == 0) {
-		PRINT_NAME();
-		LOGF("\tcall = %u, return = 0 (base PS5 mode)\n", count + 1);
-	}
-
-	return 0;
+	return Loader::SystemContentIsTrinityMode() ? 1 : 0;
 }
 
 static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 	PRINT_NAME();
 
-	*mode    = 2; // PS5 Base
-	*submode = 0; // None
+	// KYTY_POWER_SAVER=1 (default off; Sakura a2e295ed3 via usa-ratt/KytyPS5-GT7, --power-saver
+	// there): report the console's power saver mode (submode 1). GT7 then selects its 1920x1080
+	// graphics profile, less GPU work than its default.
+	static const bool power_saver = [] {
+		const char* value = std::getenv("KYTY_POWER_SAVER");
+		return value != nullptr && value[0] == '1';
+	}();
+	*mode    = Loader::SystemContentIsTrinityMode() ? 3 : 2; // PS5 Pro (experimental Pro mode) or Base
+	*submode = power_saver ? 1 : 0;                          // power saver mode (KYTY_POWER_SAVER=1) or none
 	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
 	return OK;
 }
@@ -1384,22 +1374,26 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 	[[maybe_unused]] auto* heap_posix_memalign = api[6];
 }
 
-static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
-	// PRINT_NAME();
+// _write to descriptors 0-2: upstream e0c5ae090 sends it through KernelWrite (printed and flushed). That
+// changes what a title that writes a lot to stdout costs, so it is opt-in here: KYTY_GUEST_STDOUT=1;
+// by default the bytes are dropped and reported as written, as before.
+static bool GuestStdoutEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_STDOUT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 
-	EXIT_NOT_IMPLEMENTED(d < 0);
-
-	if (Network::Net::IsSocket(d)) {
-		return Network::Net::Send(d, str, static_cast<uint64_t>(size), 0);
+static int64_t KYTY_SYSV_ABI write(int d, const void* buf, size_t nbytes) {
+	// fd 1/2: the game's own console text (KYTY_GUEST_CONSOLE, common/kytyEvents.h).
+	if ((d == 1 || d == 2) && nbytes > 0 && buf != nullptr) {
+		KytyEvents::GuestWrite(d, buf, nbytes);
 	}
-
-	if (d > 2) {
-		return POSIX_N_CALL(FileSystem::KernelWrite(d, str, size));
+	if (d >= 0 && d <= 2 && !GuestStdoutEnabled()) {
+		return static_cast<int64_t>(nbytes);
 	}
-
-	int size_int = static_cast<int>(size);
-
-	return size_int;
+	return POSIX_N_CALL(FileSystem::KernelWrite(d, buf, nbytes));
 }
 
 static int KYTY_SYSV_ABI open(const char* path, int flags, int mode) {
@@ -1932,6 +1926,12 @@ int KYTY_SYSV_ABI mkdir(const char* path, uint16_t mode) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelMkdir(path, mode));
 }
 
+int KYTY_SYSV_ABI rmdir(const char* path) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelRmdir(path));
+}
+
 int64_t KYTY_SYSV_ABI lseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();
 
@@ -2347,19 +2347,20 @@ struct FiberOptParam {
 };
 
 struct FiberCpuContext {
-	uint64_t rbx;
-	uint64_t rbp;
-	uint64_t rdi;
-	uint64_t rsi;
-	uint64_t r12;
-	uint64_t r13;
-	uint64_t r14;
-	uint64_t r15;
-	uint64_t rsp;
-	uint64_t rip;
+	uint64_t      rbx;
+	uint64_t      rbp;
+	uint64_t      rdi;
+	uint64_t      rsi;
+	uint64_t      r12;
+	uint64_t      r13;
+	uint64_t      r14;
+	uint64_t      r15;
+	uint64_t      rsp;
+	uint64_t      rip;
+	Common::FpEnv fp_env;
 };
 
-static_assert(sizeof(FiberCpuContext) == 80);
+static_assert(sizeof(FiberCpuContext) == 88);
 
 struct FiberObject {
 	uint32_t        magic_start;
@@ -2489,6 +2490,8 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 	             "movq %r11, 64(%r10)\n\t"
 	             "movq (%rsp), %r11\n\t"
 	             "movq %r11, 72(%r10)\n\t"
+	             "stmxcsr 80(%r10)\n\t"
+	             "fnstcw 84(%r10)\n\t"
 	             "xorl %eax, %eax\n\t"
 	             "retq\n");
 }
@@ -2506,6 +2509,16 @@ FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
 	             "movq 40(%r10), %r13\n\t"
 	             "movq 48(%r10), %r14\n\t"
 	             "movq 56(%r10), %r15\n\t"
+	             "subq $8, %rsp\n\t"
+	             "stmxcsr (%rsp)\n\t"
+	             "movl (%rsp), %ecx\n\t"
+	             "andl $0x3f, %ecx\n\t"
+	             "movl 80(%r10), %edx\n\t"
+	             "andl $0xffffffc0, %edx\n\t"
+	             "orl %ecx, %edx\n\t"
+	             "movl %edx, (%rsp)\n\t"
+	             "ldmxcsr (%rsp)\n\t"
+	             "fldcw 84(%r10)\n\t"
 	             "movq 64(%r10), %rsp\n\t"
 	             "jmp *%r11\n");
 }
@@ -2534,6 +2547,10 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	ctx.rsp = rsp;
 	ctx.rip = reinterpret_cast<uint64_t>(&FiberStartTrampoline);
 	ctx.rdi = reinterpret_cast<uint64_t>(fiber);
+	if ((fiber->flags & FIBER_FLAG_SET_FPU_REGS) != 0) {
+		Common::WriteFpEnv(Common::GuestFpEnv);
+	}
+	ctx.fp_env = Common::ReadFpEnv();
 
 	FiberRestoreContext(&ctx, 1);
 }
@@ -3275,6 +3292,7 @@ LIB_DEFINE(InitLibKernel_1_Equeue) {
 	LIB_FUNC("F6e0kwo4cnk", EventQueue::KernelTriggerUserEvent);
 	LIB_FUNC("LJDwdSNTnDg", EventQueue::KernelDeleteUserEvent);
 	LIB_FUNC("57ZK+ODEXWY", EventQueue::KernelAddTimerEvent);
+	LIB_FUNC("YWQFUyXIVdU", EventQueue::KernelDeleteTimerEvent);
 	LIB_FUNC("R74tt43xP6k", EventQueue::KernelAddHRTimerEvent);
 	LIB_FUNC("J+LF6LwObXU", EventQueue::KernelDeleteHRTimerEvent);
 	LIB_FUNC("bBfz7kMF2Ho", EventQueue::KernelAddAmprEvent);
@@ -3351,6 +3369,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("8+s5BzZjxSg", LibKernel::PthreadAttrGetaffinity);
 	LIB_FUNC("nsYoNRywwNg", LibKernel::PthreadAttrInit);
 	LIB_FUNC("JaRMy+QcpeU", LibKernel::PthreadAttrGetdetachstate);
+	LIB_FUNC("lpMP8HhkBbg", LibKernel::PthreadAttrGetinheritsched);
 	LIB_FUNC("-quPa4SEJUw", LibKernel::PthreadAttrGetstack);
 	LIB_FUNC("Ru36fiTtJzA", LibKernel::PthreadAttrGetstackaddr);
 	LIB_FUNC("-fA+7ZlGDQs", LibKernel::PthreadAttrGetstacksize);
@@ -3433,6 +3452,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("z0dtnPxYgtg", chmod);
 	LIB_FUNC("VAzswvTOCzI", FileSystem::KernelUnlink);
 	LIB_FUNC("JGMio+21L4c", Posix::mkdir);
+	LIB_FUNC("c7ZnT7V1B98", Posix::rmdir);
 	LIB_FUNC("wuCroIGjt2g", FileSystem::KernelOpen);
 	LIB_FUNC("bY-PO6JhzhQ", FileSystem::KernelClose);
 	LIB_FUNC("FN4gaPmuFV8", FileSystem::KernelWrite);

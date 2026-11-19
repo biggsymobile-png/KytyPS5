@@ -164,7 +164,10 @@ TestCase ScalarLoadsThroughLoopCarriedRecords() {
 TestCase RawLoadsThroughGpuSelectedDescriptors() {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000128000000ull;
-  enum Load : u32 { Ubyte = 0x08, Sbyte = 0x09, Ushort = 0x0a, Sshort = 0x0b, Dword = 0x0c };
+  enum Load : u32 {
+    Ubyte = 0x08, Sbyte = 0x09, Ushort = 0x0a, Sshort = 0x0b, Dword = 0x0c, X2 = 0x0d, X4 = 0x0e,
+    X3 = 0x0f
+  };
   struct LoadCase {
     u32 op, mode, stride, records, index, voffset, soffset, inst_offset;
     bool idxen, invalid_format = false;
@@ -188,6 +191,12 @@ TestCase RawLoadsThroughGpuSelectedDescriptors() {
       {Dword, 2, 0, 1, 0, 20, 0, 0, false},   // num_records != 0: no bounds
       {Dword, 2, 0, 0, 0, 0, 0, 0, false},    // num_records == 0: 0
       {Dword, 3, 0, 32, 0, 0, 0, 0, false, true}, // invalid format: 0
+      // Multi-dword loads: each dword has its own range check.
+      {X4, 3, 0, 16, 0, 0, 0, 0, false},      // all four in
+      {X4, 3, 0, 16, 0, 8, 0, 0, false},      // dwords 0-1 in, 2-3 out
+      {X2, 3, 0, 16, 0, 4, 4, 0, false},      // SOFFSET 4: 4 + 8 <= 16 - 4: both in
+      {X3, 0, 8, 3, 1, 0, 0, 4, true},        // structured: offset 4 in, 8 and 12 >= stride: 0
+      {X2, 3, 0, 32, 0, 0, 0, 0, false, true}, // invalid format: 0
   };
   constexpr u32 Count = static_cast<u32>(std::size(cases));
   const auto byte_at = [](u32 i, u32 b) { return static_cast<uint8_t>(0x80u + i * 16u + b * 5u); };
@@ -207,9 +216,11 @@ TestCase RawLoadsThroughGpuSelectedDescriptors() {
       word |= static_cast<u32>(byte_at(i, b)) << ((b % 4u) * 8u);
     }
   }
+  u32 slot = 0;
   for (u32 i = 0; i < Count; ++i) {
     const u32 selected = Count - 1 - i;
     const auto &input = cases[selected];
+    const u32 dwords = input.op == X2 ? 2u : input.op == X3 ? 3u : input.op == X4 ? 4u : 1u;
     test.initial[64 + i] = selected;
     AppendVMovU32(&test.code, 30, (64 + i) * 4);
     AppendBufferLoadDword(&test.code, 0, 30);
@@ -222,36 +233,258 @@ TestCase RawLoadsThroughGpuSelectedDescriptors() {
     AppendVMovU32(&test.code, 2, input.idxen ? input.index : input.voffset);
     AppendVMovU32(&test.code, 3, input.voffset);
     test.code.push_back(EncodeMubuf0(input.op, input.inst_offset, input.idxen, true));
-    test.code.push_back(EncodeMubuf1(1, 2, 2, 22)); // v1, s[8:11], v[2:3] or v2, s22
-    AppendStoreVgpr(&test.code, 1, i);
-    // Reference: RDNA2 8.1.5 linear addressing and range checks.
-    const u32 bytes = input.op == Dword ? 4u : (input.op == Ushort || input.op == Sshort) ? 2u : 1u;
-    const u32 offset = input.voffset + input.inst_offset;
-    const u32 record = input.idxen ? input.index * input.stride : 0u;
-    bool in = !input.invalid_format;
-    switch (input.mode) {
-      case 0: in = in && input.index < input.records && offset < input.stride; break;
-      case 1: in = in && input.index < input.records; break;
-      case 2: in = in && input.records != 0; break;
-      default:
-        in = in && input.soffset <= input.records && offset + bytes <= input.records - input.soffset;
-        break;
+    // v1 (one dword) or v[4..7], s[8:11], v[2:3] or v2, s22
+    test.code.push_back(EncodeMubuf1(dwords == 1u ? 1u : 4u, 2, 2, 22));
+    for (u32 c = 0; c < dwords; ++c) {
+      AppendStoreVgpr(&test.code, dwords == 1u ? 1u : 4u + c, slot++);
     }
-    const u32 first = input.soffset + record + offset;
-    u32 value = 0;
-    if (in) {
-      for (u32 b = 0; b < bytes; ++b) {
-        value |= static_cast<u32>(byte_at(selected, first + b)) << (b * 8u);
+    // Reference: RDNA2 8.1.5 linear addressing and range checks, per dword.
+    const u32 bytes = dwords > 1u || input.op == Dword ? 4u
+                      : (input.op == Ushort || input.op == Sshort) ? 2u : 1u;
+    for (u32 c = 0; c < dwords; ++c) {
+      const u32 offset = input.voffset + input.inst_offset + c * 4u;
+      const u32 record = input.idxen ? input.index * input.stride : 0u;
+      bool in = !input.invalid_format;
+      switch (input.mode) {
+        case 0: in = in && input.index < input.records && offset < input.stride; break;
+        case 1: in = in && input.index < input.records; break;
+        case 2: in = in && input.records != 0; break;
+        default:
+          in = in && input.soffset <= input.records && offset + bytes <= input.records - input.soffset;
+          break;
       }
-      if (input.op == Sbyte) value = static_cast<u32>(static_cast<int32_t>(static_cast<int8_t>(value)));
-      if (input.op == Sshort) value = static_cast<u32>(static_cast<int32_t>(static_cast<int16_t>(value)));
+      const u32 first = input.soffset + record + offset;
+      u32 value = 0;
+      if (in) {
+        for (u32 b = 0; b < bytes; ++b) {
+          value |= static_cast<u32>(byte_at(selected, first + b)) << (b * 8u);
+        }
+        if (input.op == Sbyte) value = static_cast<u32>(static_cast<int32_t>(static_cast<int8_t>(value)));
+        if (input.op == Sshort) value = static_cast<u32>(static_cast<int32_t>(static_cast<int16_t>(value)));
+      }
+      test.expected.push_back(value);
     }
-    test.expected.push_back(value);
   }
   AppendEnd(&test.code);
   test.bda_mappings = {{GuestBase, 0}};
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_UBYTE,
                   O::BUFFER_LOAD_SBYTE, O::BUFFER_LOAD_USHORT, O::BUFFER_LOAD_SSHORT,
+                  O::BUFFER_LOAD_DWORDX2, O::BUFFER_LOAD_DWORDX3, O::BUFFER_LOAD_DWORDX4,
+                  O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
+// BUFFER_LOAD_FORMAT_XYZW through V#s the shader selects at runtime (the module's formatted-load
+// decoder: the per-format switch, or KYTY_INDIRECT_FORMAT_COMPACT's table-driven one). Every
+// format the decoder decodes, with its destination selects, element alignment (8/16-bit
+// formats at odd / 2-byte offsets), out-of-range elements (0, but a select of 1 still reads one),
+// formats it does not decode (0) and an element across a 16 KiB page-table page.
+TestCase FormattedLoadsThroughGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000130000000ull;
+  enum Kind : u32 { Uint, Sint, Unorm, Snorm, Float };
+  struct FormatDef {
+    u32 format;
+    Kind kind;
+    std::array<u32, 4> widths;
+  };
+  // The formats the decoder decodes (IndirectFormatDecoded), with their component widths.
+  const FormatDef formats[] = {
+      {1, Unorm, {8}}, {2, Snorm, {8}}, {5, Uint, {8}}, {6, Sint, {8}},
+      {7, Unorm, {16}}, {8, Snorm, {16}}, {11, Uint, {16}}, {12, Sint, {16}}, {13, Float, {16}},
+      {14, Unorm, {8, 8}}, {15, Snorm, {8, 8}}, {18, Uint, {8, 8}}, {19, Sint, {8, 8}},
+      {20, Uint, {32}}, {21, Sint, {32}}, {22, Float, {32}},
+      {23, Unorm, {16, 16}}, {24, Snorm, {16, 16}}, {27, Uint, {16, 16}}, {28, Sint, {16, 16}},
+      {29, Float, {16, 16}}, {36, Float, {11, 11, 10}}, {43, Float, {10, 11, 11}},
+      {44, Unorm, {2, 10, 10, 10}}, {45, Snorm, {2, 10, 10, 10}},
+      {50, Unorm, {10, 10, 10, 2}}, {51, Snorm, {10, 10, 10, 2}},
+      {56, Unorm, {8, 8, 8, 8}}, {57, Snorm, {8, 8, 8, 8}}, {60, Uint, {8, 8, 8, 8}},
+      {61, Sint, {8, 8, 8, 8}}, {62, Uint, {32, 32}}, {63, Sint, {32, 32}}, {64, Float, {32, 32}},
+      {65, Unorm, {16, 16, 16, 16}}, {66, Snorm, {16, 16, 16, 16}}, {69, Uint, {16, 16, 16, 16}},
+      {70, Sint, {16, 16, 16, 16}}, {71, Float, {16, 16, 16, 16}},
+      {72, Uint, {32, 32, 32}}, {73, Sint, {32, 32, 32}}, {74, Float, {32, 32, 32}},
+      {75, Uint, {32, 32, 32, 32}}, {76, Sint, {32, 32, 32, 32}}, {77, Float, {32, 32, 32, 32}},
+  };
+  struct LoadCase {
+    u32 def;          // index into formats, or UINT32_MAX: undecoded `format`
+    u32 format;       // for undecoded cases
+    u32 dst_sel;      // 12 bits
+    u32 offset;       // byte offset of the access in the case's data block
+    u32 records;      // OOB_SELECT 3 bound in bytes
+    u32 data_offset;  // the data block's byte offset in the buffer (0: default slot)
+  };
+  constexpr u32 Xyzw = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u);
+  std::vector<LoadCase> cases;
+  for (u32 n = 0; n < std::size(formats); ++n) {
+    u32 bits = 0;
+    for (const auto w : formats[n].widths) bits += w;
+    const u32 bytes = bits / 8u;
+    cases.push_back({n, 0, Xyzw, bytes >= 4u ? 8u : bytes == 2u ? 6u : 5u, 64, 0});
+  }
+  const auto def_of = [&](u32 format) {
+    for (u32 n = 0; n < std::size(formats); ++n) {
+      if (formats[n].format == format) return n;
+    }
+    return UINT32_MAX;
+  };
+  // Destination selects: one/zero/wrapping past the format's components.
+  cases.push_back({def_of(22), 0, 1u | (0u << 3u) | (7u << 6u) | (4u << 9u), 4, 64, 0});
+  cases.push_back({def_of(64), 0, 5u | (4u << 3u) | (1u << 6u) | (6u << 9u), 8, 64, 0});
+  cases.push_back({def_of(56), 0, 7u | (6u << 3u) | (5u << 6u) | (1u << 9u), 12, 64, 0});
+  cases.push_back({def_of(36), 0, 6u | (1u << 3u) | (4u << 6u) | (7u << 9u), 0, 64, 0});
+  // Unaligned access: 8-bit at byte 7, 16-bit at byte 3 (element aligned down to 2).
+  cases.push_back({def_of(1), 0, Xyzw, 7, 64, 0});
+  cases.push_back({def_of(11), 0, Xyzw, 3, 64, 0});
+  cases.push_back({def_of(14), 0, Xyzw, 9, 64, 0});
+  // Out of range (offset + element size > records): zeros, a select of 1 reads one.
+  cases.push_back({def_of(71), 0, 1u | (5u << 3u) | (6u << 6u) | (7u << 9u), 8, 15, 0});
+  cases.push_back({def_of(20), 0, 4u | (1u << 3u) | (0u << 6u) | (1u << 9u), 8, 11, 0});
+  // Formats the decoder does not decode: 0 (invalid), 3 (8 uscaled), 30 (11_11_10 unorm).
+  cases.push_back({UINT32_MAX, 0, 1u | (4u << 3u) | (5u << 6u) | (6u << 9u), 0, 64, 0});
+  cases.push_back({UINT32_MAX, 3, Xyzw, 0, 64, 0});
+  cases.push_back({UINT32_MAX, 30, 1u | (4u << 3u) | (5u << 6u) | (6u << 9u), 0, 64, 0});
+  // A 16-byte element across the 16 KiB page-table page at buffer byte 16384.
+  cases.push_back({def_of(77), 0, Xyzw, 8, 64, 16384 - 16});
+  const u32 Count = static_cast<u32>(cases.size());
+  const auto byte_at = [](u32 i, u32 b) {
+    return static_cast<uint8_t>(0x37u + i * 29u + b * 11u + (b * b) / 3u);
+  };
+  TestCase test;
+  test.name = "FormattedLoadsThroughGpuSelectedDescriptors";
+  test.initial.resize(16384 / 4 + 64);
+  std::vector<uint8_t> bytes(test.initial.size() * 4u, 0);
+  const auto data_of = [&](u32 i) { return cases[i].data_offset != 0 ? cases[i].data_offset : 8192u + i * 64u; };
+  for (u32 i = 0; i < Count; ++i) {
+    const u32 data_offset = data_of(i);
+    for (u32 b = 0; b < 64; ++b) bytes[data_offset + b] = byte_at(i, b);
+    if (cases[i].def == UINT32_MAX) continue;
+    const auto &def = formats[cases[i].def];
+    u32 total = 0;
+    for (const auto w : def.widths) total += w;
+    const u32 size = total / 8u;
+    const u32 element = cases[i].offset & ~(std::min(4u, size) - 1u);
+    if (def.kind != Float) continue;
+    // Finite float components (random bits would hold NaNs).
+    u32 bit = 0;
+    for (u32 c = 0; c < 4 && def.widths[c] != 0; ++c) {
+      const u32 w = def.widths[c];
+      uint64_t value = 0;
+      if (w == 32) value = std::bit_cast<u32>(-1.25f * static_cast<float>(c + 1) + 0.0625f * i);
+      if (w == 16) value = 0x3800u + c * 0x0123u + i * 3u;       // 0.5 .. ~2
+      if (w == 11) value = ((13u + c) << 6u) | ((c * 9u + i) & 63u);
+      if (w == 10) value = ((14u + c) << 5u) | ((c * 7u + i) & 31u);
+      for (u32 k = 0; k < w; ++k) {
+        const u32 at = element * 8u + bit + k;
+        auto &byte = bytes[data_offset + at / 8u];
+        byte = static_cast<uint8_t>((byte & ~(1u << (at % 8u))) | (((value >> k) & 1u) << (at % 8u)));
+      }
+      bit += w;
+    }
+  }
+  const auto half_to_float = [](u32 h) {
+    const u32 sign = (h >> 15u) & 1u, e = (h >> 10u) & 31u, m = h & 1023u;
+    float value = e == 0 ? std::ldexp(static_cast<float>(m), -24)
+                         : std::ldexp(1.0f + static_cast<float>(m) / 1024.0f, static_cast<int>(e) - 15);
+    return sign != 0 ? -value : value;
+  };
+  const auto ufloat_to_float = [](u32 raw, u32 mantissa_bits) {
+    const u32 e = raw >> mantissa_bits, m = raw & ((1u << mantissa_bits) - 1u);
+    return e == 0 ? std::ldexp(static_cast<float>(m), 1 - 15 - static_cast<int>(mantissa_bits))
+                  : std::ldexp(1.0f + static_cast<float>(m) / static_cast<float>(1u << mantissa_bits),
+                               static_cast<int>(e) - 15);
+  };
+  for (u32 i = 0; i < Count; ++i) {
+    const u32 data_offset = data_of(i);
+    const auto &input = cases[i];
+    const uint64_t base = GuestBase + data_offset;
+    const u32 format = input.def != UINT32_MAX ? formats[input.def].format : input.format;
+    const std::array<u32, 4> descriptor{static_cast<u32>(base), static_cast<u32>(base >> 32u),
+                                        input.records, (3u << 28u) | (format << 12u) | input.dst_sel};
+    for (u32 k = 0; k < 4; ++k) {
+      for (u32 b = 0; b < 4; ++b) bytes[4096 + i * 16 + k * 4 + b] = static_cast<uint8_t>(descriptor[k] >> (8u * b));
+    }
+  }
+  for (u32 w = 0; w < test.initial.size(); ++w) {
+    test.initial[w] = bytes[w * 4] | (bytes[w * 4 + 1] << 8u) | (bytes[w * 4 + 2] << 16u) |
+                      (static_cast<u32>(bytes[w * 4 + 3]) << 24u);
+  }
+  for (u32 i = 0; i < Count; ++i) {
+    const u32 selected = Count - 1 - i;
+    const auto &input = cases[selected];
+    test.initial[512 + i] = selected;
+    AppendVMovU32(&test.code, 30, (512 + i) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0))); // v_readfirstlane_b32 s20, v0
+    test.code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 16
+    test.code.push_back(16);
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0)); // s_buffer_load_dwordx4 s[8:11], s[0:3]
+    test.code.push_back(EncodeSmem1(4096, 20));
+    AppendSMovLiteral(&test.code, 22, 0);
+    AppendVMovU32(&test.code, 2, input.offset);
+    test.code.push_back(EncodeMubuf0(0x03, 0, false, true)); // buffer_load_format_xyzw
+    test.code.push_back(EncodeMubuf1(4, 2, 2, 22));          // v[4:7], s[8:11], v2, s22
+    for (u32 c = 0; c < 4; ++c) AppendStoreVgpr(&test.code, 4 + c, i * 4 + c);
+    // Reference decode.
+    std::array<u32, 4> channels{};
+    std::array<uint8_t, 4> is_float{};
+    if (input.def != UINT32_MAX) {
+      const auto &def = formats[input.def];
+      u32 count = 0, total = 0;
+      for (const auto w : def.widths) {
+        count += w != 0 ? 1u : 0u;
+        total += w;
+      }
+      const u32 size = total / 8u;
+      const u32 element = input.offset & ~(std::min(4u, size) - 1u);
+      const bool in = input.offset + size <= input.records;
+      const u32 data_offset = data_of(selected);
+      std::array<u32, 4> components{};
+      u32 bit = 0;
+      for (u32 c = 0; c < count; ++c) {
+        const u32 w = def.widths[c];
+        uint64_t raw = 0;
+        for (u32 k = 0; k < w && in; ++k) {
+          const u32 at = element * 8u + bit + k;
+          raw |= static_cast<uint64_t>((bytes[data_offset + at / 8u] >> (at % 8u)) & 1u) << k;
+        }
+        bit += w;
+        const int64_t signed_raw = w == 32 ? static_cast<int32_t>(raw)
+                                           : (raw & (1ull << (w - 1))) ? static_cast<int64_t>(raw) - (1ll << w)
+                                                                       : static_cast<int64_t>(raw);
+        switch (def.kind) {
+          case Uint: components[c] = static_cast<u32>(raw); break;
+          case Sint: components[c] = static_cast<u32>(static_cast<int32_t>(signed_raw)); break;
+          case Unorm:
+            components[c] = std::bit_cast<u32>(static_cast<float>(raw) / static_cast<float>((1u << w) - 1u));
+            break;
+          case Snorm:
+            components[c] = std::bit_cast<u32>(std::max(
+                static_cast<float>(signed_raw) / static_cast<float>((1u << (w - 1u)) - 1u), -1.0f));
+            break;
+          case Float:
+            components[c] = w == 32 ? static_cast<u32>(raw)
+                            : w == 16 ? std::bit_cast<u32>(half_to_float(static_cast<u32>(raw)))
+                                      : std::bit_cast<u32>(ufloat_to_float(static_cast<u32>(raw), w == 11 ? 6u : 5u));
+            break;
+        }
+      }
+      const u32 one = def.kind == Uint || def.kind == Sint ? 1u : 0x3f800000u;
+      for (u32 channel = 0; channel < 4; ++channel) {
+        const u32 sel = (input.dst_sel >> (3u * channel)) & 7u;
+        channels[channel] = sel >= 4 ? components[(sel - 4u) % count] : sel == 1 ? one : 0u;
+        is_float[channel] = (def.kind == Unorm || def.kind == Snorm) && sel >= 4 ? 1u : 0u;
+      }
+    }
+    for (u32 channel = 0; channel < 4; ++channel) {
+      test.expected.push_back(channels[channel]);
+      test.float_words.push_back(is_float[channel]);
+    }
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_FORMAT_XYZW,
                   O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
@@ -349,6 +582,33 @@ void CallIsSkipped() {
   Require("CallIsSkipped", "translate", result.skip_dispatch,
           "S_SWAPPC_B64 program was not skipped under KYTY_SRT_VARIANT_READS");
   std::printf("[compute] CallIsSkipped                     ok\n");
+}
+
+// KYTY_HUGE_HELPER_OUTLINE: a helper with 16 call sites in a module of 100,000 words becomes
+// DontInline; fewer calls or a smaller module leave its function control alone.
+void HugeHelperOutlineControl() {
+  const auto module = [](size_t words, u32 calls) {
+    std::vector<u32> m = {0x07230203u, 0x00010300u, 0u, 100u, 0u};
+    m.insert(m.end(), {(5u << 16) | 54u, 1u, 10u, 0u, 2u}); // %10 = OpFunction %1 None %2
+    m.insert(m.end(), {(5u << 16) | 54u, 1u, 11u, 0u, 2u}); // %11, never called
+    for (u32 c = 0; c < calls; c++) {
+      m.insert(m.end(), {(5u << 16) | 57u, 1u, 20u + c, 10u, 3u}); // OpFunctionCall %1 %10 %3
+    }
+    m.resize(std::max(words, m.size()), (1u << 16) | 0u); // OpNop padding
+    return m;
+  };
+  const std::array<u32, 2> helpers{10u, 11u};
+  auto huge = module(100000, 16);
+  ShaderRecompiler::Spirv::OutlineHugeModuleHelpers(huge, helpers);
+  Require("HugeHelperOutline", "outlined", huge[8] == 2u && huge[13] == 0u,
+          "a helper with 16 calls in a huge module was not made DontInline (or an uncalled one was)");
+  auto few = module(100000, 15);
+  ShaderRecompiler::Spirv::OutlineHugeModuleHelpers(few, helpers);
+  Require("HugeHelperOutline", "few calls", few[8] == 0u, "a helper with 15 calls was changed");
+  auto little = module(99999, 16);
+  ShaderRecompiler::Spirv::OutlineHugeModuleHelpers(little, helpers);
+  Require("HugeHelperOutline", "small module", little[8] == 0u, "a helper of a small module was changed");
+  std::printf("[compute] HugeHelperOutlineControl          ok\n");
 }
 
 // Flat SRT reads through a pointer that is null, or points nowhere, when the plan is evaluated
@@ -555,19 +815,549 @@ void CallTargetsFromUserData() {
   std::printf("[compute] %-32s ok\n", name);
 }
 
+// S_SWAPPC_B64 calls through a function table (ShaderRecompiler CallTable), as Miles Morales'
+// ray-tracing shaders pick a hit callback per lane: the table V# is loaded through the SRT before a
+// branch, the call block loads a 16-byte record at index << 4 and copies its first pair into the
+// link registers. The table descriptor register is also used as a temporary before its load and
+// after the call; the trace still finds the load that reaches the call.
+void CallTablesTraced() {
+  constexpr const char *name = "CallTablesTraced";
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(72, 4));                        // s_mov_b32 s72, s4 (a temporary)
+  code.push_back(EncodeSmem0(0x02, 8, 2));                     // s_load_dwordx4 s[8:11], s[4:5], 544
+  code.push_back(EncodeSmem1(544, 125));
+  code.push_back(EncodeSmem0(0x0a, 72, 4));                    // s_buffer_load_dwordx4 s[72:75], s[8:11], 64
+  code.push_back(EncodeSmem1(64, 125));
+  code.push_back(EncodeSopp(0x04, 0));                         // s_cbranch_scc0 to the next block
+  code.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4)));      // s_lshl_b32 vcc_lo, s6, 4
+  code.push_back(EncodeSmem0(0x0a, 8, 36));                    // s_buffer_load_dwordx4 s[8:11], s[72:75], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSMovB32(14, 8));
+  code.push_back(EncodeSMovB32(15, 9));
+  code.push_back(0xbe8e210eu);                                 // s_swappc_b64 s[14:15], s[14:15]
+  code.push_back(EncodeSMovB32(72, 5));                        // a later temporary
+  AppendEnd(&code);
+  std::array<u32, 16> user_data{};
+  ShaderComputeInputInfo compute_info{};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  const auto result = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "skipped", result.skip_dispatch, "the calling program was not skipped");
+  const auto &tables = result.call_tables;
+  const auto step = [](const ShaderRecompiler::CallTableStep &s, bool buffer, int32_t offset) {
+    return s.buffer == buffer && s.base_index == 0u && s.offset == offset && s.dwords == 4u;
+  };
+  Require(name, "table",
+          tables.size() == 1u && tables[0].user_sgpr == 4u && tables[0].return_sgpr == 14u &&
+              tables[0].record_shift == 4u && tables[0].target_word == 0u &&
+              tables[0].table_index == 0u && tables[0].steps.size() == 2u &&
+              step(tables[0].steps[0], false, 544) && step(tables[0].steps[1], true, 64),
+          "the call table was not traced (" + std::to_string(tables.size()) + " found)");
+
+  // A second, different load of the descriptor that can reach the call is not a table.
+  std::vector<u32> ambiguous = code;
+  ambiguous.insert(ambiguous.begin() + 5, {EncodeSopp(0x04, 2),       // s_cbranch_scc0 past the reload
+                                           EncodeSmem0(0x0a, 72, 4),  // s_buffer_load_dwordx4 s[72:75], s[8:11], 80
+                                           EncodeSmem1(80, 125)});
+  const auto other = ShaderRecompiler::TranslateProgram(ambiguous, options);
+  Require(name, "two loads", other.skip_dispatch && other.call_tables.empty(),
+          "a descriptor with two reaching loads was traced");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
+// KYTY_CALL_TRACE_WAVE32: PPSA03671's tiled material kernels (wave32) write a V_CMP mask to s11
+// before their callback loop, load the table V# from the SRT pointer s[12:13] inside it, and reload
+// s[8:15] from s[12:13] only after it. A wave32 V_CMP writes one SGPR, and s[12:13] holds its entry
+// value at the call: the table is the user-data pointer's +144.
+void CallTablesTracedWave32() {
+  constexpr const char *name = "CallTablesTracedWave32";
+  std::vector<u32> code;
+  code.push_back(EncodeVop3Word0(0x004u, 11));           // v_cmp_gt_f32 s11, v0, v1
+  code.push_back(EncodeVop3Word1(Vgpr(0), Vgpr(1)));
+  code.push_back(EncodeSopp(0x04, 0));                   // s_cbranch_scc0 to the next block
+  code.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4))); // s_lshl_b32 vcc_lo, s6, 4
+  code.push_back(EncodeSmem0(0x02, 0, 6));               // s_load_dwordx4 s[0:3], s[12:13], 144
+  code.push_back(EncodeSmem1(144, 125));
+  code.push_back(EncodeSmem0(0x0a, 0, 0));               // s_buffer_load_dwordx4 s[0:3], s[0:3], vcc_lo
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSMovB32(14, 0));
+  code.push_back(EncodeSMovB32(15, 1));
+  code.push_back(0xbe8e210eu);                           // s_swappc_b64 s[14:15], s[14:15]
+  code.push_back(EncodeSmem0(0x03, 8, 6));               // s_load_dwordx8 s[8:15], s[12:13], 64
+  code.push_back(EncodeSmem1(64, 125));
+  AppendEnd(&code);
+  std::array<u32, 16> user_data{};
+  ShaderComputeInputInfo compute_info{};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.input_info.compute = &compute_info;
+  options.user_data = user_data;
+  options.wave_size = 32;
+  auto codegen = GetCodegenOptions();
+  codegen.call_trace_wave32 = false;
+  {
+    ScopedCodegenOptions scope(codegen);
+    const auto before = ShaderRecompiler::TranslateProgram(code, options);
+    Require(name, "switch off", before.skip_dispatch && before.call_tables.empty(),
+            "the table was traced without KYTY_CALL_TRACE_WAVE32");
+  }
+  codegen.call_trace_wave32 = true;
+  ScopedCodegenOptions scope(codegen);
+  const auto result = ShaderRecompiler::TranslateProgram(code, options);
+  const auto &tables = result.call_tables;
+  Require(name, "table",
+          result.skip_dispatch && tables.size() == 1u && tables[0].user_sgpr == 12u &&
+              tables[0].return_sgpr == 14u && tables[0].record_shift == 4u &&
+              tables[0].target_word == 0u && tables[0].table_index == 0u &&
+              tables[0].steps.size() == 1u && !tables[0].steps[0].buffer &&
+              tables[0].steps[0].offset == 144 && tables[0].steps[0].dwords == 4u,
+          "the wave32 call table was not traced (" + std::to_string(tables.size()) + " found)");
+  // Wave64: the V_CMP writes s[11:12], so s12 has no single reaching definition.
+  options.wave_size = 64;
+  const auto wave64 = ShaderRecompiler::TranslateProgram(code, options);
+  Require(name, "wave64", wave64.call_tables.empty(),
+          "a wave64 V_CMP pair over s12 was ignored");
+  // Upstream 7524e8f79's case: a lane read writes one SGPR in wave64 too, so V_READLANE_B32 s11
+  // does not define s12 (WritesSgpr takes the width from the _B32 name).
+  {
+    auto lane_read = code;
+    lane_read[0] = EncodeVop3Word0(0x360u, 11); // v_readlane_b32 s11, v0, s1
+    lane_read[1] = EncodeVop3Word1(Vgpr(0), 1);
+    const auto traced = ShaderRecompiler::TranslateProgram(lane_read, options);
+    Require(name, "wave64 lane read",
+            traced.call_tables.size() == 1u && traced.call_tables[0].user_sgpr == 12u,
+            "a V_READLANE_B32 of s11 was taken as a write of s12");
+  }
+  // The table V# in user data itself (0xfc0537b7278db60c: s[8:11]): no load step.
+  options.wave_size = 32;
+  {
+    std::vector<u32> direct;
+    direct.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4))); // s_lshl_b32 vcc_lo, s6, 4
+    direct.push_back(EncodeSmem0(0x0a, 0, 4));                // s_buffer_load_dwordx4 s[0:3], s[8:11], vcc_lo
+    direct.push_back(EncodeSmem1(0, 106));
+    direct.push_back(EncodeSMovB32(14, 0));
+    direct.push_back(EncodeSMovB32(15, 1));
+    direct.push_back(0xbe8e210eu); // s_swappc_b64 s[14:15], s[14:15]
+    AppendEnd(&direct);
+    const auto traced = ShaderRecompiler::TranslateProgram(direct, options);
+    Require(name, "user-data table",
+            traced.call_tables.size() == 1u && traced.call_tables[0].user_sgpr == 8u &&
+                traced.call_tables[0].steps.empty() && traced.call_tables[0].table_index == 0u,
+            "a table V# held in user data was not traced");
+  }
+  // A later write that can loop back to the call keeps the range unknown.
+  std::vector<u32> looping = code;
+  looping.pop_back(); // s_endpgm
+  // The lshl is word 3; the branch offset counts from the word after the branch.
+  const auto back = 3 - static_cast<int32_t>(looping.size() + 1u);
+  looping.push_back(EncodeSopp(0x04, static_cast<u32>(back) & 0xffffu)); // s_cbranch_scc0 to the lshl
+  AppendEnd(&looping);
+  const auto loop = ShaderRecompiler::TranslateProgram(looping, options);
+  Require(name, "loop back", loop.call_tables.empty(),
+          "a reload that can loop back to the call was taken as the entry value");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
+// KYTY_SHADER_CALLS: guest memory for the expansion side of the call tests: (guest address, words).
+struct FakeGuestMemory {
+  std::vector<std::pair<uint64_t, std::vector<u32> *>> regions;
+
+  bool Read(uint64_t address, std::span<u32> words) const {
+    for (const auto &[base, data] : regions) {
+      const uint64_t end = base + data->size() * 4u;
+      if (address >= base && address + words.size_bytes() <= end && (address & 3u) == 0) {
+        std::copy_n(data->begin() + static_cast<std::ptrdiff_t>((address - base) / 4u), words.size(),
+                    words.begin());
+        return true;
+      }
+    }
+    return false;
+  }
+  ShaderRecompiler::Decoder::ShaderCodeReader Reader() const {
+    return [this](uint64_t address, std::span<u32> words) { return Read(address, words); };
+  }
+};
+
+// The call shape of Miles Morales' ray-tracing kernels, expanded (ShaderCallExpander) and run: the
+// table V# is loaded through the user-data V#, each call loads a 16-byte record {function, data} at
+// index << 4, copies it into s[14:16] and calls s[14:15]. Records 0-2 name callees A-C; record 3 is
+// null and record 4 names D only in the GPU's copy (the expansion did not see it): both skip the
+// call. Each call stores SCC after the call (s_cselect 1 : 2), v1 (999 before the call) and v2 (0
+// before). Calls alternate the SCC they enter with; B keeps it, A and C set it.
+TestCase CallTableExpanded() {
+  using O = ShaderOpcode;
+  // The harness binds every buffer the program reads to its one test buffer, from its start, and
+  // its user-data V# s[0:3] has base 0: the table is at the start of the buffer (a table V# with
+  // base 0), the stores follow it.
+  constexpr uint64_t GuestBase = 0;
+  constexpr u32 Out = 20;
+  constexpr uint64_t CalleeBase = 0x0000000140000000ull;
+  constexpr u32 TableByte = 0;
+  static TestCallees callees;
+  TestCase test;
+  test.name = "CallTableExpanded";
+  test.initial.resize(2048);
+  const uint64_t table = GuestBase + TableByte;
+  const std::array<u32, 4> table_vsharp{static_cast<u32>(table), static_cast<u32>(table >> 32u),
+                                        5u * 16u, 0x5204u};
+  std::copy(table_vsharp.begin(), table_vsharp.end(), test.initial.begin() + 130);
+  const auto record = [&](std::vector<u32> &words, u32 index, uint64_t function, u32 data) {
+    words[TableByte / 4 + index * 4 + 0] = static_cast<u32>(function);
+    words[TableByte / 4 + index * 4 + 1] = static_cast<u32>(function >> 32u);
+    words[TableByte / 4 + index * 4 + 2] = data;
+  };
+  record(test.initial, 0, TestCallees::Address(CalleeBase, 0), 10);
+  record(test.initial, 1, TestCallees::Address(CalleeBase, 1), 20);
+  record(test.initial, 2, TestCallees::Address(CalleeBase, 2), 5);
+  const std::array<u32, 6> indices{0, 1, 2, 3, 4, 1};
+  for (u32 i = 0; i < indices.size(); ++i) {
+    test.initial[64 + i] = indices[i];
+  }
+  // What the expansion reads: the same buffer without record 4.
+  static std::vector<u32> seen;
+  seen = test.initial;
+  record(test.initial, 4, TestCallees::Address(CalleeBase, 3), 0);
+
+  auto &code = test.code;
+  code.push_back(EncodeSmem0(0x0a, 72, 0)); // s_buffer_load_dwordx4 s[72:75], s[0:3], 520
+  code.push_back(EncodeSmem1(520, 125));
+  for (u32 i = 0; i < indices.size(); ++i) {
+    AppendVMovU32(&code, 30, (64 + i) * 4);
+    AppendBufferLoadDword(&code, 0, 30);
+    code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));                       // v_readfirstlane_b32 s20, v0
+    AppendVMovLiteral(&code, 1, 999);
+    code.push_back(EncodeVop1(0x01, 2, InlineU32(0)));                  // v_mov_b32 v2, 0
+    code.push_back(EncodeSop2(0x1e, 106, 20, InlineU32(4)));            // s_lshl_b32 vcc_lo, s20, 4
+    code.push_back(EncodeSmem0(0x0a, 8, 36));                           // s_buffer_load_dwordx4 s[8:11], s[72:75], vcc_lo
+    code.push_back(EncodeSmem1(0, 106));
+    code.push_back(EncodeSopp(0x0c, 0xc07f));                           // s_waitcnt lgkmcnt(0)
+    code.push_back(EncodeSopc(0x06, InlineU32(i & 1u), InlineU32(1)));  // SCC = odd call
+    code.push_back(EncodeSMovB32(14, 8));
+    code.push_back(EncodeSMovB32(15, 9));
+    code.push_back(EncodeSMovB32(16, 10));
+    code.push_back(0xbe8e210eu);                                        // s_swappc_b64 s[14:15], s[14:15]
+    code.push_back(EncodeSop2(0x0a, 31, InlineU32(1), InlineU32(2)));   // s_cselect_b32 s31, 1, 2
+    AppendStoreSgpr(&code, 31, Out + i * 3 + 0);
+    code.push_back(EncodeVop1(0x02, 32, Vgpr(1)));                      // v_readfirstlane_b32 s32, v1
+    AppendStoreSgpr(&code, 32, Out + i * 3 + 1);
+    code.push_back(EncodeVop1(0x02, 33, Vgpr(2)));
+    AppendStoreSgpr(&code, 33, Out + i * 3 + 2);
+  }
+  AppendEnd(&code);
+  const auto callee_c_pc = static_cast<u32>(TestCallees::Address(CalleeBase, 2) + 32u);
+  test.expected.assign(test.initial.begin(), test.initial.begin() + Out); // the table
+  test.expected.insert(test.expected.end(), {2, 17, 0,           // A: 10 + 7; its s_add clears SCC
+                   1, 20, 0,           // B: SCC kept (odd call)
+                   1, 0x555, callee_c_pc, // C: s16 == 5; its compare sets SCC
+                   1, 999, 0,          // null record: skipped, SCC kept
+                   2, 999, 0,          // D, outside the expanded set: skipped, SCC kept
+                   1, 20, 0});
+
+  // The expansion, as the pipeline cache does it with this user data and memory.
+  static std::vector<u32> callee_words;
+  callee_words = callees.words;
+  FakeGuestMemory memory;
+  memory.regions = {{GuestBase, &seen}, {CalleeBase, &callee_words}};
+  std::array<u32, 4> user_data{0u, 0u, 8192u, 3u << 28u};
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.shader_hash = 0x5ca11ab1e0000001ull;
+  options.user_data = user_data;
+  ShaderRecompiler::ShaderCallExpander expander;
+  ShaderRecompiler::ShaderCallExpander::Expanded expanded;
+  Require(test.name, "expanded",
+          expander.Expand(code, reinterpret_cast<uint64_t>(code.data()), options, memory.Reader(),
+                          expanded) &&
+              expanded.code != nullptr,
+          "the call-table program did not expand");
+  Require(test.name, "no call left",
+          !ShaderRecompiler::Decoder::MayCallFunctions(*expanded.code),
+          "the expansion still holds an S_SWAPPC_B64");
+  code = *expanded.code;
+  test.opcodes = {O::S_BUFFER_LOAD_DWORDX4, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC0, O::S_CSELECT_B32,
+                  O::S_ENDPGM};
+  return test;
+}
+
+// ShaderCallExpander: an expansion is kept while the targets stay the same; a target that appears
+// in the table is picked up when the descriptor changes or at the periodic rescan, and a changed
+// callee at the rescan. A program without calls, or with a call whose target is not traced, does
+// not expand. A callee that cannot be placed (here: a nested call) is left out.
+void CallExpanderRefreshes() {
+  constexpr const char *name = "CallExpanderRefreshes";
+  constexpr uint64_t DataBase = 0x0000000150000000ull;
+  constexpr uint64_t CalleeBase = 0x0000000160000000ull;
+  static TestCallees callees;
+  static std::vector<u32> callee_words;
+  callee_words = callees.words;
+  // A fifth callee with a nested call.
+  callee_words.resize(callee_words.size() + TestCallees::Stride / 4, 0xbf810000u);
+  callee_words[4 * TestCallees::Stride / 4] = 0xbe94210au; // s_swappc_b64 s[20:21], s[10:11]
+  callee_words[4 * TestCallees::Stride / 4 + 1] = EncodeSop1(0x20, 0, 14);
+  // Data: the table V# at +0, the table at +0x100 (4 records).
+  static std::vector<u32> data;
+  data.assign(0x200 / 4, 0u);
+  const uint64_t table = DataBase + 0x100;
+  data[0] = static_cast<u32>(table);
+  data[1] = static_cast<u32>(table >> 32u);
+  data[2] = 4u * 16u;
+  const auto record = [&](u32 index, uint64_t function) {
+    data[0x100 / 4 + index * 4 + 0] = static_cast<u32>(function);
+    data[0x100 / 4 + index * 4 + 1] = static_cast<u32>(function >> 32u);
+  };
+  record(0, TestCallees::Address(CalleeBase, 0));
+  record(1, TestCallees::Address(CalleeBase, 4)); // the nested call: left out
+  FakeGuestMemory memory;
+  memory.regions = {{DataBase, &data}, {CalleeBase, &callee_words}};
+
+  std::vector<u32> code;
+  code.push_back(EncodeSmem0(0x02, 72, 2)); // s_load_dwordx4 s[72:75], s[4:5], 0
+  code.push_back(EncodeSmem1(0, 125));
+  code.push_back(EncodeSopp(0x0c, 0xc07f));
+  code.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4))); // s_lshl_b32 vcc_lo, s6, 4
+  code.push_back(EncodeSmem0(0x0a, 8, 36));
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSMovB32(14, 8));
+  code.push_back(EncodeSMovB32(15, 9));
+  code.push_back(0xbe8e210eu);
+  AppendEnd(&code);
+  std::array<u32, 8> user_data{};
+  user_data[4] = static_cast<u32>(DataBase);
+  user_data[5] = static_cast<u32>(DataBase >> 32u);
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.shader_hash = 0x5ca11ab1e0000002ull;
+  options.user_data = user_data;
+  const uint64_t base = 0x0000000170000000ull;
+  ShaderRecompiler::ShaderCallExpander expander;
+  expander.rescan_interval = 4;
+  expander.sticky = false; // every table change is followed
+  ShaderRecompiler::ShaderCallExpander::Expanded first, again, grown, patched, moved;
+  const auto expand = [&](ShaderRecompiler::ShaderCallExpander::Expanded &out) {
+    return expander.Expand(code, base, options, memory.Reader(), out) && out.code != nullptr;
+  };
+  Require(name, "first", expand(first), "the program did not expand");
+  Require(name, "kept", expand(again) && again.code == first.code,
+          "an unchanged dispatch expanded the program again");
+  record(2, TestCallees::Address(CalleeBase, 1));
+  // Dispatches 3 and 4: no rescan yet (every 4th dispatch from the first rescans).
+  Require(name, "before the rescan",
+          expand(again) && again.code == first.code && expand(again) && again.code == first.code,
+          "a table change was picked up before the rescan without a descriptor change");
+  Require(name, "rescan", expand(grown) && grown.digest != first.digest,
+          "the periodic rescan missed a new target");
+  callee_words[TestCallees::Stride / 4] = EncodeVop1(0x01, 1, InlineU32(3)); // patch B
+  for (int i = 0; i < 3; ++i) {
+    Require(name, "patched callee", expand(patched) && patched.code == grown.code,
+            "a changed callee was picked up before the rescan");
+  }
+  Require(name, "patched callee", expand(patched) && patched.digest != grown.digest,
+          "a changed callee was not expanded again at the rescan");
+  // A new table (the descriptor changes): read at once.
+  data[0] = static_cast<u32>(table + 0x40);
+  data[2] = 2u * 16u;
+  record(4, TestCallees::Address(CalleeBase, 2));
+  Require(name, "moved table", expand(moved) && moved.digest != patched.digest,
+          "a changed table descriptor was not read at once");
+
+  // The expansion of the nested-call callee is left out, and the program still has no call.
+  Require(name, "nested call left out", !ShaderRecompiler::Decoder::MayCallFunctions(*moved.code),
+          "a callee with a nested call was placed");
+
+  // No calls; an untraced target (s[14:15] computed).
+  std::vector<u32> plain;
+  plain.push_back(EncodeSMovB32(20, 4));
+  AppendEnd(&plain);
+  ShaderRecompiler::ShaderCallExpander::Expanded none;
+  Require(name, "no calls",
+          !expander.Expand(plain, base + 0x1000, options, memory.Reader(), none),
+          "a program without calls expanded");
+  std::vector<u32> computed;
+  computed.push_back(EncodeSMovB32(14, 4));
+  computed.push_back(EncodeSMovB32(15, 5));
+  computed.push_back(EncodeSop2(0x00, 14, 14, InlineU32(4))); // s_add_u32 s14, s14, 4
+  computed.push_back(0xbe8e210eu);
+  AppendEnd(&computed);
+  Require(name, "untraced",
+          !expander.Expand(computed, base + 0x2000, options, memory.Reader(), none),
+          "a call with an untraced target expanded");
+  std::printf("[compute] %-32s ok\n", name);
+}
+
+// KYTY_CALL_LEARN (adapted from usa-ratt/KytyPS5-GT7 8b76a992a): a table call over the bound is
+// expanded with the targets its dispatches reported (at most learn_variants, in report order);
+// every other target reports itself (MissReport) and is skipped. A table within the bound, or
+// the mode off, leaves the program to Expand.
+void CallExpanderLearns() {
+  constexpr const char *name = "CallExpanderLearns";
+  constexpr uint64_t DataBase = 0x0000000150000000ull;
+  constexpr uint64_t CalleeBase = 0x0000000160000000ull;
+  static TestCallees callees;
+  static std::vector<u32> callee_words;
+  callee_words = callees.words;
+  static std::vector<u32> data;
+  data.assign(0x200 / 4, 0u);
+  const uint64_t table = DataBase + 0x100;
+  data[0] = static_cast<u32>(table);
+  data[1] = static_cast<u32>(table >> 32u);
+  data[2] = 3u * 16u;
+  for (u32 index = 0; index < 3u; ++index) {
+    const auto function = TestCallees::Address(CalleeBase, index);
+    data[0x100 / 4 + index * 4 + 0] = static_cast<u32>(function);
+    data[0x100 / 4 + index * 4 + 1] = static_cast<u32>(function >> 32u);
+  }
+  FakeGuestMemory memory;
+  memory.regions = {{DataBase, &data}, {CalleeBase, &callee_words}};
+  std::vector<u32> code;
+  code.push_back(EncodeSmem0(0x02, 72, 2)); // s_load_dwordx4 s[72:75], s[4:5], 0
+  code.push_back(EncodeSmem1(0, 125));
+  code.push_back(EncodeSopp(0x0c, 0xc07f));
+  code.push_back(EncodeSop2(0x1e, 106, 6, InlineU32(4))); // s_lshl_b32 vcc_lo, s6, 4
+  code.push_back(EncodeSmem0(0x0a, 8, 36));
+  code.push_back(EncodeSmem1(0, 106));
+  code.push_back(EncodeSMovB32(14, 8));
+  code.push_back(EncodeSMovB32(15, 9));
+  code.push_back(0xbe8e210eu);
+  AppendEnd(&code);
+  std::array<u32, 8> user_data{};
+  user_data[4] = static_cast<u32>(DataBase);
+  user_data[5] = static_cast<u32>(DataBase >> 32u);
+  ShaderRecompiler::CompileOptions options;
+  options.stage = ShaderType::Compute;
+  options.shader_hash = 0x5ca11ab1e0000003ull;
+  options.user_data = user_data;
+  const uint64_t base = 0x0000000180000000ull;
+  const u32 marker = ShaderRecompiler::Decoder::EncodeCallStateWord(
+      ShaderRecompiler::Decoder::CallStateOp::MissReport, 1u);
+  const auto reports = [&](const std::vector<u32> &words) {
+    for (size_t i = 0; i + 1u < words.size(); ++i) {
+      if (words[i] == marker && words[i + 1u] == 14u) return true;
+    }
+    return false;
+  };
+  const auto key = [](uint64_t target) { return static_cast<u32>(target) | 1u; };
+
+  ShaderRecompiler::ShaderCallExpander expander;
+  expander.learn = true;
+  expander.learn_over = 1;
+  expander.learn_variants = 2;
+  ShaderRecompiler::CallPartitionRun probe, first, again, capped;
+  Require(name, "probe",
+          expander.Partition(code, base, options, memory.Reader(), probe) && probe.parts.size() == 1u &&
+              probe.parts[0].target == 0 && probe.parts[0].code != nullptr &&
+              reports(*probe.parts[0].code) &&
+              !ShaderRecompiler::Decoder::MayCallFunctions(*probe.parts[0].code),
+          "a table over the bound did not run the reporting expansion first");
+  const std::array<u32, 1> a{key(TestCallees::Address(CalleeBase, 1))};
+  expander.ReportPartitionKeys(probe.program, a);
+  Require(name, "learned",
+          expander.Partition(code, base, options, memory.Reader(), first) && first.parts.size() == 1u &&
+              first.parts[0].target == TestCallees::Address(CalleeBase, 1) &&
+              first.parts[0].code->size() > probe.parts[0].code->size() && reports(*first.parts[0].code),
+          "a reported target was not placed in the next expansion");
+  Require(name, "kept",
+          expander.Partition(code, base, options, memory.Reader(), again) &&
+              again.parts[0].code == first.parts[0].code,
+          "an unchanged learned set expanded the program again");
+  // One report set at a time, so the report order is callee 1, 2, 0.
+  const std::array<u32, 1> second{key(TestCallees::Address(CalleeBase, 2))};
+  const std::array<u32, 1> third{key(TestCallees::Address(CalleeBase, 0))};
+  expander.ReportPartitionKeys(probe.program, second);
+  expander.ReportPartitionKeys(probe.program, third);
+  Require(name, "capped",
+          expander.Partition(code, base, options, memory.Reader(), capped) &&
+              capped.parts[0].digest != first.parts[0].digest &&
+              capped.parts[0].target == TestCallees::Address(CalleeBase, 1) &&
+              capped.parts[0].code->size() > first.parts[0].code->size(),
+          "the second reported target was not added, or the bound was ignored");
+  {
+    // learn_variants 2: the third reported target (callee 0) stays out. A run with all three placed
+    // is longer still.
+    ShaderRecompiler::ShaderCallExpander all;
+    all.learn = true;
+    all.learn_over = 1;
+    all.learn_variants = 3;
+    ShaderRecompiler::CallPartitionRun run;
+    (void)all.Partition(code, base, options, memory.Reader(), run);
+    const std::array<u32, 3> every{key(TestCallees::Address(CalleeBase, 1)),
+                                   key(TestCallees::Address(CalleeBase, 2)),
+                                   key(TestCallees::Address(CalleeBase, 0))};
+    all.ReportPartitionKeys(run.program, every); // one set: added in table order
+    Require(name, "bound",
+            all.Partition(code, base, options, memory.Reader(), run) &&
+                run.parts[0].code->size() > capped.parts[0].code->size(),
+            "KYTY_CALL_VARIANTS did not bound the learned targets");
+  }
+  {
+    ShaderRecompiler::ShaderCallExpander off;
+    off.learn = false;
+    ShaderRecompiler::CallPartitionRun run;
+    Require(name, "off",
+            ShaderRecompiler::CallPartitionsEnabled() ||
+                !off.Partition(code, base, options, memory.Reader(), run),
+            "the learned mode ran while off");
+    ShaderRecompiler::ShaderCallExpander within;
+    within.learn = true;
+    within.learn_over = 3;
+    Require(name, "within the bound",
+            ShaderRecompiler::CallPartitionsEnabled() ||
+                !within.Partition(code, base, options, memory.Reader(), run),
+            "a table within the bound took the learned mode");
+  }
+  std::printf("[compute] %-32s ok\n", name);
+}
+
 void RunAll(VulkanHarness *vulkan) {
   auto options = GetCodegenOptions();
   options.srt_variant_reads = true;
+  {
+    // The skip and dump behaviour of programs with calls (KYTY_SHADER_CALLS=0).
+    auto skipping = options;
+    skipping.shader_calls = false;
+    ScopedCodegenOptions scope(skipping);
+    RunCase(vulkan, ScalarBufferLoadsGpuSelectedDescriptors());
+    RunCase(vulkan, ScalarLoadsThroughLoopCarriedRecords());
+    RunCase(vulkan, RawLoadsThroughGpuSelectedDescriptors());
+    {
+      // KYTY_INDIRECT_RAW_OUTLINE: the same loads through the module's outlined functions.
+      auto outline = skipping;
+      outline.indirect_raw_outline = true;
+      ScopedCodegenOptions outline_scope(outline);
+      auto test = RawLoadsThroughGpuSelectedDescriptors();
+      test.name = "RawLoadsOutlined";
+      test.required_spirv.push_back("indirect_raw_x4");
+      test.required_spirv.push_back("indirect_raw_u8");
+      RunCase(vulkan, test);
+    }
+    RunCase(vulkan, FormattedLoadsThroughGpuSelectedDescriptors());
+    {
+      // KYTY_INDIRECT_FORMAT_COMPACT: the table-driven decoder gives the same channels.
+      auto compact = skipping;
+      compact.indirect_format_compact = true;
+      ScopedCodegenOptions compact_scope(compact);
+      auto test = FormattedLoadsThroughGpuSelectedDescriptors();
+      test.name = "FormattedLoadsCompactDecoder";
+      test.required_spirv.push_back("indirect_formatted_load_compact");
+      RunCase(vulkan, test);
+    }
+    CallIsSkipped();
+    HugeHelperOutlineControl();
+    CallTargetsFromUserData();
+    CallTablesTraced();
+    CallTablesTracedWave32();
+    vulkan->CheckCallTargetDump();
+    NullBasedFlatReadReadsZero();
+    VariantPlanIsFound();
+    vulkan->CheckVariantPlanSkipped();
+  }
+  options.shader_calls = true;
   ScopedCodegenOptions scope(options);
-  RunCase(vulkan, ScalarBufferLoadsGpuSelectedDescriptors());
-  RunCase(vulkan, ScalarLoadsThroughLoopCarriedRecords());
-  RunCase(vulkan, RawLoadsThroughGpuSelectedDescriptors());
-  CallIsSkipped();
-  CallTargetsFromUserData();
-  vulkan->CheckCallTargetDump();
-  NullBasedFlatReadReadsZero();
-  VariantPlanIsFound();
-  vulkan->CheckVariantPlanSkipped();
+  CallExpanderRefreshes();
+  CallExpanderLearns();
+  vulkan->CheckCallTableDispatch();
+  RunCase(vulkan, CallTableExpanded());
 }
 
 } // namespace SrtVariantTests

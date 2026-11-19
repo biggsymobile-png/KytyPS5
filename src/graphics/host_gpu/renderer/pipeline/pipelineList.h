@@ -81,12 +81,16 @@ enum class SectionId : uint32_t {
 	Shaders      = 3,
 	Permutations = 4,
 	Pipelines    = 5,
+	Files        = 6, // the game data files shaders are read from (optional; CodeFile 1..n)
 };
 
 // The file a shader's code is read from.
+// 0 is the game's executable (/app0/eboot.bin); n >= 1 is File::files[n - 1], a data file of the
+// game (path relative to /app0, '/' separated): Insomniac titles keep most shader code in d/material.
 enum class CodeFile : uint32_t {
-	Executable = 0, // the game's executable (/app0/eboot.bin)
+	Executable = 0,
 };
+inline constexpr uint32_t MaxDataFiles = 4096;
 
 struct Info {
 	std::string title_id;    // TITLE_ID of param.json / param.sfo
@@ -96,7 +100,16 @@ struct Info {
 	// producer: the stage input info bytes are those structs.
 	std::array<uint32_t, 3> input_info_sizes {};
 	uint64_t                created_unix = 0;
+	// The renderer's pipeline state format the pipelines were recorded with (StateFormat of the
+	// producer; 0: a list older than the field). A list of another format keeps its shaders (the
+	// precompile is still exact) but its pipelines are not replayed: they would describe create infos
+	// this build no longer makes.
+	uint32_t state_format = 0;
 };
+// Bump when CreatePipelineInternal (pipeline/shaders.cpp) or GraphicsPipelineSnapshot changes the
+// graphics pipeline create infos it makes for the same draw state (released lists then keep only
+// their shaders until they are re-recorded).
+inline constexpr uint32_t StateFormat = 1;
 
 struct Shader {
 	CodeFile file      = CodeFile::Executable;
@@ -146,6 +159,7 @@ struct File {
 	std::vector<Shader>      shaders;
 	std::vector<Permutation> permutations;
 	std::vector<Pipeline>    pipelines;
+	std::vector<std::string> files; // data files (CodeFile n >= 1 is files[n - 1])
 };
 
 [[nodiscard]] std::vector<uint8_t> Encode(const File& file, int zstd_level = 19);
@@ -158,6 +172,25 @@ struct File {
 // Snapshot words with every module hash replaced by `hash_for(stage index)` (0 clears them). False
 // when the words are not a snapshot.
 [[nodiscard]] bool RewriteSnapshotModules(std::span<uint32_t> words, const std::function<uint64_t(uint32_t)>& hash_for);
+
+// The values of a stored snapshot that come from the recording device, not from the draw: the
+// dynamic state VK_DYNAMIC_STATE_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT (present when the device enabled
+// attachment feedback loops, shaders.cpp) and each stage's required subgroup size
+// (GraphicContext::GraphicsSubgroupSize). The run-time pipeline key holds the running device's own
+// values, so a pipeline recorded on another device would be built and never found.
+//
+// Canonical stored form (what the exporter and the merge write): the feedback-loop state absent, every
+// stage's required subgroup size 0. The loader applies this device's values to a list pipeline
+// before it builds it. `subgroup_for` gets the stage's VkShaderStageFlags word and its index in the
+// snapshot; null means 0 for every stage. `words` are a pipeline's words (snapshot words, then the
+// layout signature length and the signature), `snapshot_words` the snapshot's part, which grows or
+// shrinks by one word with the state. False (nothing changed) when the words are not a snapshot.
+inline constexpr uint32_t DynamicStateAttachmentFeedbackLoop = 1000524000u; // VK_DYNAMIC_STATE_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT
+using SubgroupSizeFn = std::function<uint32_t(uint32_t stage_flags, uint32_t stage_index)>;
+[[nodiscard]] bool ApplySnapshotDeviceState(std::vector<uint32_t>& words, uint32_t& snapshot_words, bool feedback_loop,
+                                            const SubgroupSizeFn& subgroup_for);
+// The canonical form (above) of `pipeline`.
+[[nodiscard]] bool NormalizePipelineDeviceState(Pipeline& pipeline);
 
 struct Hash128 {
 	uint64_t low = 0, high = 0;
@@ -195,9 +228,15 @@ public:
 
 	// One recording run: its shader journal content and pipeline journal records. `locate` gives the
 	// executable offset of a source's code (nullopt: not found, the source is dropped).
-	using LocateFn = std::function<std::optional<uint64_t>(std::span<const uint32_t> code)>;
+	struct Location {
+		CodeFile file   = CodeFile::Executable;
+		uint64_t offset = 0;
+	};
+	using LocateFn = std::function<std::optional<Location>(std::span<const uint32_t> code)>;
 	void AddJournals(const std::vector<ShaderJournal::Source>& sources, const std::vector<ShaderJournal::Entry>& entries,
 	                 const std::vector<PipelineJournal::Record>& pipelines, const LocateFn& locate, ExportStats& stats);
+	// The data file named `path` (relative to /app0) as a CodeFile, added to the list's table once.
+	CodeFile AddFile(const std::string& path);
 	// Another list (merge).
 	void AddList(const File& other, ExportStats& stats);
 
@@ -240,10 +279,41 @@ struct Resolved {
 	std::vector<uint32_t>             entry_permutation;
 	// Per list permutation: index into `entries`, or UINT32_MAX when unusable.
 	std::vector<uint32_t> permutation_entry;
+	// Per list shader, where its code (and a merged stage's back half) sits in the file read; usable only.
+	std::vector<uint64_t> offsets, back_offsets;
 };
 
 [[nodiscard]] Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_sizes, const ReadCodeFn& read,
                                const ReadImageFn& read_image, ResolveStats& stats);
+
+// A stored vertex input info layout of an earlier release and the fields this build added to it:
+// `bytes` go in at byte `at` of the old layout (inserts in ascending order). A shader whose dword at
+// `skip_if_nonzero_at` (old layout) is not zero keeps its old bytes, so Resolve counts it as another
+// input layout (fields that cannot be filled in without the guest registers).
+struct VertexLayoutUpgrade {
+	struct Insert {
+		uint32_t             at = 0;
+		std::vector<uint8_t> bytes;
+	};
+	uint32_t            from_size = 0;
+	std::vector<Insert> inserts;
+	uint32_t            skip_if_nonzero_at = UINT32_MAX;
+};
+struct UpgradeStats {
+	uint64_t upgraded = 0, skipped = 0;
+};
+// Rewrites the vertex input infos of `upgrade.from_size` bytes to `to_size` bytes; nothing when the
+// inserts do not add up to `to_size`.
+void UpgradeVertexInputInfos(File& file, const VertexLayoutUpgrade& upgrade, uint32_t to_size, UpgradeStats& stats);
+
+// Retargeting: the list re-stamped for another copy of the game (another version or SKU) whose shaders
+// `resolved` found. Shaders not found are dropped with their permutations and pipelines; the offsets are the
+// new ones. The caller sets the title and version in `info`.
+struct RetargetStats {
+	uint64_t shaders = 0, same_offset = 0, moved = 0, missing = 0;
+	uint64_t pipelines = 0, pipelines_kept = 0;
+};
+[[nodiscard]] File Retarget(const File& file, const Resolved& resolved, RetargetStats& stats);
 
 // The "no game code" proof: every 64-byte window of known shader code (any byte offset), minus
 // low-entropy windows (fewer than 8 distinct byte values, e.g. zero runs that also occur in plain

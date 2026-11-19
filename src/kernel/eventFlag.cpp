@@ -1,7 +1,9 @@
+#include "common/hleWaitStats.h"
 #include "kernel/eventFlag.h"
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/gthreadStats.h"
 #include "common/hangWatchdog.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -113,7 +115,6 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 
 	uint32_t      elapsed = 0;
 	Common::Timer t;
-	t.Start();
 
 	auto update_timeout = [&]() {
 		if (ptr_micros != nullptr) {
@@ -289,7 +290,9 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
+	HleWait::Scope hle_wait_scope(HleWait::EventFlag); // wholecp measurement (KYTY_HLE_WAIT_STATS)
 	PRINT_NAME();
+	GThreadStats::FpProbe();
 
 	if (ef == nullptr) {
 		return KERNEL_ERROR_ESRCH;

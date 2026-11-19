@@ -24,9 +24,6 @@ on:
       cp_diagnostics:
         type: boolean
         default: false
-      cpu_v3:
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -119,13 +116,13 @@ jobs:
         shell: cmd
         run: |
           set LLVM=C:/LLVM-22.1.3/bin
-          set PGO_PROFILE=C:/kyty-src19/tools/pgo/u59-int21-1.profdata
+          set PGO_PROFILE=C:/kyty-src19/tools/pgo/u59-int22-1.profdata
           cmake -S C:\kyty-src19 -B _Build/windows ^
             -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DKYTY_EMULATOR_IPO=ON ^
             -DKYTY_CP_DIAGNOSTICS=${{ inputs.cp_diagnostics && 'ON' || 'OFF' }} ^
-            -DKYTY_MARCH=${{ inputs.cpu_v3 && 'x86-64-v3' || '' }} ^
+            -DKYTY_MARCH=x86-64-v3 ^
             -DKYTY_PGO_USE=%PGO_PROFILE% ^
             -DKYTY_BUILD_ORIGIN=Fork ^
             -DKYTY_BUILD_REPOSITORY=%GITHUB_REPOSITORY% ^
@@ -191,6 +188,15 @@ jobs:
           New-Item -ItemType Directory -Path $release | Out-Null
           Copy-Item -Path (Join-Path $runtime '*') -Destination $release -Recurse
           Copy-Item -LiteralPath 'tools/u59-preset.json' -Destination $release
+          # Per-title overrides (u59-preset.<TITLE_ID>.json, common/u59Preset.h) ship next to it.
+          Get-ChildItem -Path 'tools' -Filter 'u59-preset.*.json' | Copy-Item -Destination $release
+          # The launcher's Export list button runs kyty_pipeline_list.exe; the shipped shader lists
+          # (tools/PipelineLists) are what its Precompile button finds. Both come from cmake --install. Every list
+          # of the tree has to be in the package; the two Astro lists are named, so losing them from the tree fails too.
+          $lists = @('PPSA21567.kyplst', 'PPSA01325.kyplst') + @(Get-ChildItem -Path 'tools/PipelineLists' -Filter '*.kyplst' | ForEach-Object Name) | Select-Object -Unique
+          foreach ($file in @('kyty_pipeline_list.exe') + ($lists | ForEach-Object { "PipelineLists/$_" })) {
+            if (-not (Test-Path -LiteralPath (Join-Path $release $file))) { throw "$file is missing from the package." }
+          }
           if (Test-Path -LiteralPath (Join-Path $release 'Kyty.ini')) {
             throw 'The release must use the shared Kyty settings location; remove the local Kyty.ini.'
           }

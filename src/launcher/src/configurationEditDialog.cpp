@@ -17,6 +17,8 @@
 #include <QFileInfo>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QHash>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLayout>
 #include <QLineEdit>
@@ -28,8 +30,6 @@
 #include <QResizeEvent>
 #include <QScreen>
 #include <QScrollArea>
-#include <QScrollBar>
-#include <QShowEvent>
 #include <QSettings>
 #include <QStandardItemModel>
 #include <QSlider>
@@ -149,14 +149,43 @@ static void SetAudioMixVisible(Ui::ConfigurationEditDialog& ui, bool visible) {
 	for (int row = 1; row <= 6; row++) {
 		ui.audioLayout->setRowVisible(row, visible);
 	}
-	// The occlusion mode is global too (graphics row 9).
-	ui.graphicsLayout->setRowVisible(ui.checkBox_gpu_occlusion, visible);
+}
+
+static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings);
+
+// What the Recommended button sets, in the dialog's words: the checkbox texts of the settings
+// that are switched on, "name: value" for anything else.
+static QString RecommendedSettingsText(const Ui::ConfigurationEditDialog& ui,
+                                       const QJsonObject&                 recommended) {
+	const QHash<QString, const QCheckBox*> boxes {
+	    {QStringLiteral("readback_linear_images"), ui.checkBox_readback},
+	    {QStringLiteral("readback_tiled_images"), ui.checkBox_readback_tiled},
+	    {QStringLiteral("readback_storage_images"), ui.checkBox_readback_storage},
+	    {QStringLiteral("sync_raw_image_buffers"), ui.checkBox_sync_raw_image_buffers},
+	    {QStringLiteral("tessellation_enabled"), ui.checkBox_tessellation},
+	    {QStringLiteral("relaxed_shader_float"), ui.checkBox_relaxed_shader_float},
+	    {QStringLiteral("gpu_occlusion_accurate"), ui.checkBox_gpu_occlusion},
+	    {QStringLiteral("guest_tsc_enabled"), ui.checkBox_guest_tsc},
+	    {QStringLiteral("red_zone_protection_enabled"), ui.checkBox_red_zone_protection},
+	};
+	QStringList parts;
+	for (auto it = recommended.constBegin(); it != recommended.constEnd(); ++it) {
+		const auto* box   = boxes.value(it.key());
+		const auto  value = it.value().toString();
+		if (box != nullptr && value == QStringLiteral("true")) {
+			parts << box->text();
+		} else {
+			parts << QStringLiteral("%1: %2").arg(box != nullptr ? box->text() : it.key(), value);
+		}
+	}
+	return parts.join(QStringLiteral(", "));
 }
 
 ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* parent)
-    : QDialog(parent, Qt::WindowCloseButtonHint), m_ui(new Ui::ConfigurationEditDialog),
-      m_info(info) {
+    : QDialog(parent, Qt::WindowMaximizeButtonHint | Qt::WindowCloseButtonHint),
+      m_ui(new Ui::ConfigurationEditDialog), m_info(info) {
 	m_ui->setupUi(this);
+	MakeTabsScrollable();
 	SetAudioMixVisible(*m_ui, false);
 	for (const auto& mix: AudioMixSliders(*m_ui)) {
 		mix.slider->setMaximum(static_cast<int>(Config::MAX_AUDIO_VOLUME));
@@ -169,7 +198,13 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		m_ui->slider_audio_objects->setEnabled(on);
 		m_ui->label_audio_objects_value->setEnabled(on);
 	});
-	setMinimumWidth(width());
+	connect(m_ui->comboBox_present_mode, &QComboBox::currentTextChanged, this,
+	        [this](const QString& text) {
+		        const bool immediate =
+		            TextToEnum<Configuration::PresentMode>(text) ==
+		            Configuration::PresentMode::Immediate;
+		        m_ui->graphicsLayout->setRowVisible(m_ui->checkBox_smooth_frametime_fix, immediate);
+	        });
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
 	m_ui->settings_button->setVisible(false);
@@ -177,6 +212,30 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
+	// A game with tested settings (Configuration::RecommendedGameSettings) gets a button that sets
+	// them and keeps the rest of the dialog; the global dialog and other games have none.
+	auto recommended = Configuration::RecommendedGameSettings(info.title_id);
+	for (const auto& key: recommended.keys()) {
+		if (!info.GameSettings().contains(key)) {
+			recommended.remove(key); // not a setting on this platform
+		}
+	}
+	if (!recommended.isEmpty()) {
+		auto* button = new QPushButton(tr("Recommended"), this);
+		button->setObjectName(QStringLiteral("recommended_button"));
+		button->setMinimumSize(m_ui->clear_button->minimumSize());
+		button->setToolTip(tr("Set the settings this game was tested with and keep the others: %1")
+		                       .arg(RecommendedSettingsText(*m_ui, recommended)));
+		m_ui->buttonLayout->insertWidget(1, button);
+		connect(button, &QPushButton::clicked, this, [this]() {
+			Configuration current;
+			current.CopyEmulatorSettingsFrom(m_info);
+			current.CopyGlobalOnlySettingsFrom(m_info);
+			UpdateInfo(current, *m_ui, m_global_settings);
+			current.ApplyRecommendedGameSettings(m_info.title_id);
+			Init(current);
+		});
+	}
 	connect(m_ui->button_controller_color, &QPushButton::clicked, this, [this]() {
 		const auto current = m_ui->button_controller_color->property("controllerColor").toString();
 		const auto initial =
@@ -204,6 +263,16 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		        m_ui->lineEdit_shader_log_folder->setEnabled(
 		            log == Configuration::LogDirection::File);
 	        });
+	// The upscaler applies in Pro mode only, and the folder to DLSS only.
+	const auto show_pssr = [this] {
+		const bool pro = m_ui->checkBox_pro->isChecked();
+		const auto upscaler =
+		    TextToEnum<Configuration::PssrUpscaler>(m_ui->comboBox_pssr_upscaler->currentText());
+		m_ui->pssrLayout->setRowVisible(0, pro);
+		m_ui->pssrLayout->setRowVisible(1, pro && upscaler == Configuration::PssrUpscaler::DLSS);
+	};
+	connect(m_ui->checkBox_pro, &QCheckBox::toggled, this, show_pssr);
+	connect(m_ui->comboBox_pssr_upscaler, &QComboBox::currentTextChanged, this, show_pssr);
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
 	connect(m_ui->comboBox_printf_direction, &QComboBox::currentTextChanged, this,
@@ -213,11 +282,12 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	        });
 
 	setSizeGripEnabled(true);
-	WrapTabsInScrollAreas();
-
-	restoreGeometry(g_last_geometry);
 
 	Init(info);
+	m_geometry_restored = restoreGeometry(g_last_geometry);
+	if (!m_geometry_restored) {
+		GrowToFitContents();
+	}
 }
 
 QByteArray ConfigurationEditDialog::g_last_geometry;
@@ -300,8 +370,12 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 		                    info.audio_input_device);
 	}
 	microphone->setCurrentIndex(microphone->findData(info.audio_input_device));
-	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
+	m_ui->comboBox_screen_resolution->setCurrentText(info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
+	m_ui->checkBox_smooth_frametime_fix->setChecked(info.smooth_frametime_fix);
+	m_ui->graphicsLayout->setRowVisible(
+	    m_ui->checkBox_smooth_frametime_fix,
+	    info.present_mode == Configuration::PresentMode::Immediate);
 	m_ui->comboBox_gpu->clear();
 	m_ui->comboBox_gpu->addItem(tr("Auto"));
 	// Keep Auto when Qt is built without Vulkan support.
@@ -337,12 +411,18 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_hdr->setChecked(info.hdr_enabled);
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
+	m_ui->checkBox_stretch->setChecked(info.stretch_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_readback_tiled->setChecked(info.readback_tiled_images);
+	m_ui->checkBox_readback_storage->setChecked(info.readback_storage_images);
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
+	m_ui->spinBox_flush_draws->setValue(info.flush_draws);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
+	m_ui->checkBox_relaxed_shader_float->setChecked(info.relaxed_shader_float);
+	m_ui->checkBox_fast_gpu_sync->setChecked(info.fast_gpu_sync);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
+	m_ui->checkBox_psn_emulation->setChecked(info.psn_emulation_enabled);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
 	m_ui->spinBox_trophy_duration->setValue(info.trophy_duration_seconds);
 	m_ui->checkBox_perf_overlay->setChecked(info.perf_overlay_enabled);
@@ -446,12 +526,17 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_shader_validation->setChecked(info.shader_validation_enabled);
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
+	m_ui->checkBox_pro->setChecked(info.pro_enabled);
+	ListInit(m_ui->comboBox_pssr_upscaler, info.pssr_upscaler);
+	m_ui->lineEdit_dlss_folder->setText(info.dlss_folder);
 	// Partly checked: automatic (on unless the CPU is an AMD).
 	m_ui->checkBox_amd_cpu->setTristate(true);
 	m_ui->checkBox_amd_cpu->setCheckState(info.amd_cpu_mode == QStringLiteral("on")    ? Qt::Checked
 	                                      : info.amd_cpu_mode == QStringLiteral("off") ? Qt::Unchecked
 	                                                                                   : Qt::PartiallyChecked);
+	m_ui->checkBox_guest_tsc->setChecked(info.guest_tsc_enabled);
 #if defined(__APPLE__)
+	m_ui->comboBox_pssr_upscaler->removeItem(static_cast<int>(Configuration::PssrUpscaler::DLSS));
 	m_ui->checkBox_amd_cpu->setVisible(false);
 #endif
 #if defined(_WIN32)
@@ -459,7 +544,10 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 #else
 	m_ui->checkBox_red_zone_protection->setVisible(false);
 #endif
-	ListInit(m_ui->comboBox_shader_optimization_type, info.shader_optimization_type);
+	// Upstream hid this row and stopped filling the combo; the row is visible in this form, so
+	// fill it (an unknown value shows as Performance).
+	ListInit(m_ui->comboBox_shader_optimization_type,
+	         Configuration::ShaderOptimizationTypeFromText(EnumToText(info.shader_optimization_type)));
 	ListInit(m_ui->comboBox_shader_log_direction, info.shader_log_direction);
 	m_ui->lineEdit_shader_log_folder->setText(info.shader_log_folder);
 	m_ui->lineEdit_shader_log_folder->setEnabled(info.shader_log_direction ==
@@ -558,8 +646,46 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const Q
 	m_ui->controller_group->setVisible(true);
 	SetAudioMixVisible(*m_ui, true);
 	update_game_directory_buttons();
+	if (!m_geometry_restored) {
+		GrowToFitContents();
+	}
+}
+
+void ConfigurationEditDialog::MakeTabsScrollable() {
+	auto* tabs = m_ui->settings_tabs;
+	for (int i = 0; i < tabs->count(); i++) {
+		auto* page   = tabs->widget(i);
+		auto  title  = tabs->tabText(i);
+		auto* scroll = new QScrollArea;
+		scroll->setWidgetResizable(true);
+		scroll->setFrameShape(QFrame::NoFrame);
+		tabs->removeTab(i);
+		scroll->setWidget(page);
+		tabs->insertTab(i, scroll, title);
+	}
+	tabs->setCurrentIndex(0);
+}
+
+void ConfigurationEditDialog::GrowToFitContents() {
 	layout()->activate();
-	m_fitted_to_screen = false; // (sized to the larger global page when shown, FitToScreen)
+	auto* tabs = m_ui->settings_tabs;
+	QSize content;
+	for (int i = 0; i < tabs->count(); i++) {
+		content = content.expandedTo(
+		    static_cast<QScrollArea*>(tabs->widget(i))->widget()->minimumSizeHint());
+	}
+	const QSize chrome = size() - tabs->currentWidget()->size();
+	resize(size().expandedTo(content + chrome).boundedTo(screen()->availableGeometry().size()));
+}
+
+void ConfigurationEditDialog::ShowTab(QWidget* page) {
+	auto* tabs = m_ui->settings_tabs;
+	for (int i = 0; i < tabs->count(); i++) {
+		if (tabs->widget(i)->isAncestorOf(page)) {
+			tabs->setCurrentIndex(i);
+			return;
+		}
+	}
 }
 
 QString ConfigurationEditDialog::GetAddonsDirectory() const {
@@ -608,92 +734,6 @@ void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 	g_last_geometry = saveGeometry();
 }
 
-// Each tab's page scrolls (issue #6): the global settings are taller than a 1080p screen at 125%
-// scaling, and the dialog could not be smaller than everything on the General tab, so Save and
-// Cancel were below the screen. The pages keep their own widgets (m_ui->debug_tab and so on).
-void ConfigurationEditDialog::WrapTabsInScrollAreas() {
-	auto* tabs = m_ui->settings_tabs;
-	for (int index = 0; index < tabs->count(); index++) {
-		QWidget* page = tabs->widget(index);
-		if (qobject_cast<QScrollArea*>(page) != nullptr) continue;
-		const QString title   = tabs->tabText(index);
-		const QString tooltip = tabs->tabToolTip(index);
-		tabs->removeTab(index);
-		auto* scroll = new QScrollArea;
-		scroll->setFrameShape(QFrame::NoFrame);
-		scroll->setWidgetResizable(true);
-		scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-		scroll->setWidget(page);
-		page->setAutoFillBackground(false);
-		scroll->viewport()->setAutoFillBackground(false);
-		tabs->insertTab(index, scroll, title);
-		tabs->setTabToolTip(index, tooltip);
-	}
-	tabs->setCurrentIndex(0);
-}
-
-void ConfigurationEditDialog::ShowTabPage(QWidget* page) {
-	for (QWidget* parent = page; parent != nullptr; parent = parent->parentWidget()) {
-		if (auto* scroll = qobject_cast<QScrollArea*>(parent); scroll != nullptr) {
-			m_ui->settings_tabs->setCurrentWidget(scroll);
-			scroll->ensureWidgetVisible(page);
-			return;
-		}
-	}
-}
-
-// Opens at the size that shows the whole tab without scrolling where the screen has room, and never
-// larger than the screen's free area (Windows scaling included): the rest scrolls.
-void ConfigurationEditDialog::FitToScreen() {
-	const QScreen* screen = this->screen();
-	if (screen == nullptr) return;
-	QRect available = screen->availableGeometry();
-	// (The title bar and borders are outside the dialog's own size.)
-	const QMargins frame(geometry().left() - frameGeometry().left(), geometry().top() - frameGeometry().top(),
-	                     frameGeometry().right() - geometry().right(),
-	                     frameGeometry().bottom() - geometry().bottom());
-	const QSize room = available.marginsRemoved(frame).size();
-
-	auto* current = qobject_cast<QScrollArea*>(m_ui->settings_tabs->currentWidget());
-	QSize want = size();
-	if (current != nullptr && current->widget() != nullptr) {
-		QSize content(0, 0);
-		for (int index = 0; index < m_ui->settings_tabs->count(); index++) {
-			if (auto* scroll = qobject_cast<QScrollArea*>(m_ui->settings_tabs->widget(index));
-			    scroll != nullptr && scroll->widget() != nullptr) {
-				content = content.expandedTo(scroll->widget()->sizeHint());
-			}
-		}
-		const QSize chrome = size() - current->viewport()->size();
-		const int   bar    = current->verticalScrollBar()->sizeHint().width();
-		const QSize whole  = chrome + content;
-		// A saved size the user chose is kept; the first time, the whole page where it fits.
-		want = g_last_geometry.isEmpty() ? whole : size();
-		if (whole.height() > room.height()) {
-			want.setWidth(std::max(want.width(), whole.width() + bar)); // (room for the scroll bar)
-		}
-	}
-	setMinimumWidth(std::min(minimumWidth(), room.width()));
-	want = want.boundedTo(room);
-	resize(want);
-	// Keep it on the screen.
-	QRect frame_now = frameGeometry();
-	frame_now.moveLeft(std::clamp(frame_now.left(), available.left(),
-	                              std::max(available.left(), available.right() - frame_now.width() + 1)));
-	frame_now.moveTop(std::clamp(frame_now.top(), available.top(),
-	                             std::max(available.top(), available.bottom() - frame_now.height() + 1)));
-	move(frame_now.topLeft());
-}
-
-void ConfigurationEditDialog::showEvent(QShowEvent* event) {
-	QDialog::showEvent(event);
-	if (!m_fitted_to_screen) {
-		m_fitted_to_screen = true;
-		layout()->activate();
-		FitToScreen();
-	}
-}
-
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings) {
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
 	info.user_id   = ui.spinBox_user_id->value();
@@ -706,23 +746,30 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 			info.audio_mix.*mix.field = mix.slider->value();
 		}
 		info.audio_mix.objects_enabled = ui.checkBox_audio_objects->isChecked();
-		info.gpu_occlusion_accurate = ui.checkBox_gpu_occlusion->isChecked();
 		info.controller.keyboard_player     = ui.comboBox_keyboard_player->currentData().toInt();
 	}
 	info.screen_resolution =
-	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
+	    Configuration::NormalizeResolution(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
+	info.smooth_frametime_fix = ui.checkBox_smooth_frametime_fix->isChecked();
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hdr_enabled               = ui.checkBox_hdr->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
+	info.stretch_enabled           = ui.checkBox_stretch->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.readback_tiled_images     = ui.checkBox_readback_tiled->isChecked();
+	info.readback_storage_images   = ui.checkBox_readback_storage->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
+	info.flush_draws               = ui.spinBox_flush_draws->value();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
+	info.gpu_occlusion_accurate    = ui.checkBox_gpu_occlusion->isChecked();
+	info.relaxed_shader_float      = ui.checkBox_relaxed_shader_float->isChecked();
+	info.fast_gpu_sync             = ui.checkBox_fast_gpu_sync->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
+	info.psn_emulation_enabled     = ui.checkBox_psn_emulation->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
 	info.trophy_duration_seconds   = ui.spinBox_trophy_duration->value();
 	info.perf_overlay_enabled      = ui.checkBox_perf_overlay->isChecked();
@@ -745,14 +792,19 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
+	info.pro_enabled               = ui.checkBox_pro->isChecked();
+	info.pssr_upscaler =
+	    TextToEnum<Configuration::PssrUpscaler>(ui.comboBox_pssr_upscaler->currentText());
+	info.dlss_folder               = ui.lineEdit_dlss_folder->text();
 	const auto amd_cpu             = ui.checkBox_amd_cpu->checkState();
 	info.amd_cpu_mode              = amd_cpu == Qt::Checked     ? QStringLiteral("on")
 	                                 : amd_cpu == Qt::Unchecked ? QStringLiteral("off")
 	                                                            : QStringLiteral("auto");
+	info.guest_tsc_enabled         = ui.checkBox_guest_tsc->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
-	info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
+	info.shader_optimization_type = Configuration::ShaderOptimizationTypeFromText(
 	    ui.comboBox_shader_optimization_type->currentText());
 	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
 	    ui.comboBox_shader_log_direction->currentText());
@@ -766,10 +818,10 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 }
 
 void ConfigurationEditDialog::save() {
-	for (auto* field: {m_ui->lineEdit_shader_log_folder, m_ui->lineEdit_printf_file,
-	                   m_ui->lineEdit_cmd_dump_folder}) {
-		if (field->isEnabled() && field->text().isEmpty()) {
-			ShowTabPage(m_ui->debug_tab);
+	for (auto* field: {m_ui->lineEdit_dlss_folder, m_ui->lineEdit_shader_log_folder,
+	                   m_ui->lineEdit_printf_file, m_ui->lineEdit_cmd_dump_folder}) {
+		if (field->isEnabled() && !field->isHidden() && field->text().isEmpty()) {
+			ShowTab(field);
 			field->setFocus();
 			break;
 		}
@@ -791,6 +843,16 @@ void ConfigurationEditDialog::save() {
 		                      tr("User ID cannot be 254 (everyone) or 255 (system)"));
 		return;
 	}
+	if (Configuration::NormalizeResolution(m_ui->comboBox_screen_resolution->currentText())
+	        .isEmpty()) {
+		ShowTab(m_ui->settings_tab);
+		m_ui->comboBox_screen_resolution->setFocus();
+		QMessageBox::critical(this, tr("Save failed"),
+		                      tr("Screen resolution must be WIDTHxHEIGHT, each between %1 and %2")
+		                          .arg(Configuration::MIN_SCREEN_SIZE)
+		                          .arg(Configuration::MAX_SCREEN_SIZE));
+		return;
+	}
 
 	if (const int key = m_ui->comboBox_decouple_key->currentData().toInt();
 	    key != 0 && key == m_ui->comboBox_gyro_recenter_key->currentData().toInt()) {
@@ -807,6 +869,10 @@ void ConfigurationEditDialog::save() {
 
 void ConfigurationEditDialog::clear() {
 	Configuration default_info;
+	// A game's defaults are the built-in ones with the settings it was tested with on top.
+	if (!m_global_settings) {
+		default_info.ApplyRecommendedGameSettings(m_info.title_id);
+	}
 	Init(default_info);
 
 	if (m_global_settings) {

@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include "graphics/shader/recompiler/CodegenOptions.h"
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
@@ -16,7 +18,10 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	if (state.shader_data_storage_variable != 0) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          SrtUniformEnabled()
+		                              ? TypePointer(state, spv::StorageClassUniform, TypeU32(state))
+		                              : TypeStorageBufferElementPointer(state),
 		                          pointer, state.shader_data_storage_variable,
 		                          ConstantU32(state, 0), ConstantU32(state, dword_index));
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
@@ -35,7 +40,7 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
                                    uint32_t search_iterations, uint32_t default_resource) {
 	const auto LoadMapping = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		state.builder.AddFunction(spv::OpAccessChain, FlattenedSrtElementPointerType(state),
 		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
 		                          index);
 		const auto value = state.builder.AllocateId();
@@ -137,7 +142,7 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 		return workgroup->lds_size_dwords;
 	}
 	if (state.program.stage == ShaderType::Pixel && state.input_info.pixel != nullptr) {
-		return std::max(state.input_info.pixel->lds_size_dwords, 1u);
+		return std::max<uint32_t>(state.input_info.pixel->lds_size_dwords, 1u);
 	}
 	if (state.program.stage == ShaderType::Vertex && state.input_info.vertex != nullptr) {
 		return std::max(state.input_info.vertex->lds_size_dwords, 1u);
@@ -196,6 +201,10 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);
+	// KYTY_STORAGE_LENGTH_ZERO: NVIDIA's OpArrayLength is 0 for a range of 2 GiB or more. The check
+	// becomes "index < length || length == 0" (EmitMemoryElementInBounds); selecting 0xffffffff
+	// as the length crashed NVIDIA's shader compiler.
+	access.zero_length_unbounded = GetCodegenOptions().storage_length_zero;
 	return access;
 }
 
@@ -237,9 +246,12 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Buffer: {
 			const auto bits = mem.kind == IR::ResourceKind::Buffer
 			                      ? StorageBufferElementBits(state.program, mem) : 32u;
+			// KYTY_COHERENT_GLC_ONLY: only GLC/DLC accesses use the Coherent alias.
 			const auto variable = bits == 8u ? state.storage_buffer_u8_variable
 			                      : bits == 16u ? state.storage_buffer_u16_variable
-			                                    : state.storage_buffer_variable;
+			                      : mem.coherent && state.storage_buffer_coherent_variable != 0
+			                          ? state.storage_buffer_coherent_variable
+			                          : state.storage_buffer_variable;
 			access = PrepareStorageBufferResourceAccess(
 			    state, mem, variable, TypeStorageBufferPointer(state, bits));
 			access.element_bits = bits;
@@ -253,7 +265,24 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
                                    uint32_t index) {
 	const auto in_bounds = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_bounds, index, access.length);
+	if (access.zero_length_unbounded) {
+		const auto zero = EmitCompareU32Constant(state, spv::OpIEqual, access.length, 0);
+		return Binary(state, spv::OpLogicalOr, TypeBool(state), in_bounds, zero);
+	}
 	return in_bounds;
+}
+
+uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                    uint32_t index) {
+	// KYTY_ROBUST_BUFFER_STORES (upstream ee034be4b), plain stores only: the descriptor range ends
+	// where access.length does, and with robustBufferAccess2 at a 1-byte robustness alignment the
+	// device drops a store with any byte past it (HostBufferRobustness).
+	if ((access.kind == IR::ResourceKind::Buffer || access.kind == IR::ResourceKind::ScalarBuffer) &&
+	    GetCodegenOptions().robust_buffer_stores &&
+	    GetHostBufferRobustness().storage_dword_loads_return_zero) {
+		return ConstantBool(state, true);
+	}
+	return EmitMemoryElementInBounds(state, access, index);
 }
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
@@ -289,7 +318,7 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
 	return pointer;
 }
 
-uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value) {
+static uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBitcast, TypeI32(state), ret, value);
 	return ret;
@@ -300,7 +329,7 @@ bool IsSignedFormatComponent(Format::ComponentType type) {
 	       type == Format::ComponentType::Sscaled;
 }
 
-uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
+static uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 	const auto mantissa_bits = bits == 11u ? 6u : 5u;
 	const auto mantissa_mask = (1u << mantissa_bits) - 1u;
 	const auto mantissa =
@@ -432,7 +461,25 @@ static uint32_t EmitF32ToI32Bits(EmitterState& state, uint32_t value, uint32_t m
 	return EmitBinaryU32(state, spv::OpBitwiseAnd, bits, ConstantU32(state, mask));
 }
 
+uint32_t EmitClampToHalfRangeBits(EmitterState& state, uint32_t f32_bits) {
+	const auto magnitude = EmitBinaryU32(state, spv::OpBitwiseAnd, f32_bits,
+	                                     ConstantU32(state, 0x7fffffffu));
+	// 0x477fe000 is 65504, the largest half; 0x7f800000 and above are infinity and NaN.
+	const auto beyond = Binary(
+	    state, spv::OpLogicalAnd, TypeBool(state),
+	    EmitCompareU32Constant(state, spv::OpUGreaterThan, magnitude, 0x477fe000u),
+	    EmitCompareU32Constant(state, spv::OpULessThan, magnitude, 0x7f800000u));
+	const auto largest = EmitBinaryU32(
+	    state, spv::OpBitwiseOr,
+	    EmitBinaryU32(state, spv::OpBitwiseAnd, f32_bits, ConstantU32(state, 0x80000000u)),
+	    ConstantU32(state, 0x477fe000u));
+	return EmitSelectU32(state, beyond, largest, f32_bits);
+}
+
 static uint32_t EmitF32ToHalfBits(EmitterState& state, uint32_t raw) {
+	if (GetCodegenOptions().float_store_clamp) {
+		raw = EmitClampToHalfRangeBits(state, raw);
+	}
 	const auto value = EmitBitcastU32ToF32(state, raw);
 	const auto pair  = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, value,
@@ -459,8 +506,10 @@ static uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t raw, uint32_t 
 	    state, spv::OpISub, EmitBinaryU32(state, spv::OpShiftRightLogical, biased, ConstantU32(state, shift)),
 	    ConstantU32(state, 112u << mantissa_bits));
 	const auto normal_clamped = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), normal_clamped, GlslStd450(state),
-	                          GLSLstd450UMin, normal, ConstantU32(state, infinity));
+	// KYTY_FLOAT_STORE_CLAMP: finite overflow gives the largest finite value, as the guest GPU.
+	state.builder.AddFunction(
+	    spv::OpExtInst, TypeU32(state), normal_clamped, GlslStd450(state), GLSLstd450UMin, normal,
+	    ConstantU32(state, GetCodegenOptions().float_store_clamp ? infinity - 1u : infinity));
 	const auto value    = EmitBitcastU32ToF32(state, raw);
 	const auto denormal = EmitF32ToU32(
 	    state, EmitScaledRoundEven(state, value,
@@ -524,6 +573,17 @@ uint32_t PackFormatComponent(EmitterState& state, const Format::BufferFormatInfo
 			                                           static_cast<float>(max_signed)),
 			                        max_unsigned);
 		case Format::ComponentType::Float:
+			if (bits < 16u && GetCodegenOptions().ufloat_store_rtz) {
+				// KYTY_UFLOAT_STORE_RTZ=1 (upstream 59d8256b3): truncate to f16, whose bias the
+				// unsigned 11/10-bit floats share, and drop mantissa bits; negatives and NaN, whose
+				// f16 bits lie above +inf, store zero.
+				const auto half = EmitF32BitsToF16RtzBits(state, raw);
+				return Select(state, TypeU32(state),
+				              EmitCompareU32Constant(state, spv::OpUGreaterThan, half, 0x7c00u),
+				              ConstantU32(state, 0),
+				              EmitBinaryU32(state, spv::OpShiftRightLogical, half,
+				                            ConstantU32(state, 15u - bits)));
+			}
 			return bits == 16u ? EmitF32ToHalfBits(state, raw)
 			                   : EmitF32ToUFloatBits(state, raw, bits);
 		default: return raw;

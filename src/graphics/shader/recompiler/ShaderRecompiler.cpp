@@ -7,7 +7,9 @@
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
+#include "graphics/shader/recompiler/frontend/decode/RayTracingPatch.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -29,11 +31,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <span>
+#include <string>
 #include <string_view>
+#include <tuple>
+#include <vector>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -399,7 +406,8 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 								dst.attrib_id =
 								    BufferTableAttribFromOffset(raw_offset, static_cast<int>(i));
 							}
-						} else if (IsDecodedSgpr(inst.src1) &&
+						} else if (!GetCodegenOptions().embedded_fetch_no_sgpr_offset &&
+						           IsDecodedSgpr(inst.src1) &&
 						           DecodedSgprReg(inst.src1) < sgprs.size() &&
 						           sgprs[DecodedSgprReg(inst.src1)].type ==
 						               EmbeddedFetchValueType::Attrib &&
@@ -578,6 +586,42 @@ static bool IsUnsupportedCall(const Decoder::Instruction& inst) {
 	       inst.opcode_id == 0x21u;
 }
 
+// The SGPRs an instruction writes: its destination's width follows from the opcode (64-bit
+// scalar ops and lane masks write a pair, SMEM loads their dword count); a second destination
+// (carry-out) counts as a pair. Unsupported instructions other than calls write nothing known;
+// calls write their return address to their SDST pair.
+// `wave32` (KYTY_CALL_TRACE_WAVE32, a wave32 program): a lane mask (V_CMP result, carry-out) is
+// one SGPR, not a pair. PPSA03671's material kernels keep their SRT pointer in s12..s13 and write
+// V_CMP masks to s11, which the pair width took for writes of s12.
+static bool WritesSgpr(const Decoder::Instruction& inst, uint32_t reg, bool wave32 = false) {
+	if (inst.opcode == Decoder::Opcode::UNSUPPORTED) {
+		const auto sdst = (inst.raw[0] >> 16u) & 0x7fu;
+		return IsUnsupportedCall(inst) && (sdst == reg || sdst + 1u == reg);
+	}
+	const auto name  = magic_enum::enum_name(inst.opcode);
+	const auto width = [&]() -> uint32_t {
+		for (const auto& [suffix, dwords]: {std::pair {std::string_view("DWORDX16"), 16u},
+		                                    std::pair {std::string_view("DWORDX8"), 8u},
+		                                    std::pair {std::string_view("DWORDX4"), 4u},
+		                                    std::pair {std::string_view("DWORDX3"), 3u},
+		                                    std::pair {std::string_view("DWORDX2"), 2u}}) {
+			if (name.ends_with(suffix)) return dwords;
+		}
+		// A 32-bit result of a 64-bit source (S_FF1_I32_B64, S_BCNT1_I32_B64, S_FLBIT_I32_B64): one.
+		if (name.ends_with("32_B64")) return 1u;
+		if (wave32 && name.starts_with("V_CMP")) return 1u;
+		return name.ends_with("_B64") || name.ends_with("_U64") || name.ends_with("_I64") ||
+		               name.ends_with("_F64") || name.starts_with("V_CMP")
+		           ? 2u
+		           : 1u;
+	}();
+	const auto covers = [&](const Decoder::Operand& operand, uint32_t count) {
+		return operand.kind == Decoder::OperandKind::Sgpr && reg >= operand.reg &&
+		       reg < operand.reg + count;
+	};
+	return covers(inst.dst, width) || covers(inst.dst2, wave32 ? 1u : 2u);
+}
+
 // Diagnostics for a program skipped for S_SWAPPC_B64: the functions its calls jump to, as the
 // dispatch's user data gives them. Psr's shader-mesh builders copy a callback record from user
 // SGPRs into their link registers before each call (s_mov_b32 s14, s8; s_mov_b32 s15, s9;
@@ -587,42 +631,19 @@ static bool IsUnsupportedCall(const Decoder::Instruction& inst) {
 // never writes, or the user SGPRs themselves when nothing before the call writes them. Anything
 // else (another write, a branch or branch target on the way, an odd or non-user pair) leaves the
 // call `unresolved`: its callee is unknown.
-static std::vector<CallTarget> FindCallTargets(const Decoder::Program& decoded,
-                                               const CompileOptions& options, uint32_t& unresolved) {
+// `per_call`, when given, receives (call pc, user SGPR of the target pair) for every resolved call.
+static std::vector<CallTarget>
+FindCallTargets(const Decoder::Program& decoded, const CompileOptions& options, uint32_t& unresolved,
+                std::vector<std::pair<uint32_t, uint32_t>>* per_call = nullptr) {
 	unresolved             = 0;
 	const auto& insts      = decoded.instructions;
 	const auto  user_sgpr  = [&](uint32_t reg) {
         return reg >= options.user_data_base &&
                reg - options.user_data_base < options.user_data.size();
 	};
-	// The SGPRs an instruction writes: its destination's width follows from the opcode (64-bit
-	// scalar ops and lane masks write a pair, SMEM loads their dword count); a second destination
-	// (carry-out) counts as a pair. Unsupported instructions other than calls write nothing known;
-	// calls write their return address to their SDST pair.
-	const auto writes_sgpr = [](const Decoder::Instruction& inst, uint32_t reg) {
-		if (inst.opcode == Decoder::Opcode::UNSUPPORTED) {
-			const auto sdst = (inst.raw[0] >> 16u) & 0x7fu;
-			return IsUnsupportedCall(inst) && (sdst == reg || sdst + 1u == reg);
-		}
-		const auto name  = magic_enum::enum_name(inst.opcode);
-		const auto width = [&]() -> uint32_t {
-			for (const auto& [suffix, dwords]: {std::pair {std::string_view("DWORDX16"), 16u},
-			                                    std::pair {std::string_view("DWORDX8"), 8u},
-			                                    std::pair {std::string_view("DWORDX4"), 4u},
-			                                    std::pair {std::string_view("DWORDX3"), 3u},
-			                                    std::pair {std::string_view("DWORDX2"), 2u}}) {
-				if (name.ends_with(suffix)) return dwords;
-			}
-			return name.ends_with("_B64") || name.ends_with("_U64") || name.ends_with("_I64") ||
-			               name.ends_with("_F64") || name.starts_with("V_CMP")
-			           ? 2u
-			           : 1u;
-		}();
-		const auto covers = [&](const Decoder::Operand& operand, uint32_t count) {
-			return operand.kind == Decoder::OperandKind::Sgpr && reg >= operand.reg &&
-			       reg < operand.reg + count;
-		};
-		return covers(inst.dst, width) || covers(inst.dst2, 2u);
+	const bool wave32      = GetCodegenOptions().call_trace_wave32 && options.wave_size == 32u;
+	const auto writes_sgpr = [wave32](const Decoder::Instruction& inst, uint32_t reg) {
+		return WritesSgpr(inst, reg, wave32);
 	};
 	std::set<uint32_t> labels;
 	for (const auto& inst: insts) {
@@ -743,6 +764,9 @@ static std::vector<CallTarget> FindCallTargets(const Decoder::Program& decoded,
 			unresolved++;
 			continue;
 		}
+		if (per_call != nullptr) {
+			per_call->emplace_back(insts[call].pc, halves[0]);
+		}
 		const auto low  = static_cast<uint64_t>(options.user_data[halves[0] - options.user_data_base]);
 		const auto high = static_cast<uint64_t>(options.user_data[halves[1] - options.user_data_base]);
 		const auto address = (low | (high << 32u)) & 0x0000ffffffffffffull;
@@ -768,16 +792,567 @@ static std::string DescribeCallTargets(std::span<const CallTarget> targets, uint
 	return text.empty() ? "no callee found" : text;
 }
 
+// Diagnostics for S_SWAPPC_B64 calls whose target pair is read from a table (CallTable): Miles
+// Morales' ray-tracing shaders pick a hit callback per lane in a waterfall loop:
+//   s_lshl_b32 vcc_lo, s8, 4
+//   s_buffer_load_dwordx4 s[8:11], s[72:75], vcc_lo   ; 16-byte record: function, data pointer
+//   s_mov_b32 s14, s8 ; s_mov_b32 s15, s9 ; ... ; s_swappc_b64 s[14:15], s[14:15]
+// with the table V# s[72:75] loaded blocks earlier through the SRT (user s12 -> +544 -> +64). Each
+// register range is traced to its definition: the last write in the straight-line code before the
+// use, else the only instruction anywhere in the program that writes it (so it reaches every
+// path), else the user SGPRs when nothing writes them. Only scalar loads with an immediate offset
+// are followed; anything else leaves the call out.
+static std::vector<CallTable> FindCallTables(const Decoder::Program& decoded,
+                                             const CompileOptions& options, std::string& failures) {
+	const auto& insts     = decoded.instructions;
+	const bool  wave32    = GetCodegenOptions().call_trace_wave32 && options.wave_size == 32u;
+	const auto  WritesSgpr32 = [wave32](const Decoder::Instruction& inst, uint32_t reg) {
+		return WritesSgpr(inst, reg, wave32);
+	};
+	const auto  user_sgpr = [&](uint32_t reg) {
+        return reg >= options.user_data_base &&
+               reg - options.user_data_base < options.user_data.size();
+	};
+	std::set<uint32_t> labels;
+	for (const auto& inst: insts) {
+		if (Decoder::IsDirectBranch(inst.opcode)) {
+			labels.insert(inst.branch_target);
+		}
+	}
+	constexpr ptrdiff_t Top     = -1; // nothing writes the register: its entry value
+	constexpr ptrdiff_t Unknown = -2;
+	// The straight-line writer of `reg` before instruction `at`, Top at the program start, or
+	// Unknown when a branch or branch target comes first.
+	const auto straight_writer = [&](uint32_t reg, size_t at) -> ptrdiff_t {
+		for (size_t i = at; i-- > 0;) {
+			if (labels.contains(insts[i + 1].pc) || Decoder::IsDirectBranch(insts[i].opcode) ||
+			    insts[i].opcode == Decoder::Opcode::S_SETPC_B64) {
+				return Unknown;
+			}
+			if (WritesSgpr32(insts[i], reg)) {
+				return static_cast<ptrdiff_t>(i);
+			}
+		}
+		return Top;
+	};
+	// KYTY_CALL_TRACE_REACH: instruction-level successors (fallthrough and direct branch edges),
+	// built on first use; empty when an indirect branch makes them unknown.
+	std::vector<std::vector<size_t>> successors;
+	bool                             successors_built = false;
+	const auto                       build_successors = [&]() {
+		if (successors_built) {
+			return !successors.empty();
+		}
+		successors_built = true;
+		std::unordered_map<uint32_t, size_t> index_of_pc;
+		for (size_t i = 0; i < insts.size(); i++) {
+			if (insts[i].opcode == Decoder::Opcode::S_SETPC_B64) {
+				return false;
+			}
+			index_of_pc.emplace(insts[i].pc, i);
+		}
+		successors.resize(insts.size());
+		for (size_t i = 0; i < insts.size(); i++) {
+			const auto& inst = insts[i];
+			if (inst.opcode == Decoder::Opcode::S_ENDPGM) {
+				continue;
+			}
+			if (Decoder::IsDirectBranch(inst.opcode)) {
+				const auto target = index_of_pc.find(inst.branch_target);
+				if (target == index_of_pc.end()) {
+					successors.clear();
+					return false;
+				}
+				successors[i].push_back(target->second);
+				if (inst.opcode == Decoder::Opcode::S_BRANCH) {
+					continue;
+				}
+			}
+			if (i + 1 < insts.size()) {
+				successors[i].push_back(i + 1);
+			}
+		}
+		return true;
+	};
+	// Whether `to` is reachable from the successors of `from`, or (from == SIZE_MAX) from the
+	// entry, never passing `avoid`.
+	const auto reaches = [&](size_t from, size_t to, size_t avoid) {
+		std::vector<uint8_t> seen(insts.size(), 0u);
+		std::vector<size_t>  work;
+		if (from == SIZE_MAX) {
+			work.push_back(0);
+		} else {
+			work = successors[from];
+		}
+		while (!work.empty()) {
+			const auto node = work.back();
+			work.pop_back();
+			if (node == avoid || seen[node] != 0u) {
+				continue;
+			}
+			if (node == to) {
+				return true;
+			}
+			seen[node] = 1u;
+			work.insert(work.end(), successors[node].begin(), successors[node].end());
+		}
+		return false;
+	};
+	const auto reach_definition = [&](uint32_t reg, uint32_t count, size_t at) -> ptrdiff_t {
+		if (insts.empty() || !build_successors()) {
+			return Unknown;
+		}
+		ptrdiff_t writer = Unknown;
+		for (size_t i = 0; i < insts.size(); i++) {
+			bool writes = IsUnsupportedCall(insts[i]);
+			for (uint32_t r = reg; r < reg + count && !writes; r++) {
+				writes = WritesSgpr32(insts[i], r);
+			}
+			if (!writes || !reaches(i, at, SIZE_MAX)) {
+				continue;
+			}
+			if (writer != Unknown) {
+				return Unknown; // two writers reach `at`
+			}
+			writer = static_cast<ptrdiff_t>(i);
+		}
+		if (writer == Unknown) {
+			return Top; // nothing that writes the range reaches `at`: its entry value
+		}
+		const auto& inst = insts[static_cast<size_t>(writer)];
+		if (IsUnsupportedCall(inst)) {
+			return Unknown;
+		}
+		for (uint32_t r = reg; r < reg + count; r++) {
+			if (!WritesSgpr32(inst, r)) {
+				return Unknown;
+			}
+		}
+		// Every path from the entry to `at` passes the writer.
+		return reaches(SIZE_MAX, at, static_cast<size_t>(writer)) ? Unknown : writer;
+	};
+	// `also`: further identical writers when the definition crossed control flow.
+	const auto definition = [&](uint32_t reg, uint32_t count, size_t at,
+	                            std::vector<size_t>& also) -> ptrdiff_t {
+		also.clear();
+		ptrdiff_t found   = Unknown;
+		bool      crossed = false;
+		for (uint32_t r = reg; r < reg + count; r++) {
+			const auto writer = straight_writer(r, at);
+			if (writer == Unknown) {
+				crossed = true;
+				break;
+			}
+			if (found != Unknown && found != writer) {
+				return Unknown;
+			}
+			found = writer;
+		}
+		if (!crossed) {
+			return found;
+		}
+		const auto writes_range = [&](size_t i) {
+			for (uint32_t r = reg; r < reg + count; r++) {
+				if (WritesSgpr32(insts[i], r)) return true;
+			}
+			return false;
+		};
+		// Across control flow, the reaching definition: the last write before `at` in program
+		// order, one instruction that writes the whole range, provided no branch from before it
+		// lands between it and `at` (it dominates `at`), and no later write can loop back to `at`
+		// (no backward branch at or after such a write targets `at` or earlier).
+		{
+			ptrdiff_t candidate = Unknown;
+			for (size_t i = at; i-- > 0;) {
+				if (writes_range(i)) {
+					candidate = static_cast<ptrdiff_t>(i);
+					break;
+				}
+			}
+			bool ok = candidate >= 0;
+			for (uint32_t r = reg; ok && r < reg + count; r++) {
+				ok = WritesSgpr32(insts[static_cast<size_t>(candidate)], r);
+			}
+			const auto cand_pc = ok ? insts[static_cast<size_t>(candidate)].pc : 0u;
+			for (size_t i = 0; ok && i < static_cast<size_t>(candidate); i++) {
+				ok = !Decoder::IsDirectBranch(insts[i].opcode) ||
+				     !(insts[i].branch_target > cand_pc && insts[i].branch_target <= insts[at].pc);
+			}
+			size_t first_later = insts.size();
+			for (size_t i = at; ok && i < insts.size(); i++) {
+				if (first_later == insts.size() && writes_range(i)) {
+					first_later = i;
+				}
+				ok = first_later == insts.size() || !Decoder::IsDirectBranch(insts[i].opcode) ||
+				     insts[i].branch_target > insts[at].pc;
+			}
+			for (const auto& inst: insts) {
+				ok = ok && inst.opcode != Decoder::Opcode::S_SETPC_B64;
+			}
+			if (ok) {
+				return candidate;
+			}
+			// KYTY_CALL_TRACE_WAVE32: nothing before `at` writes the range and no later write can
+			// loop back to `at`: the range holds its entry value (PPSA03671's material kernels
+			// reload s[8:15] from s12 only after their callback loop).
+			if (candidate == Unknown && GetCodegenOptions().call_trace_wave32) {
+				bool entry = true;
+				size_t later = insts.size();
+				for (size_t i = at; entry && i < insts.size(); i++) {
+					if (later == insts.size() && writes_range(i)) {
+						later = i;
+					}
+					entry = later == insts.size() || !Decoder::IsDirectBranch(insts[i].opcode) ||
+					        insts[i].branch_target > insts[at].pc;
+				}
+				for (const auto& inst: insts) {
+					entry = entry && inst.opcode != Decoder::Opcode::S_SETPC_B64;
+				}
+				if (entry) {
+					return Top;
+				}
+			}
+		}
+		// KYTY_CALL_TRACE_REACH (adapted from usa-ratt/KytyPS5-GT7 a6cd035f0): the instruction-level
+		// control flow graph decides. The writers from which `at` can be reached: none, and the
+		// range holds its entry value; one that writes the whole range and that every path from
+		// the entry to `at` passes, and it is the definition. A call (its callee is not known
+		// here) counts as a writer, so a definition never crosses one that can reach `at`.
+		if (GetCodegenOptions().call_trace_reach) {
+			if (const auto reached = reach_definition(reg, count, at); reached != Unknown) {
+				return reached;
+			}
+		}
+		// Else every write of the range anywhere in the program must be the same
+		// load (a compiler reload of one descriptor), at least one of them before `at`.
+		found = Top;
+		for (size_t i = 0; i < insts.size(); i++) {
+			bool writes = false;
+			for (uint32_t r = reg; r < reg + count && !writes; r++) {
+				writes = WritesSgpr32(insts[i], r);
+			}
+			if (!writes) {
+				continue;
+			}
+			if (found == Top) {
+				found = static_cast<ptrdiff_t>(i);
+				continue;
+			}
+			const auto& first = insts[static_cast<size_t>(found)];
+			if (first.word_count != insts[i].word_count ||
+			    !std::equal(first.raw, first.raw + first.word_count, insts[i].raw)) {
+				return Unknown;
+			}
+			also.push_back(i);
+		}
+		return found != Top && static_cast<size_t>(found) >= at ? Unknown : found;
+	};
+	const auto smem_load = [](const Decoder::Instruction& inst, bool& buffer) {
+		if (inst.family != Decoder::Family::SMEM || inst.dst.kind != Decoder::OperandKind::Sgpr) {
+			return false;
+		}
+		const auto name = magic_enum::enum_name(inst.opcode);
+		buffer          = name.starts_with("S_BUFFER_LOAD_DWORD");
+		return buffer || name.starts_with("S_LOAD_DWORD");
+	};
+	// Traces s[reg:reg+count-1] before instruction `at`; `origin` is the first SGPR of the value
+	// that holds them (the user SGPRs or the last step's destination).
+	std::string resolve_why;
+	std::function<bool(uint32_t, uint32_t, size_t, uint32_t, CallTable&, uint32_t&)> resolve;
+	resolve = [&](uint32_t reg, uint32_t count, size_t at, uint32_t depth, CallTable& table,
+	              uint32_t& origin) {
+		if (depth > 8) {
+			return false;
+		}
+		std::vector<size_t> also;
+		const auto          def = definition(reg, count, at, also);
+		if (def == Top) {
+			if (!user_sgpr(reg) || !user_sgpr(reg + count - 1u)) {
+				resolve_why = fmt::format("s{}..s{} unwritten but not user data", reg, reg + count - 1u);
+				return false;
+			}
+			table.user_sgpr = reg;
+			origin          = reg;
+			return true;
+		}
+		if (def == Unknown) {
+			std::string writers;
+			for (size_t i = 0; i < insts.size(); i++) {
+				for (uint32_t r = reg; r < reg + count; r++) {
+					if (WritesSgpr32(insts[i], r)) {
+						writers += fmt::format(" 0x{:x}:{}:s{}", insts[i].pc,
+						                       magic_enum::enum_name(insts[i].opcode), r);
+						break;
+					}
+				}
+			}
+			resolve_why = fmt::format("s{}..s{} before pc 0x{:x} has no unique definition; writers{}",
+			                          reg, reg + count - 1u, insts[at].pc, writers);
+			return false;
+		}
+		const auto& inst   = insts[static_cast<size_t>(def)];
+		bool        buffer = false;
+		if (!smem_load(inst, buffer) || inst.src1.kind != Decoder::OperandKind::Null ||
+		    reg < inst.dst.reg || reg + count > inst.dst.reg + inst.data_dwords) {
+			resolve_why = fmt::format("s{} defined at pc 0x{:x} by {}", reg, inst.pc,
+			                          magic_enum::enum_name(inst.opcode));
+			return false;
+		}
+		uint32_t base_origin = 0;
+		// Each identical reload must see the same chain.
+		for (const auto other: also) {
+			CallTable copy  = table;
+			uint32_t  other_origin = 0;
+			CallTable first = table;
+			uint32_t  first_origin = 0;
+			if (!resolve(inst.src0.reg, buffer ? 4u : 2u, other, depth + 1u, copy, other_origin) ||
+			    !resolve(inst.src0.reg, buffer ? 4u : 2u, static_cast<size_t>(def), depth + 1u, first,
+			             first_origin) ||
+			    other_origin - inst.src0.reg != first_origin - inst.src0.reg ||
+			    copy.user_sgpr != first.user_sgpr || copy.steps.size() != first.steps.size() ||
+			    !std::equal(copy.steps.begin(), copy.steps.end(), first.steps.begin(),
+			                [](const CallTableStep& a, const CallTableStep& b) {
+				                return a.buffer == b.buffer && a.base_index == b.base_index &&
+				                       a.offset == b.offset && a.dwords == b.dwords;
+			                })) {
+				resolve_why = fmt::format("reloads of s{} at pc 0x{:x} and 0x{:x} differ", reg,
+				                          inst.pc, insts[other].pc);
+				return false;
+			}
+		}
+		if (!resolve(inst.src0.reg, buffer ? 4u : 2u, static_cast<size_t>(def), depth + 1u, table,
+		             base_origin)) {
+			return false;
+		}
+		table.steps.push_back({buffer, inst.src0.reg - base_origin,
+		                       static_cast<int32_t>(inst.offset), inst.data_dwords});
+		origin = inst.dst.reg;
+		return true;
+	};
+	std::vector<CallTable> tables;
+	for (size_t call = 0; call < insts.size(); call++) {
+		if (!IsUnsupportedCall(insts[call])) {
+			continue;
+		}
+		CallTable table;
+		table.call_pc     = insts[call].pc;
+		table.return_sgpr = (insts[call].raw[0] >> 16u) & 0x7fu;
+		const auto target = insts[call].raw[0] & 0xffu;
+		const auto fail = [&](std::string_view why) {
+			failures += fmt::format("{}pc 0x{:x}: {}", failures.empty() ? "" : "; ", table.call_pc, why);
+		};
+		if (target >= 104u || (target & 1u) != 0u) {
+			fail("odd target pair");
+			continue;
+		}
+		// The target pair: two S_MOV_B32 copies of a consecutive pair.
+		uint32_t sources[2] = {};
+		size_t   copies[2]  = {};
+		bool     ok         = true;
+		for (uint32_t half = 0; ok && half < 2; half++) {
+			const auto writer = straight_writer(target + half, call);
+			ok = writer >= 0 && insts[static_cast<size_t>(writer)].opcode == Decoder::Opcode::S_MOV_B32 &&
+			     insts[static_cast<size_t>(writer)].src0.kind == Decoder::OperandKind::Sgpr;
+			if (ok) {
+				copies[half]  = static_cast<size_t>(writer);
+				sources[half] = insts[copies[half]].src0.reg;
+			}
+		}
+		if (!ok || sources[1] != sources[0] + 1u) {
+			fail("target pair not two S_MOV_B32 copies of a pair");
+			continue;
+		}
+		// The record load: both halves from one S_BUFFER_LOAD with a register offset.
+		const auto load = straight_writer(sources[0], std::min(copies[0], copies[1]));
+		bool       buffer = false;
+		if (load < 0 || load != straight_writer(sources[1], std::min(copies[0], copies[1]))) {
+			fail(fmt::format("copied pair s{} has no single straight-line writer", sources[0]));
+			continue;
+		}
+		const auto& record = insts[static_cast<size_t>(load)];
+		if (!smem_load(record, buffer) || !buffer || record.src1.kind == Decoder::OperandKind::Null ||
+		    sources[0] < record.dst.reg || sources[1] >= record.dst.reg + record.data_dwords) {
+			fail(fmt::format("pair writer at pc 0x{:x} is not a register-offset S_BUFFER_LOAD",
+			                 record.pc));
+			continue;
+		}
+		table.target_word   = sources[0] - record.dst.reg;
+		table.record_offset = record.offset;
+		// The record index shift: S_LSHL_B32 into the offset register right before.
+		bool shift_found = false;
+		for (size_t i = static_cast<size_t>(load); i-- > 0;) {
+			const auto& inst = insts[i];
+			if (labels.contains(insts[i + 1].pc) || Decoder::IsDirectBranch(inst.opcode)) {
+				break;
+			}
+			if (inst.dst.kind != record.src1.kind ||
+			    (inst.dst.kind == Decoder::OperandKind::Sgpr && inst.dst.reg != record.src1.reg)) {
+				continue;
+			}
+			shift_found = inst.opcode == Decoder::Opcode::S_LSHL_B32 &&
+			              inst.src1.kind == Decoder::OperandKind::IntegerInlineConstant;
+			table.record_shift = shift_found ? inst.src1.value : 0u;
+			break;
+		}
+		uint32_t origin = 0;
+		if (!shift_found) {
+			fail("no S_LSHL_B32 record index");
+			continue;
+		}
+		// KYTY_CALL_TRACE_WAVE32: a table V# held in user data itself (no load step; PPSA03671's
+		// 0xfc0537b7278db60c keeps it in s[8:11]) is evaluated from the user data as it is.
+		if (!resolve(record.src0.reg, 4u, static_cast<size_t>(load), 0u, table, origin) ||
+		    (table.steps.empty() && !GetCodegenOptions().call_trace_wave32)) {
+			fail(fmt::format("table descriptor s{} not traced ({})", record.src0.reg,
+			                 resolve_why.empty() ? std::string("held in user data") : resolve_why));
+			continue;
+		}
+		table.table_index = record.src0.reg - origin;
+		tables.push_back(std::move(table));
+	}
+	return tables;
+}
+
+ShaderCallAnalysis AnalyzeShaderCalls(std::span<const uint32_t> code, const CompileOptions& options) {
+	ShaderCallAnalysis analysis;
+	if (code.empty() || !options.back_code.empty() || options.stage == ShaderType::Local) {
+		analysis.failures = "not a single-stage program";
+		return analysis;
+	}
+	Decoder::Program decoded;
+	Decoder::DecodeProgram(code, decoded, true);
+	std::vector<std::pair<uint32_t, uint32_t>> user_calls;
+	uint32_t                                   unresolved = 0;
+	(void)FindCallTargets(decoded, options, unresolved, &user_calls);
+	std::string table_failures;
+	auto        tables = FindCallTables(decoded, options, table_failures);
+	// KYTY_RAY_HIT_CALLS_RETURN=1 (default off; usa-ratt/KytyPS5-GT7's RayHitCallsReturn): in a
+	// program that traces rays (IMAGE_BVH_INTERSECT_RAY), a call whose target cannot be traced is
+	// a hit function (GT7's traversal calls one for a candidate on non-opaque geometry, with v7 = 1
+	// "accept" set before it): it returns at once, so every candidate counts as opaque, instead of
+	// the whole program being refused and its dispatches skipped (GT7 CS 0x2218a07ab01d4f46).
+	static const bool ray_hit_return = [] {
+		const char* value = std::getenv("KYTY_RAY_HIT_CALLS_RETURN");
+		return value != nullptr && value[0] == '1';
+	}();
+	const bool traces_rays =
+	    ray_hit_return && std::ranges::any_of(decoded.instructions, [](const Decoder::Instruction& inst) {
+		    return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
+	    });
+	for (const auto& inst: decoded.instructions) {
+		if (!IsUnsupportedCall(inst)) {
+			continue;
+		}
+		ShaderCall call;
+		call.pc         = inst.pc;
+		call.source_reg = inst.raw[0] & 0xffu;
+		call.return_reg = (inst.raw[0] >> 16u) & 0x7fu;
+		if (const auto user = std::ranges::find(user_calls, inst.pc, &std::pair<uint32_t, uint32_t>::first);
+		    user != user_calls.end()) {
+			call.user_sgpr = user->second;
+		} else if (const auto table = std::ranges::find(tables, inst.pc, &CallTable::call_pc);
+		           table != tables.end()) {
+			call.table = *table;
+		} else if (traces_rays) {
+			call.null_callee = true;
+		} else {
+			analysis.failures += fmt::format("{}pc 0x{:x}: target not traced", analysis.failures.empty() ? "" : "; ",
+			                                 inst.pc);
+		}
+		analysis.calls.push_back(std::move(call));
+	}
+	if (!analysis.failures.empty() && !table_failures.empty()) {
+		analysis.failures += fmt::format(" (table trace: {})", table_failures);
+	}
+	return analysis;
+}
+
+// KYTY_DIAG_CODE_PATCH=<hash>:<byte offset>=<word>[,<byte offset>=<word>...][;<hash>:...] (diagnostic,
+// all hex): the listed program's guest code words are replaced before decoding (an instruction turned
+// into S_NOPs, a constant changed) to bisect a translation in game. Pair it with KYTY_SHADER_DUMP for
+// that hash so the persistent program cache does not serve the unpatched translation.
+static bool DiagCodePatch(uint64_t hash, std::span<const uint32_t> code, std::vector<uint32_t>& patched) {
+	static const auto patches = [] {
+		std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> parsed;
+		const char* value = std::getenv("KYTY_DIAG_CODE_PATCH");
+		if (value == nullptr) return parsed;
+		std::string_view text(value);
+		while (!text.empty()) {
+			const auto end   = text.find(';');
+			auto       group = text.substr(0, end);
+			text             = end == std::string_view::npos ? std::string_view() : text.substr(end + 1);
+			const auto colon = group.find(':');
+			if (colon == std::string_view::npos) continue;
+			const auto program = std::strtoull(std::string(group.substr(0, colon)).c_str(), nullptr, 16);
+			group              = group.substr(colon + 1);
+			while (!group.empty()) {
+				const auto comma = group.find(',');
+				const auto item  = std::string(group.substr(0, comma));
+				group            = comma == std::string_view::npos ? std::string_view() : group.substr(comma + 1);
+				const auto equal = item.find('=');
+				if (equal == std::string::npos) continue;
+				parsed.emplace_back(program,
+				                    static_cast<uint32_t>(std::strtoul(item.substr(0, equal).c_str(), nullptr, 16)),
+				                    static_cast<uint32_t>(std::strtoul(item.substr(equal + 1).c_str(), nullptr, 16)));
+			}
+		}
+		return parsed;
+	}();
+	bool applied = false;
+	for (const auto& [program, offset, word]: patches) {
+		if (program != hash || offset % 4u != 0u || offset / 4u >= code.size()) continue;
+		if (!applied) patched.assign(code.begin(), code.end());
+		applied              = true;
+		patched[offset / 4u] = word;
+		std::fprintf(stderr, "DIAG_CODE_PATCH hash=0x%016llx offset=0x%x word=0x%08x (was 0x%08x)\n",
+		             static_cast<unsigned long long>(hash), offset, word, code[offset / 4u]);
+	}
+	return applied;
+}
+
+// KYTY_CALL_LOOP_CAP: the loop headers inside the callee bodies the function expansion bracketed
+// (Decoder::ShaderCallLoopBodyBegin / End) draw on the invocation's call-loop budget (the emitter
+// counts their rounds and takes their exits once it is spent). An empty header the structurizer
+// adds is judged by the block it enters.
+static void MarkCallLoopHeaders(const Decoder::Program& decoded, IR::Program& ir) {
+	if (GetCodegenOptions().call_loop_cap == 0u) return;
+	std::vector<std::pair<uint32_t, uint32_t>> bracketed;
+	for (const auto& inst: decoded.instructions) {
+		if (inst.opcode != Decoder::Opcode::S_NOP) continue;
+		if (inst.raw[0] == Decoder::ShaderCallLoopBodyBegin) {
+			bracketed.emplace_back(inst.pc, UINT32_MAX);
+		} else if (inst.raw[0] == Decoder::ShaderCallLoopBodyEnd && !bracketed.empty() &&
+		           bracketed.back().second == UINT32_MAX) {
+			bracketed.back().second = inst.pc;
+		}
+	}
+	if (bracketed.empty()) return;
+	const auto find = [&](uint32_t id) -> const IR::BlockInfo* {
+		const auto found = std::ranges::find_if(ir.block_info, [&](const IR::BlockInfo& info) { return info.id == id; });
+		return found != ir.block_info.end() ? &*found : nullptr;
+	};
+	for (auto& info: ir.block_info) {
+		if (!info.terminator.loop_header) continue;
+		const auto* first = &info;
+		for (uint32_t step = 0; first != nullptr && first->start_pc == first->end_pc &&
+		                        first->terminator.kind == CFG::TerminatorKind::Branch && step < 8;
+		     step++) {
+			first = find(first->terminator.true_block);
+		}
+		if (first == nullptr || first->start_pc == first->end_pc) continue;
+		info.terminator.call_loop = std::ranges::any_of(bracketed, [&](const auto& range) {
+			return first->start_pc >= range.first && first->start_pc < range.second;
+		});
+	}
+}
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
-	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
-	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
-	    options.stage != ShaderType::TessellationEvaluation) {
-		EXIT("shader recompiler received unsupported stage %u\n",
-		     static_cast<unsigned>(options.stage));
+	std::vector<uint32_t> diag_patched;
+	if (DiagCodePatch(options.shader_hash, code, diag_patched)) {
+		code = diag_patched;
 	}
 
 	const auto compile_begin = std::chrono::steady_clock::now();
@@ -806,6 +1381,17 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, decoded, decode_bvh);
+		// KYTY_RT_HW: sce::Psr traversal loops trace with host ray queries (RayTracingPatch.h).
+		if (options.stage == ShaderType::Compute && decode_bvh && GetCodegenOptions().rt_hw) {
+			Decoder::RayTracingPatch patch;
+			const bool found   = Decoder::DeriveRayTracingPatch(decoded, patch);
+			const bool applied = found && Decoder::ApplyRayTracingPatch(patch, decoded, GetCodegenOptions().rt_hw_verify);
+			if (found || patch.unmatched != 0) {
+				LOGF("%s native ray tracing patch: hash=0x%016" PRIx64 " sites=%" PRIu64 " unmatched=%u applied=%d%s\n",
+				     GetDumpLabel(options), options.shader_hash, static_cast<uint64_t>(patch.sites.size()),
+				     patch.unmatched, applied ? 1 : 0, patch.report.c_str());
+			}
+		}
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
@@ -828,10 +1414,62 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 		TranslateResult skipped;
 		skipped.skip_dispatch = true;
+		skipped.skip_pc       = decoded.instructions.back().pc;
+		skipped.skip_reason   = "BVH intersection without a BVH mode";
 		if (options.dump_ir) {
 			skipped.decoded_dump = Decoder::ProgramToString(decoded);
 		}
 		return skipped;
+	}
+
+	// KYTY_CALL_PARTITIONS: a partition program (ShaderCalls.h) drops lanes at its markers.
+	struct PartitionScope {
+		~PartitionScope() { IR::SetPartitionDropLanes(false); }
+	} partition_scope;
+	IR::SetPartitionDropLanes(std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+		return inst.opcode == Decoder::Opcode::S_KYTY_CALL_STATE &&
+		       inst.offset == static_cast<uint32_t>(Decoder::CallStateOp::PartitionDrop);
+	}));
+
+	// Call-split programs (CallSplit.h) start with their header marker.
+	std::optional<CallSplit::Translation> split;
+	struct SplitScope {
+		~SplitScope() { CallSplit::SetCurrent(nullptr); }
+	} split_scope;
+	if (!decoded.instructions.empty() &&
+	    decoded.instructions.front().opcode == Decoder::Opcode::S_KYTY_CALL_STATE &&
+	    decoded.instructions.front().offset == static_cast<uint32_t>(Decoder::CallStateOp::Header)) {
+		const auto& first = decoded.instructions.front();
+		split.emplace();
+		const bool parsed = CallSplit::DecodeHeader(
+		    std::span(code).subspan(first.secondary_offset, first.word_count - 1u), split->header);
+		// CallSplitPlan BuildCode: header, then for a resume program (entry site k) one S_BRANCH, then
+		// the canonical guest code. Callee programs carry no S_GETPC_B64 (ExpandShaderCalls turns
+		// each into moves of its guest value), so the offset only matters for the others.
+		split->guest_pc_offset =
+		    (first.word_count + (split->header.entry_site != 0u ? 1u : 0u)) * static_cast<uint32_t>(sizeof(uint32_t));
+		for (const auto& inst: decoded.instructions) {
+			if (inst.opcode != Decoder::Opcode::S_KYTY_CALL_STATE) continue;
+			const auto op = static_cast<Decoder::CallStateOp>(inst.offset);
+			if ((op == Decoder::CallStateOp::Save || op == Decoder::CallStateOp::Probe) &&
+			    inst.word_count == 2u) {
+				split->site_at_pc[inst.pc] = code[inst.secondary_offset];
+			}
+		}
+		const bool planning =
+		    (split->header.flags & (CallSplit::FlagLiveness | CallSplit::FlagProbe)) != 0;
+		if ((split->header.flags & CallSplit::FlagProbe) == 0) {
+			split->recipe = CallSplit::FindRecipe(split->header.digest);
+		}
+		if (!parsed || options.stage != ShaderType::Compute || options.wave_size != 64u ||
+		    (!planning && split->recipe == nullptr)) {
+			NoteSkippedProgram(options, 0, parsed ? "is a call-split program without its plan"
+			                                      : "has a damaged call-split header");
+			TranslateResult skipped;
+			skipped.skip_dispatch = true;
+			return skipped;
+		}
+		CallSplit::SetCurrent(&*split);
 	}
 
 	std::string decoded_dump;
@@ -849,12 +1487,18 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			TranslateResult skipped;
 			uint32_t        unresolved = 0;
 			skipped.call_targets       = FindCallTargets(decoded, options, unresolved);
+			std::string table_failures;
+			skipped.call_tables = FindCallTables(decoded, options, table_failures);
 			NoteSkippedProgram(
 			    options, call->pc,
 			    fmt::format("calls a function through S_SWAPPC_B64, which is not supported "
-			                "(callees from user data: {})",
-			                DescribeCallTargets(skipped.call_targets, unresolved)));
+			                "(callees from user data: {}; calls through a traced table: {}{}{})",
+			                DescribeCallTargets(skipped.call_targets, unresolved),
+			                skipped.call_tables.size(), table_failures.empty() ? "" : "; untraced: ",
+			                table_failures));
 			skipped.skip_dispatch = true;
+			skipped.skip_pc       = call->pc;
+			skipped.skip_reason   = "S_SWAPPC_B64 call";
 			skipped.decoded_dump  = std::move(decoded_dump);
 			return skipped;
 		}
@@ -909,6 +1553,14 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	MarkCallLoopHeaders(decoded, ir);
+	// The TLAS of the native ray tracing patch (NativeRayTracing::Prepare reads it).
+	if (decoded.ray_tracing_source.valid && ir.info.ray_query_sites != 0) {
+		ir.info.ray_query_user_sgpr     = decoded.ray_tracing_source.user_sgpr;
+		ir.info.ray_query_vsharp_offset = decoded.ray_tracing_source.vsharp_offset;
+		ir.info.ray_query_header_offset = decoded.ray_tracing_source.header_offset;
+		ir.info.ray_query_root          = decoded.ray_tracing_source.root;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -927,7 +1579,17 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
+	// KYTY_WAVE64_HIGH_LANES: a wave64 VS/PS on 32-wide host subgroups (no KYTY_WAVE32_CLUSTERS
+	// wide stage) has no lanes 32-63 to shuffle from.
+	const bool unreachable_high_lanes = [&] {
+		if (!GetCodegenOptions().wave64_high_lanes || ir.wave_size != 64u ||
+		    ShaderWorkgroupInput(ir.stage, options.input_info) != nullptr) {
+			return false;
+		}
+		const auto wide = Spirv::GetHostWaveClusters();
+		return ir.stage == ShaderType::Pixel ? !wide.pixel : !wide.vertex;
+	}();
+	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size, unreachable_high_lanes);
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
@@ -936,7 +1598,14 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	LowerTessellationMemory(ir, options);
+	if (const auto* reason = LowerTessellationMemory(ir, options, &decoded); reason != nullptr) {
+		// KYTY_TESS_INDEXED: skipped like the draws of a program that gives up.
+		NoteSkippedProgram(options, 0, reason);
+		TranslateResult skipped;
+		skipped.skip_dispatch = true;
+		skipped.skip_reason   = reason;
+		return skipped;
+	}
 	// KYTY_DUMP_STDOUT=1 with the early dump: the decoded ISA and the IR that resource tracking is
 	// about to see go to stdout, so a shader the tracker rejects can still be inspected offline.
 	if (options.dump_ir && options.early_dump && std::getenv("KYTY_DUMP_STDOUT") != nullptr) {
@@ -944,19 +1613,50 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		std::fputs(MakeIrDump(CFG::GraphToString(cfg), ir).c_str(), stdout);
 		std::fflush(stdout);
 	}
+	if (split && (split->header.flags & (CallSplit::FlagLiveness | CallSplit::FlagProbe)) != 0) {
+		auto report = std::make_shared<CallSplit::Report>();
+		CallSplit::CollectReport(*split, ir, *report);
+		TranslateResult planned;
+		planned.skip_dispatch = true;
+		planned.call_split    = std::move(report);
+		return planned;
+	}
 	const bool variant_reads = GetCodegenOptions().srt_variant_reads;
 	IR::BuildSrtPlan(ir, variant_reads);
 	IR::EliminateDeadCode(ir.blocks);
 	if (const auto unresolved_pc =
-	        IR::TrackResources(ir, variant_reads, GetCodegenOptions().bda_writes);
+	        IR::TrackResources(ir, variant_reads, GetCodegenOptions().bda_writes,
+	                           ShaderWorkgroupInput(options.stage, options.input_info));
 	    unresolved_pc != UINT32_MAX) {
 		NoteSkippedProgram(options, unresolved_pc,
 		                   "computes a descriptor at runtime that has no BDA path");
 		TranslateResult skipped;
 		skipped.skip_dispatch = true;
+		skipped.skip_pc       = unresolved_pc;
+		skipped.skip_reason   = "descriptor computed at runtime without a BDA path";
 		return skipped;
 	}
-	IR::EliminateDeadCode(ir.blocks);
+	// Resource tracking can take a plan-table value's last IR use: a stand-in or bindless sampler
+	// plan rewires the S# handle, so the scalar reads of the sampler heap are stranded, and the
+	// heap's buffer source (collected in the walk) names V# words nothing else uses. Erasing them
+	// left the plan naming freed instructions, which ExtractResourcePlan then read (and the
+	// draw-prep thread crashed once another compile had reused that memory), so the elimination
+	// keeps every value the plan tables name. The walk's list of dynamic reads is no plan value:
+	// entries for stranded reads are cleared instead.
+	IR::EliminateDeadCode(ir.blocks, IR::PlanTableInstructions(ir));
+	(void)IR::DropDeadPlanReferences(ir);
+	// A subgroup larger than a host mesh workgroup runs in passes, cut at its barriers.
+	if (options.stage == ShaderType::Mesh && options.input_info.vertex != nullptr &&
+	    options.input_info.vertex->mesh.passes > 1u) {
+		if (const auto* reason = Spirv::MeshPassesUnsupported(ir); reason != nullptr) {
+			// Skipped like the draws of a program that gives up, logged once per shader.
+			NoteSkippedProgram(options, 0, reason);
+			TranslateResult skipped;
+			skipped.skip_dispatch = true;
+			skipped.skip_reason   = "mesh passes cannot cut the program at its barriers";
+			return skipped;
+		}
+	}
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {

@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/drawPrep/drawRun.h"
+#include "common/staticOnce.h"
 
 #include "graphics/host_gpu/renderer/drawPrep/ownedCounters.h"
+#include "graphics/host_gpu/renderer/drawPrep/texDelta.h"
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -83,6 +85,13 @@ Live::Switch g_targets("KYTY_DRAW_RUN_TARGETS", [](const char* value) -> int64_t
 // A record made with the swap on is only continued by a swap while it stays on.
 Live::Switch g_pipeswap("KYTY_DRAW_RUN_PIPESWAP", Live::ParseDefaultOff,
                         [](int64_t, int64_t) { NoteForeignActivity("KYTY_DRAW_RUN_PIPESWAP change"); });
+// KYTY_DRAW_RUN_TEXDELTA: 0 off, 1 on, 2 verify; a change ends the current run.
+Live::Switch g_texdelta(
+    "KYTY_DRAW_RUN_TEXDELTA",
+    [](const char* value) -> int64_t {
+	    return value != nullptr ? std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 2) : 0;
+    },
+    [](int64_t, int64_t) { NoteForeignActivity("KYTY_DRAW_RUN_TEXDELTA change"); });
 
 } // namespace Detail
 
@@ -135,10 +144,12 @@ void NoteForeignActivity(const char* what) noexcept {
 }
 
 bool QuietOpsEnabled() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const char* value = std::getenv("KYTY_DRAW_RUN_QUIET_OPS");
 		return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -164,15 +175,18 @@ uint64_t ActivityEpoch() noexcept {
 
 uint64_t StructureKey(const HW::Context& context, const HW::UserConfig& user_config,
                       const DrawPrep::PreparedDraw& prepared, uint64_t* targets_key,
-                      uint64_t* swap_key) {
+                      uint64_t* swap_key, uint64_t* texture_free_key) {
 	if (targets_key != nullptr) {
 		*targets_key = 0;
 	}
 	if (swap_key != nullptr) {
 		*swap_key = 0;
 	}
+	if (texture_free_key != nullptr) {
+		*texture_free_key = 0;
+	}
 	if (!prepared.ok || prepared.failure != DrawPrep::Failure::None ||
-	    !prepared.vertex_info.stage.program) {
+	    !prepared.vertex_info.stage.program || prepared.vertex_stages != 1) {
 		return 0;
 	}
 	// Every context register (targets, depth/stencil, blend, raster, viewports, shader registers).
@@ -180,7 +194,10 @@ uint64_t StructureKey(const HW::Context& context, const HW::UserConfig& user_con
 	// The user-config registers but the per-draw index offset and object id.
 	auto config = user_config;
 	config.SetIndexOffset(0);
-	config.SetObjectId(0);
+	// KYTY_OBJPRIM_ID: a draw writing VGT_OBJECT_ID to a colour slot needs its own (pushed per draw).
+	if (!ShaderObjprimIdEnabled() || (context.GetDrawPayloadControl() & 0x1u) == 0) {
+		config.SetObjectId(0);
+	}
 	hash = HashBytes(hash, &config, sizeof(config));
 	if (targets_key != nullptr) {
 		*targets_key = hash != 0 ? hash : 1;
@@ -199,16 +216,13 @@ uint64_t StructureKey(const HW::Context& context, const HW::UserConfig& user_con
 		words = HashValues(words, prepared.pixel_prep.resources.images);
 		words = HashValues(words, prepared.pixel_prep.resources.samplers);
 	}
-	const auto chain = [&](const std::array<const void*, 2>& chained) {
-		uint64_t result = HashBytes(hash, chained.data(), sizeof(chained));
-		result          = HashBytes(result, &flags, sizeof(flags));
-		result          = HashBytes(result, &words, sizeof(words));
-		return result != 0 ? result : 1;
-	};
 	if (swap_key != nullptr) {
-		*swap_key = chain({nullptr, programs[1]});
+		*swap_key = TexDelta::ChainKey(hash, {nullptr, programs[1]}, flags, words);
 	}
-	return chain(programs);
+	if (texture_free_key != nullptr) {
+		*texture_free_key = TexDelta::TextureFreeKey(hash, programs, flags);
+	}
+	return TexDelta::ChainKey(hash, programs, flags, words);
 }
 
 Totals& GetTotals() {
@@ -263,7 +277,7 @@ void StructureKeyParts(const HW::Context& context, const HW::UserConfig& user_co
                        const DrawPrep::PreparedDraw& prepared, KeyParts& parts) {
 	parts.fill(0);
 	if (!prepared.ok || prepared.failure != DrawPrep::Failure::None ||
-	    !prepared.vertex_info.stage.program) {
+	    !prepared.vertex_info.stage.program || prepared.vertex_stages != 1) {
 		return;
 	}
 	context.VisitKeyDiagParts([&parts](uint32_t part, const void* data, size_t size) {
@@ -271,7 +285,10 @@ void StructureKeyParts(const HW::Context& context, const HW::UserConfig& user_co
 	});
 	auto config = user_config;
 	config.SetIndexOffset(0);
-	config.SetObjectId(0);
+	// KYTY_OBJPRIM_ID: a draw writing VGT_OBJECT_ID to a colour slot needs its own (pushed per draw).
+	if (!ShaderObjprimIdEnabled() || (context.GetDrawPayloadControl() & 0x1u) == 0) {
+		config.SetObjectId(0);
+	}
 	parts[KpUserConfig]  = HashBytes(11, &config, sizeof(config));
 	const uint32_t flags = (prepared.pixel_active ? 1u : 0u) |
 	                       (prepared.programs.VertexStageCount() == 1 ? 2u : 0u);

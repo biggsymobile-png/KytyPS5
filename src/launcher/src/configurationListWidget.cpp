@@ -8,11 +8,14 @@
 #include "configurationEditDialog.h"
 #include "configurationItem.h"
 #include "gameContent.h"
-#include "gameListTreeWidget.h"
+#include "gameViews.h"
 #include "inputMappingDialog.h"
 #include "mainDialog.h"
 #include "patchesDialog.h"
+#include "precompileDialog.h"
+#include "shaderListExport.h"
 #include "trophyViewerDialog.h"
+#include "wheelMappingDialog.h"
 
 #include <QAbstractItemModel>
 #include <QAbstractItemView>
@@ -53,7 +56,6 @@
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QStyle>
-#include <QStyledItemDelegate>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QUrl>
@@ -80,17 +82,9 @@ constexpr char CONF_LAUNCHER[]     = "Launcher";
 constexpr char CONF_GAME_DIR[]     = "game_dir";
 constexpr char CONF_GAME_DIRS[]    = "game_dirs";
 constexpr char CONF_ADDONS_DIR[]   = "addons_dir";
+constexpr char CONF_ADDCONT[]      = "AdditionalContent";
 constexpr char CONF_GLOBAL[]       = "GlobalConfiguration";
 constexpr char SAVE_DATA_DIR[]     = "_SaveData";
-
-constexpr int GAME_NAME_COLUMN             = 0;
-constexpr int GAME_SERIAL_COLUMN           = 1;
-constexpr int GAME_VERSION_COLUMN          = 2;
-constexpr int GAME_FIRMWARE_VERSION_COLUMN = 3;
-constexpr int GAME_SIZE_COLUMN             = 4;
-constexpr int GAME_PATH_COLUMN             = 5;
-constexpr int GAME_STATUS_COLUMN           = 6;
-constexpr int GAME_COMMENT_COLUMN          = 7;
 
 static std::unique_ptr<QSettings> OpenGlobalSettings() {
 #ifdef __linux__
@@ -202,54 +196,6 @@ static QStringList SettingsStringList(const QVariant& value) {
 	return text.isEmpty() ? QStringList() : QStringList({text});
 }
 
-class GameGridDelegate: public QStyledItemDelegate {
-public:
-	using QStyledItemDelegate::QStyledItemDelegate;
-
-	QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex&) const override {
-		return option.decorationSize + QSize(16, 24 + option.fontMetrics.lineSpacing() * 2);
-	}
-
-protected:
-	void initStyleOption(QStyleOptionViewItem* option, const QModelIndex& index) const override {
-		const auto image_size = option->decorationSize;
-		QStyledItemDelegate::initStyleOption(option, index);
-		option->decorationSize      = image_size;
-		option->decorationPosition  = QStyleOptionViewItem::Top;
-		option->decorationAlignment = Qt::AlignCenter;
-		option->displayAlignment    = Qt::AlignHCenter | Qt::AlignTop;
-		option->features |= QStyleOptionViewItem::WrapText;
-	}
-};
-
-static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
-	ui->cfgs_list->setAlternatingRowColors(false);
-	ui->cfgs_list->setAllColumnsShowFocus(true);
-	ui->cfgs_list->setIndentation(0);
-	ui->cfgs_list->setMouseTracking(false);
-	ui->cfgs_list->setSelectionBehavior(QAbstractItemView::SelectRows);
-	ui->cfgs_list->setSelectionMode(QAbstractItemView::SingleSelection);
-	ui->cfgs_list->setTextElideMode(Qt::ElideMiddle);
-	ui->cfgs_list->header()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-	ui->cfgs_list->header()->setHighlightSections(false);
-	ui->cfgs_list->header()->setStretchLastSection(true);
-
-	// Both presentations use the same items, icons and current game.
-	ui->cfgs_grid->setModel(ui->cfgs_list->model());
-	ui->cfgs_grid->setSelectionModel(ui->cfgs_list->selectionModel());
-	ui->cfgs_grid->setViewMode(QListView::IconMode);
-	ui->cfgs_grid->setMovement(QListView::Static);
-	ui->cfgs_grid->setResizeMode(QListView::Adjust);
-	ui->cfgs_grid->setSelectionMode(QAbstractItemView::SingleSelection);
-	ui->cfgs_grid->setSelectionBehavior(QAbstractItemView::SelectRows);
-	ui->cfgs_grid->setEditTriggers(QAbstractItemView::NoEditTriggers);
-	ui->cfgs_grid->setSpacing(8);
-	ui->cfgs_grid->setUniformItemSizes(true);
-	ui->cfgs_grid->setWordWrap(true);
-	ui->cfgs_grid->setItemDelegate(new GameGridDelegate(ui->cfgs_grid));
-	ui->cfgs_grid->setContextMenuPolicy(Qt::CustomContextMenu);
-}
-
 static void AddSaveDataDir(QStringList* dirs, QSet<QString>* seen, const QString& root,
                            const QString& title_id) {
 	const auto path = QDir(root).filePath(
@@ -303,7 +249,6 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_compatibility = new CompatibilityDatabase(
 	    QCoreApplication::arguments().contains(QStringLiteral("--local")), this);
 	m_ui->setupUi(this);
-	ConfigureGameList(m_ui);
 
 	m_ui->refresh_action->setShortcuts(QKeySequence::Refresh);
 	m_ui->refresh_button->setDefaultAction(m_ui->refresh_action);
@@ -312,16 +257,21 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	UpdateToolbarIcons();
 	m_ui->global_settings_button->setToolTip(tr("Edit global settings and game folders"));
 	m_ui->input_mapping_button->setToolTip(tr("Edit global input mapping"));
+	m_ui->wheel_button->setToolTip(tr("Map a racing wheel"));
 
 	m_ui->delete_button->setEnabled(false);
 	m_ui->edit_button->setEnabled(false);
 
 	m_ui->cfgs_list->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_ui->cfgs_list->setAllColumnsShowFocus(true);
+	m_ui->cfgs_list->setTextElideMode(Qt::ElideMiddle);
 	m_ui->cfgs_list->setIconSize(QSize(48, 48));
-	m_ui->cfgs_list->setRootIsDecorated(false);
+	m_ui->cfgs_list->setItemDelegateForColumn(GAME_NAME_COLUMN,
+	                                          new GameListNameDelegate(m_ui->cfgs_list));
 	m_ui->cfgs_list->setUniformRowHeights(true);
 	m_ui->cfgs_list->setSortingEnabled(true);
 	m_ui->cfgs_list->setColumnWidth(GAME_NAME_COLUMN, 320);
+	m_ui->cfgs_list->setColumnWidth(GAME_PRECOMPILE_COLUMN, 110);
 	m_ui->cfgs_list->setColumnWidth(GAME_SERIAL_COLUMN, 110);
 	m_ui->cfgs_list->setColumnWidth(GAME_VERSION_COLUMN, 120);
 	m_ui->cfgs_list->setColumnWidth(GAME_FIRMWARE_VERSION_COLUMN, 150);
@@ -330,6 +280,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setColumnWidth(GAME_STATUS_COLUMN, 150);
 	m_ui->cfgs_list->setColumnWidth(GAME_COMMENT_COLUMN, 240);
 	m_ui->cfgs_list->sortItems(GAME_NAME_COLUMN, Qt::AscendingOrder);
+	SetupGameGrid(m_ui->cfgs_list, m_ui->cfgs_grid);
+	m_ui->cfgs_grid->setContextMenuPolicy(Qt::CustomContextMenu);
 
 	connect(m_ui->refresh_action, &QAction::triggered, this,
 	        &ConfigurationListWidget::ScanGameDirectory);
@@ -337,6 +289,7 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	        &ConfigurationListWidget::edit_global_settings);
 	connect(m_ui->input_mapping_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::edit_input_mapping);
+	connect(m_ui->wheel_button, &QToolButton::clicked, this, &ConfigurationListWidget::edit_wheel);
 	connect(m_ui->edit_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::edit_configuration);
 	connect(m_ui->delete_button, &QToolButton::clicked, this,
@@ -374,16 +327,12 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	connect(m_compatibility, &CompatibilityDatabase::Updated, this,
 	        &ConfigurationListWidget::ApplyCompatibility);
 
-	m_ui->cfgs_list->setDragDropMode(QAbstractItemView::NoDragDrop);
-
 	ReadSettings();
 	m_ui->grid_size_slider->setVisible(m_ui->grid_view_button->isChecked());
-	const auto resize_grid = [this](int width) {
-		m_ui->cfgs_grid->setIconSize(QSize(width, width * 9 / 16));
-	};
-	resize_grid(m_ui->grid_size_slider->value());
-	connect(m_ui->grid_size_slider, &QSlider::valueChanged, this, [this, resize_grid](int width) {
-		resize_grid(width);
+	const int grid_size = m_ui->grid_size_slider->value();
+	m_ui->cfgs_grid->setIconSize(QSize(grid_size, grid_size));
+	connect(m_ui->grid_size_slider, &QSlider::valueChanged, this, [this](int width) {
+		m_ui->cfgs_grid->setIconSize(QSize(width, width));
 		if (!m_ui->grid_size_slider->isSliderDown()) {
 			WriteSettings();
 		}
@@ -411,6 +360,87 @@ void ConfigurationListWidget::changeEvent(QEvent* event) {
 	}
 }
 
+void ConfigurationListWidget::SetRuntimeDirectory(const QString& directory) {
+	m_runtime_directory = directory;
+	UpdatePrecompileButtons();
+}
+
+void ConfigurationListWidget::SetPrecompileRunning(bool running) {
+	m_precompile_running = running;
+	UpdatePrecompileButtons();
+}
+
+// Each button's tooltip names the game's shader list as it is on disk now. A game that runs from
+// another row (its folder and its archive are two rows) blocks the button like a running precompile:
+// both write the title's caches.
+void ConfigurationListWidget::UpdatePrecompileButtons() {
+	QSet<QString> running_titles;
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		const auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (item->IsRunning()) {
+			running_titles.insert(item->GetInfo().title_id);
+		}
+	}
+	// The Export list buttons need kyty_pipeline_list next to the launcher (or one folder up).
+	const bool can_export =
+	    !m_runtime_directory.isEmpty() && !ShaderListExport::FindTool(QCoreApplication::applicationDirPath()).isEmpty();
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		item->SetPrecompileState(m_runtime_directory,
+		                         m_precompile_running ||
+		                             running_titles.contains(item->GetInfo().title_id),
+		                         can_export);
+	}
+}
+
+bool ConfigurationListWidget::PressPrecompile(const QString& game) {
+	const auto key = PathKey(game);
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (!key.isEmpty() && PathKey(item->GetInfo().game_path) == key) {
+			item->GetPrecompileButton()->click();
+			return true;
+		}
+	}
+	return false;
+}
+
+bool ConfigurationListWidget::IsTitleRunning(const QString& title_id) const {
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		const auto* item = static_cast<const ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (item->IsRunning() && item->GetInfo().title_id == title_id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+ConfigurationItem* ConfigurationListWidget::SelectGame(const QString& game) {
+	const auto key = PathKey(game);
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->topLevelItem(index));
+		if (!key.isEmpty() && PathKey(item->GetInfo().game_path) == key) {
+			m_ui->cfgs_list->setCurrentItem(item);
+			SelectItem(item);
+			return item;
+		}
+	}
+	return nullptr;
+}
+
+bool ConfigurationListWidget::OpenContextMenu(const QString& game) {
+	const auto key = PathKey(game);
+	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
+		auto* item = m_ui->cfgs_list->topLevelItem(index);
+		if (!key.isEmpty() && PathKey(static_cast<ConfigurationItem*>(item)->GetInfo().game_path) == key) {
+			m_ui->cfgs_list->setCurrentItem(item);
+			ShowContextMenu(item); // returns when the menu closes
+			return true;
+		}
+	}
+	return false;
+}
+
 void ConfigurationListWidget::UpdateToolbarIcons() {
 	const auto color = palette().color(QPalette::Window).lightness() < 128 ? QColor(Qt::white)
 	                                                                      : QColor(Qt::black);
@@ -426,6 +456,7 @@ void ConfigurationListWidget::UpdateToolbarIcons() {
 	m_ui->refresh_action->setIcon(m_ui->refresh_button->icon());
 	set_icon(m_ui->global_settings_button, QStringLiteral(":/icons/global-settings.svg"));
 	set_icon(m_ui->input_mapping_button, QStringLiteral(":/icons/input-mapping.svg"));
+	set_icon(m_ui->wheel_button, QStringLiteral(":/icons/racing-wheel.svg"));
 	set_icon(m_ui->edit_button, QStringLiteral(":/icons/edit-configuration.svg"));
 	set_icon(m_ui->delete_button, QStringLiteral(":/icons/remove-configuration.svg"));
 	set_icon(m_ui->trophy_overview_button, QStringLiteral(":/icons/trophy.svg"));
@@ -445,6 +476,13 @@ void ConfigurationListWidget::WriteSettings() {
 	s->setValue("grid_view", m_ui->grid_view_button->isChecked());
 	s->setValue("grid_icon_width", m_ui->grid_size_slider->value());
 	s->remove(CONF_GAME_DIR);
+	s->endGroup();
+
+	s->remove(CONF_ADDCONT);
+	s->beginGroup(CONF_ADDCONT);
+	for (auto it = m_addcont.constBegin(); it != m_addcont.constEnd(); ++it) {
+		s->setValue(it.key(), it.value());
+	}
 	s->endGroup();
 
 	s->remove(CONF_GLOBAL);
@@ -483,12 +521,21 @@ void ConfigurationListWidget::ReadSettings() {
 	m_addons_dir = NormalizeGameDirectory(s->value(CONF_ADDONS_DIR).toString());
 	s->endGroup();
 
+	m_addcont.clear();
+	s->beginGroup(CONF_ADDCONT);
+	for (const auto& title_id: s->childKeys()) {
+		m_addcont.insert(title_id, SettingsStringList(s->value(title_id)));
+	}
+	s->endGroup();
+
 	s->beginGroup(CONF_GLOBAL);
 	if (!s->childKeys().isEmpty()) {
 		m_global_info.ReadSettings(s.get());
 	}
 	m_global_info.controller.ReadSettings(s.get());
 	m_global_info.ReadGlobalOnlySettings(s.get());
+	m_global_info.controller.wheel_config =
+	    QDir(QFileInfo(m_settings_file).absolutePath()).filePath(QStringLiteral("wheel.json"));
 	s->endGroup();
 
 	qDeleteAll(m_custom_infos);
@@ -499,6 +546,9 @@ void ConfigurationListWidget::ReadSettings() {
 	for (int i = 0; i < size; i++) {
 		s->setArrayIndex(i);
 		auto* info = new Configuration;
+		// Game configs saved while the occlusion mode was global have no key: they keep the
+		// global value.
+		info->gpu_occlusion_accurate = m_global_info.gpu_occlusion_accurate;
 		info->ReadSettings(s.get());
 		info->custom_settings = true;
 		if (!info->game_path.isEmpty()) {
@@ -541,12 +591,18 @@ ConfigurationListWidget::CreateConfiguration(const ConfigurationItem& item) cons
 	const auto* custom = m_custom_infos.value(item.GetInfo().game_path);
 	info->CopyGameInfoFrom(item.GetInfo());
 	info->CopyEmulatorSettingsFrom(custom != nullptr ? *custom : m_global_info);
+	if (custom == nullptr) {
+		// No config of its own: the global settings, with the settings this title was tested with
+		// on top. Saving the game's dialog turns them into its own config.
+		info->ApplyRecommendedGameSettings(info->title_id);
+	}
 	info->CopyGlobalOnlySettingsFrom(m_global_info);
 	if (custom != nullptr && !custom->elf.isEmpty()) {
 		info->elf = custom->elf;
 	}
 	info->host_input_mapping = m_global_info.host_input_mapping;
 	info->addons_dir         = m_addons_dir;
+	info->addcont            = m_addcont.value(item.GetInfo().title_id.trimmed().toUpper());
 	return info;
 }
 
@@ -555,6 +611,7 @@ struct GameMetadata {
 	QString title_id;
 	QString gameVersion;
 	QString firmwareVer;
+	bool    pro_supported = false;
 };
 
 static QString GetJsonString(const QJsonObject& obj, const QString& key) {
@@ -648,7 +705,8 @@ static GameMetadata GetGameMetadata(const QByteArray& param_data, const QString&
 	if (ret.gameVersion.isEmpty()) {
 		ret.gameVersion = GetJsonString(root, QStringLiteral("contentVersion"));
 	}
-	ret.firmwareVer = GetFirmwareVersion(root);
+	ret.firmwareVer   = GetFirmwareVersion(root);
+	ret.pro_supported = (root.value(QStringLiteral("attribute3")).toInteger() & (1 << 22)) != 0;
 
 	return ret;
 }
@@ -657,12 +715,13 @@ static void SetGameFiles(Configuration& info, const QString& game_dir, const QSt
                          const GameMetadata& metadata, bool archive) {
 	const QFileInfo game(game_dir);
 
-	info.game_path   = game_path;
-	info.basedir     = archive ? game.absoluteFilePath() : QDir(game_dir).absolutePath();
-	info.name        = metadata.title_name;
-	info.title_id    = metadata.title_id;
-	info.gameVersion = metadata.gameVersion;
-	info.firmwareVer = metadata.firmwareVer;
+	info.game_path     = game_path;
+	info.basedir       = archive ? game.absoluteFilePath() : QDir(game_dir).absolutePath();
+	info.name          = metadata.title_name;
+	info.title_id      = metadata.title_id;
+	info.gameVersion   = metadata.gameVersion;
+	info.firmwareVer   = metadata.firmwareVer;
+	info.pro_supported = metadata.pro_supported;
 
 	if (info.name.isEmpty()) {
 		info.name = archive ? game.completeBaseName() : QDir(game_dir).dirName();
@@ -785,6 +844,16 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		auto* item = new ConfigurationItem(std::move(info), m_ui->cfgs_list);
 		item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
 		                               !item->GetInfo().title_id.trimmed().isEmpty());
+		connect(item->GetPrecompileButton(), &QPushButton::clicked, item, [this, item]() {
+			m_ui->cfgs_list->setCurrentItem(item);
+			SelectItem(item);
+			emit PrecompileShaders();
+		});
+		connect(item->GetExportListButton(), &QPushButton::clicked, item, [this, item]() {
+			m_ui->cfgs_list->setCurrentItem(item);
+			SelectItem(item);
+			emit ExportShaderList();
+		});
 		connect(item->GetStatusCombo(), &QComboBox::currentIndexChanged, item,
 		        [this, item](int /*index*/) {
 			        if (!m_compatibility->IsLocal()) {
@@ -869,6 +938,7 @@ void ConfigurationListWidget::ScanGameDirectory() {
 		m_ui->cfgs_list->sortItems(sort_column, sort_order);
 	}
 	filter_configurations(m_ui->search_line_edit->text());
+	UpdatePrecompileButtons();
 
 	ConfigurationItem* selected_item = nullptr;
 	for (int index = 0; index < m_ui->cfgs_list->topLevelItemCount(); index++) {
@@ -1089,6 +1159,15 @@ void ConfigurationListWidget::edit_input_mapping() {
 	}
 }
 
+void ConfigurationListWidget::edit_wheel() {
+	WheelMappingDialog dialog(m_global_info.controller.wheel_config,
+	                          m_global_info.controller.wheel_enabled, this);
+	if (dialog.exec() == QDialog::Accepted) {
+		m_global_info.controller.wheel_enabled = dialog.Enabled();
+		WriteSettings();
+	}
+}
+
 void ConfigurationListWidget::ViewTrophies() {
 	auto* current = static_cast<ConfigurationItem*>(m_ui->cfgs_list->currentItem());
 	auto* item    = current != nullptr ? current : m_selected_item;
@@ -1270,6 +1349,20 @@ void ConfigurationListWidget::compress_game() {
 	    }));
 }
 
+// Installs (or replaces) the selected game's shader list without running it.
+void ConfigurationListWidget::choose_shader_list() {
+	auto* item = static_cast<ConfigurationItem*>(m_ui->cfgs_list->currentItem());
+	if (item == nullptr || m_precompile_running) {
+		return;
+	}
+
+	// A copy: the row may be rebuilt while the dialogs are open.
+	const auto info = CreateConfiguration(*item);
+	if (!PrecompileDialog::ChooseList(this, m_runtime_directory, *info, false).isEmpty()) {
+		UpdatePrecompileButtons();
+	}
+}
+
 void ConfigurationListWidget::filter_configurations(const QString& text) {
 	const auto query              = text.trimmed();
 	const bool has_query          = !query.isEmpty();
@@ -1303,7 +1396,7 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 	auto* item = static_cast<ConfigurationItem*>(witem);
 	if (item == nullptr) {
 		m_selected_item = nullptr;
-		m_ui->cfgs_list->SetBackgroundImage({});
+		m_ui->game_views->SetBackgroundImage({});
 		m_ui->edit_button->setEnabled(false);
 		m_ui->delete_button->setEnabled(false);
 		emit Select();
@@ -1314,7 +1407,7 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 	m_ui->edit_button->setEnabled(!item->IsRunning());
 
 	m_selected_item = item;
-	m_ui->cfgs_list->SetBackgroundImage(item->GetInfo().basedir);
+	m_ui->game_views->SetBackgroundImage(item->GetInfo().basedir);
 
 	emit Select();
 }
@@ -1340,6 +1433,13 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());
 
 	QAction* action_run = menu.addAction(tr("Run"), this, SIGNAL(Run()));
+	QAction* action_precompile =
+	    menu.addAction(tr("Precompile shaders"), this, SIGNAL(PrecompileShaders()));
+	QAction* action_shader_list =
+	    menu.addAction(tr("Choose shader list..."), this, SLOT(choose_shader_list()));
+	QAction* action_export_list =
+	    menu.addAction(tr("Export shader list..."), this, SIGNAL(ExportShaderList()));
+	action_export_list->setVisible(item != nullptr && !item->GetExportListButton()->isHidden());
 	QAction* action_open_folder =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DirOpenIcon), tr("Open game folder"), this,
 	                   SLOT(open_game_folder()));
@@ -1362,11 +1462,22 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	connect(action_addcont, &QAction::triggered, this,
 	        [this, item = QPointer<ConfigurationItem>(item)]() {
 		        if (item != nullptr) {
-			        auto* dialog = new AdditionalContentDialog(item->GetInfo(), m_addons_dir, this);
+			        const auto title_id = item->GetInfo().title_id.trimmed().toUpper();
+			        auto*      dialog   = new AdditionalContentDialog(
+			            item->GetInfo(), m_addons_dir, m_addcont.value(title_id),
+			            [this, title_id](const QStringList& entries) {
+				            if (entries.isEmpty()) {
+					            m_addcont.remove(title_id);
+				            } else {
+					            m_addcont.insert(title_id, entries);
+				            }
+				            WriteSettings();
+			            },
+			            this);
 			        dialog->show();
 		        }
 	        });
-	action_addcont->setEnabled(item != nullptr);
+	action_addcont->setEnabled(item != nullptr && !item->GetInfo().title_id.trimmed().isEmpty());
 	QAction* action_compress =
 	    menu.addAction(tr("Compress to ZAR..."), this, SLOT(compress_game()));
 	QAction* action_remove_save_data =
@@ -1389,6 +1500,10 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 
 	if (item != nullptr) {
 		action_run->setDisabled(item->IsRunning());
+		// As the row's button: not while the game or a precompile runs.
+		action_precompile->setEnabled(item->GetPrecompileButton()->isEnabled());
+		action_shader_list->setEnabled(item->GetPrecompileButton()->isEnabled());
+		action_export_list->setEnabled(item->GetExportListButton()->isEnabled());
 		const auto& base = item->GetInfo().basedir;
 		action_open_folder->setDisabled(!QDir(base).exists() && !GameContent::IsArchive(base));
 		action_view_trophies->setDisabled(!has_trophy_data);
@@ -1398,6 +1513,9 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 		action_delete->setDisabled(item->IsRunning() || !item->GetInfo().custom_settings);
 	} else {
 		action_run->setDisabled(true);
+		action_precompile->setDisabled(true);
+		action_shader_list->setDisabled(true);
+		action_export_list->setDisabled(true);
 		action_open_folder->setDisabled(true);
 		action_view_trophies->setDisabled(true);
 		action_compress->setDisabled(true);

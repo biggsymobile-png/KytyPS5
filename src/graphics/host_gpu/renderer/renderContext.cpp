@@ -1,7 +1,12 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/staticOnce.h"
+#include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/host_gpu/renderer/cache/faultManager.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/cruzStats.h"
 #include "common/hangTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -13,16 +18,21 @@
 #include "graphics/host_gpu/syncEpoch.h"
 #include "graphics/host_gpu/vramStats.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <fmt/format.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <shared_mutex>
 #include <thread>
 
@@ -110,6 +120,13 @@ void RenderMutex::RequesterUnlock() {
 	m_mutex.Unlock();
 }
 
+NativeRayTracing& RenderContext::GetNativeRayTracing() {
+	if (m_native_ray_tracing == nullptr) {
+		m_native_ray_tracing = std::make_unique<NativeRayTracing>(m_graphics, m_command_scheduler, m_buffer_cache);
+	}
+	return *m_native_ray_tracing;
+}
+
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this),
       m_command_scheduler(*this, graphics, CommandScheduler::Role::Guest),
@@ -117,8 +134,16 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_occlusion_counter(*this), m_lod_stats(*this) {
+      m_occlusion_counter(*this), m_lod_stats(*this),
+      m_bindless_table(graphics, m_command_scheduler, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Bindless table (Senaxx): images the texture cache drops leave the table's slots first.
+	m_texture_cache.on_bindless_unregister = [this](ImageId id, bool replaced) {
+		m_bindless_table.OnImageUnregistered(id, replaced);
+	};
+	m_texture_cache.on_image_views_dropped = [this](std::span<const CachedImageView> views) {
+		return m_bindless_table.ReleaseViews(views);
+	};
 	// What guest write tracking costs on this PC (faultCost.h), measured before the GPU caches
 	// take their first fault.
 	FaultCost::SetThreadDescriber([](char* name, uint64_t size) -> int {
@@ -136,6 +161,36 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		return 1;
 	});
 	FaultCost::RunStartupBenchmark();
+	// KYTY_WAIT_ATTRIB: the command processor's op recording a GPU write (CpGaps' innermost op
+	// scope, needs KYTY_CP_GAP_STATS), and the guest mapping of a region.
+	FaultCost::SetOpDescriber([]() -> const char* {
+		auto* state = CpGaps::t_state;
+		if (state == nullptr) {
+			return "?";
+		}
+		const auto depth = std::min(state->ledger.Depth(), CpGaps::Ledger::MaxDepth);
+		for (uint32_t level = depth; level-- > 0;) {
+			switch (const auto cat = state->ledger.At(level)) {
+				case CpGaps::Cat::GpuWaitDrain:
+				case CpGaps::Cat::GpuWaitOcclusion:
+				case CpGaps::Cat::GpuWaitOther:
+				case CpGaps::Cat::RecorderWait:
+				case CpGaps::Cat::SubmitWait:
+				case CpGaps::Cat::TextureUpload:
+				case CpGaps::Cat::Protect:
+				case CpGaps::Cat::Fault:
+				case CpGaps::Cat::ProgPrepare:
+				case CpGaps::Cat::ProgKey:
+				case CpGaps::Cat::ProgMaterialize:
+				case CpGaps::Cat::ProgPermutation: continue;
+				default: return CpGaps::CatName(cat);
+			}
+		}
+		return "none";
+	});
+	FaultCost::SetRangeDescriber([](uint64_t vaddr, uint64_t* start, uint64_t* size, char* name, uint64_t name_size) {
+		return LibKernel::Memory::DescribeVirtualRange(vaddr, start, size, name, name_size);
+	});
 }
 
 RenderContext::~RenderContext() {
@@ -186,19 +241,58 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+static bool FaultWatchedOutsideEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FAULT_WATCHED_OUTSIDE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
-		return false;
+		// KYTY_FAULT_WATCHED_OUTSIDE=1 (default off; TheCruZ/KytyPS5-GTA b7961f66): cache tracking may
+		// still protect a page whose range left the GPU-mapped set; that fault is ours to resolve,
+		// not a guest access violation.
+		if (!FaultWatchedOutsideEnabled() || !GuestRange {fault_vaddr, fault_size}.Valid()) {
+			return false;
+		}
+		const auto watched = m_page_manager.CountWatchedPages(fault_vaddr, fault_size);
+		if (watched.write == 0 && watched.access == 0) {
+			return false;
+		}
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("RenderContext: resolving a fault on a watched page outside the GPU-mapped ranges "
+			            "(0x%016" PRIx64 ")\n",
+			            fault_vaddr);
+		}
+	}
+	// The access retries once the image write-backs over its page land (upstream 9678c59b7;
+	// only with --readback-storage-images, TextureCache::WriteBackTick is 0 otherwise).
+	if (WaitWriteBacks(fault_vaddr, fault_size)) {
+		return true;
 	}
 	const MemoryStats::ScopedTimer fault_timer(MemoryStats::Counter::FaultNs);
 	const CpGaps::Scope            fault_gap(CpGaps::Cat::Fault);
+	// KYTY_WAIT_ATTRIB: the command processor's faults by call site, page state and region.
+	FaultCost::AttribScope attrib(access == PageFaultAccess::Write ? FaultCost::AttribKind::FaultWrite
+	                                                               : FaultCost::AttribKind::FaultRead,
+	                              FaultCost::InRetriedFault());
+	if (attrib.Active()) {
+		const auto page = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE);
+		attrib.SetAddress(fault_vaddr);
+		attrib.AddFlags((m_buffer_cache.IsRegionGpuModifiedRelaxed(page, TRACKER_PAGE_SIZE) ? FaultCost::AttribBufferGpu : 0u) |
+		                (m_texture_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) ? FaultCost::AttribImageGpu : 0u));
+	}
 	// Live cost numbers (faultCost.h); the slow-PC simulation's wait comes first, outside every lock.
 	const auto start = FaultCost::NowNs();
 	FaultCost::SimulateFault();
-	const bool               map = FaultCost::MapEnabled();
+	const bool               map   = FaultCost::MapEnabled();
+	const bool               split = map || attrib.Active();
 	FaultCost::FaultRecord   record;
 	MemoryStats::Count(access == PageFaultAccess::Write ? MemoryStats::Counter::WriteFaults
 	                                                    : MemoryStats::Counter::ReadFaults);
@@ -206,7 +300,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		// Both caches' releases of the page reach the host once, when the scope ends and no
 		// tracking lock is held (KYTY_DEFER_UNPROTECT).
 		const bool nested = PageManager::InDeferUnprotectScope();
-		if (map) {
+		if (split) {
 			FaultCost::MapInFault(true);
 		}
 		uint64_t mark = map ? FaultCost::NowNs() : 0;
@@ -223,6 +317,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			lap(FaultCost::Part::Buffer);
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 			lap(FaultCost::Part::Texture);
+			// Bindless heap pages (engine method): returns without a lock unless a heap is near.
+			m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 			// The faulting page gets the protection its watchers ask even when neither cache
 			// released anything here: another thread may have released it without having applied
 			// the release yet. A fault inside an enclosing scope (an emulator write between that
@@ -231,7 +327,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			                         TRACKER_PAGE_SIZE, nested);
 		}
 		lap(FaultCost::Part::Reconcile);
-		if (map) {
+		if (split) {
 			FaultCost::MapInFault(false);
 		}
 		if (nested) {
@@ -241,7 +337,13 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	const auto handler_ns  = FaultCost::NowNs() - start;
+	if (access != PageFaultAccess::Write && GuestGpu::IsGpuThread()) {
+		m_buffer_cache.NoteCpFault(fault_vaddr, handler_ns); // KYTY_CP_FAULT_WRITERS
+	}
 	const bool found_dirty = access == PageFaultAccess::Write && MemoryTracker::TakeFaultFoundDirty();
+	if (found_dirty) {
+		attrib.AddFlags(FaultCost::AttribFoundDirty);
+	}
 	FaultCost::NoteFault(handler_ns);
 	if (map) {
 		record.address     = fault_vaddr;
@@ -253,7 +355,151 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+namespace {
+
+// KYTY_STORE_IN_PLACE=1: stores to pages protected because the GPU wrote them; KYTY_STORE_CLEAN=1:
+// stores to CPU-clean pages watched for CPU writes (both default off).
+bool StoreInPlaceGpuWritten() {
+	static constexpr auto enabled_init = [] {
+		const auto* value = std::getenv("KYTY_STORE_IN_PLACE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
+	return enabled;
+}
+
+bool StoreInPlaceClean() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_STORE_CLEAN");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// Stores done in place: each is a round trip to the GPU thread that leaves the page protected. A
+// page the CPU writes over many times (a structure filled field by field) costs more that way than
+// the normal path, after which it is writable: after PageBudget of them within WindowMs, the page's
+// next store takes the normal path. A store site that spends the budget of BulkPages pages within
+// a second is copying in bulk: it takes the normal path for BulkMs (the fork's budgets).
+constexpr uint32_t StorePageBudget = 8;
+constexpr uint64_t StoreWindowMs   = 100;
+constexpr uint32_t StoreBulkPages  = 2;
+constexpr uint64_t StoreBulkMs     = 2000;
+
+bool TakeStoreBudget(uint64_t pc, uint64_t page) {
+	struct PageEntry {
+		uint64_t page     = UINT64_MAX;
+		uint64_t since_ms = 0;
+		uint32_t count    = 0;
+	};
+	struct SiteEntry {
+		uint64_t pc            = 0;
+		uint64_t since_ms      = 0;
+		uint32_t spent         = 0; // pages whose budget it spent since since_ms
+		uint64_t bulk_until_ms = 0;
+	};
+	static std::array<PageEntry, 1024> pages {};
+	static std::array<SiteEntry, 256>  sites {};
+	static std::mutex                  mutex;
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	std::scoped_lock lock(mutex);
+	auto&            site = sites[(pc ^ (pc >> 8u)) % sites.size()];
+	if (site.pc != pc) {
+		site = {pc, now, 0, 0};
+	}
+	if (now < site.bulk_until_ms) {
+		return false;
+	}
+	auto& entry = pages[(page / TRACKER_PAGE_SIZE) % pages.size()];
+	if (entry.page != page || now - entry.since_ms >= StoreWindowMs) {
+		entry = {page, now, 0};
+	}
+	if (entry.count >= StorePageBudget) {
+		// This store takes the normal path, which leaves the page writable.
+		if (now - site.since_ms >= 1000) {
+			site.since_ms = now;
+			site.spent    = 0;
+		}
+		if (++site.spent >= StoreBulkPages) {
+			site.bulk_until_ms = now + StoreBulkMs;
+			site.spent         = 0;
+		}
+		return false;
+	}
+	entry.count++;
+	return true;
+}
+
+std::atomic<uint64_t> g_stores_in_place {0};
+std::atomic<uint64_t> g_stores_declined {0};
+
+} // namespace
+
+bool RenderContext::IsStoreInPlaceCandidate(uint64_t fault_vaddr) noexcept {
+	const bool gpu_written = StoreInPlaceGpuWritten();
+	const bool clean       = StoreInPlaceClean();
+	if ((!gpu_written && !clean) || GuestGpu::IsGpuThread() || !IsMapped(fault_vaddr, 1)) {
+		return false;
+	}
+	if (clean) {
+		return true;
+	}
+	const auto page = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE);
+	return m_buffer_cache.IsRegionGpuModifiedRelaxed(page, TRACKER_PAGE_SIZE);
+}
+
+bool RenderContext::TryStoreInPlace(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr,
+                                    const void* data, uint64_t size) noexcept {
+	if (m_gpu == nullptr || GuestGpu::IsGpuThread() || size == 0 || !IsMapped(vaddr, size)) {
+		return false;
+	}
+	const auto page = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE);
+	if (!TakeStoreBudget(pc, page)) {
+		g_stores_declined.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	const bool gpu_written = StoreInPlaceGpuWritten();
+	const bool clean       = StoreInPlaceClean();
+	bool       written     = false;
+	m_gpu->SendCommandSync([this, vaddr, data, size, gpu_written, clean, &written] {
+		written = m_buffer_cache.StoreInPlace(vaddr, data, size, gpu_written, clean);
+	});
+	if (!written) {
+		g_stores_declined.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	m_bindless_table.OnCpuWrite(vaddr, size);
+	if (const auto n = g_stores_in_place.fetch_add(1, std::memory_order_relaxed) + 1;
+	    (n & (n - 1)) == 0 && n >= 64) {
+		LOGF("Store in place: %" PRIu64 " game-thread stores done on both copies, %" PRIu64
+		     " declined (KYTY_STORE_IN_PLACE / KYTY_STORE_CLEAN)\n",
+		     n, g_stores_declined.load(std::memory_order_relaxed));
+	}
+	return true;
+}
+
+bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
+	const auto tick = m_texture_cache.WriteBackTick(vaddr, size);
+	if (tick == 0) {
+		return false;
+	}
+	// The GPU thread can fault inside a draw, so it submits without running deferred operations.
+	if (GuestGpu::IsGpuThread()) {
+		m_command_scheduler.Wait(tick);
+	} else if (m_gpu != nullptr && tick == m_command_scheduler.CurrentTick()) {
+		m_gpu->SendCommandSync([this, tick] { m_command_scheduler.Wait(tick); });
+	}
+	m_command_scheduler.WaitPriorityOperations(tick);
+	return true;
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	// Host I/O into the range, even one running past its mapping, would fail on its inaccessible
+	// pages, and a later write-back would overwrite it.
+	(void)WaitWriteBacks(vaddr, size);
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
@@ -261,6 +507,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	const PageManager::DeferUnprotectScope defer_unprotect;
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_bindless_table.OnCpuWrite(vaddr, size);
 	return true;
 }
 
@@ -283,11 +530,35 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+std::string RenderContext::DescribeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
+	const auto images = m_texture_cache.DescribeGpuModifiedImages(vaddr, size);
+	return fmt::format("mapped {} gpu_dirty {} pending_pub {} gpu_images [{}] writer {}", IsMapped(vaddr, size) ? 1 : 0,
+	                   m_buffer_cache.HasGpuDirtyBytes(vaddr, size) ? 1 : 0,
+	                   m_buffer_cache.HasPendingBackingPublication(vaddr, size) ? 1 : 0, images,
+	                   m_buffer_cache.DescribeNewestWriter(vaddr));
+}
+
 bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) {
 	if (!GuestGpu::IsGpuThread() || CommandScheduler::InDeferredOperation() ||
 	    !m_command_scheduler.Active() || m_command_scheduler.Current().IsInvalid() ||
-	    !IsMapped(vaddr, size) || m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+	    !IsMapped(vaddr, size)) {
 		return false;
+	}
+	// KYTY_SRT_STALE_IMAGE_READS: GPU-modified images over the range either are no source of its
+	// bytes any more (a CPU write superseded them: the backing read past them is exact, see
+	// LibKernel::Memory::TryReadGpuBackingOverStaleImages) or have their owned bytes moved into the
+	// buffer cache, whose GPU-dirty bytes the download below brings to the backing.
+	const bool stale_image_reads = LibKernel::Memory::SrtStaleImageReadsEnabled();
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		if (!stale_image_reads) {
+			return false;
+		}
+		if (m_texture_cache.IsRegionGpuOwnedForRead(vaddr, size)) {
+			(void)m_texture_cache.MaterializeForRead(vaddr, size);
+			if (m_texture_cache.IsRegionGpuOwnedForRead(vaddr, size)) {
+				return false; // no download layout for an owner: its bytes stay with the image
+			}
+		}
 	}
 
 	// Exact dirty ranges are removed when a download is queued, before its backing publication.
@@ -310,18 +581,52 @@ bool RenderContext::SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size) 
 	// A publication may already have finished since the failed strict read. Such a range is
 	// ready too; callers still retry the actual read and bound their preparation retries.
 	return IsMapped(vaddr, size) && !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
-	       !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
+	       !(stale_image_reads ? m_texture_cache.IsRegionGpuOwnedForRead(vaddr, size)
+	                           : m_texture_cache.IsRegionGpuModified(vaddr, size)) &&
 	       !m_buffer_cache.HasPendingBackingPublication(vaddr, size);
 }
 
+// KYTY_MAP_INVALIDATE=1 (default off in this line; on in the Insomniac title presets): a new
+// mapping is treated as a write of its whole range.
+// Streaming games map the resident part of a texture and leave the rest of its range unmapped
+// (Miles Morales' AMM pool); an image created then read zeros there, and its page watch could not
+// protect pages that had no mapping. When the game maps the rest and loads the finer mips into it
+// (AMPR file reads), no write faulted and the image kept the zeros: shared detail textures whose
+// two finest mips stayed black made car paint black near the camera.
+static bool MapInvalidateEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_MAP_INVALIDATE");
+		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	// GPU mapping changes retire clean-read verdicts (the backing translation has its own
-	// generation in the guest address space).
-	CleanVerdict::Invalidate(vaddr, size, Coherence::Source::MapMemory);
-	m_mapped_ranges.Add(vaddr, size);
-	m_buffer_cache.InvalidateBdaSynchronization();
-	SyncEpoch::Advance();
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		// GPU mapping changes retire clean-read verdicts (the backing translation has its own
+		// generation in the guest address space).
+		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::MapMemory);
+		m_mapped_ranges.Add(vaddr, size);
+		m_buffer_cache.InvalidateBdaSynchronization();
+		SyncEpoch::Advance();
+	}
+	if (!MapInvalidateEnabled() || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// Images and buffers over the new mapping hold the zeros read before it: invalidate them as a
+	// file read into the range does. Untracked images watch the pages again at their refresh, now
+	// that the pages can be protected.
+	const bool images = m_texture_cache.IsRegionRegistered(vaddr, size);
+	if (images) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("MapMemory: 0x%016" PRIx64 "+0x%" PRIx64
+			     " maps into registered images: they are refreshed (KYTY_MAP_INVALIDATE)\n",
+			     vaddr, size);
+		}
+	}
+	(void)InvalidateMemory(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -340,14 +645,42 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
+		// KYTY_UNMAP_DRAIN_SKIP=1 (default off; adapted from TheCruZ/KytyPS5-GTA 1f331bb7): the full
+		// GPU drain is skipped when nothing in the range is owned by GPU work or written by a pending
+		// completion: no GPU-dirty buffer bytes, no GPU-modified image, no pending backing
+		// publication (downloads, side readbacks) and no deferred label write. The GPU never reads
+		// guest memory itself (uploads copy it into cache buffers and images, freed by tick), and
+		// the guest unmaps memory only after the labels of the work that used it. Streaming games
+		// drained the GPU many times per frame here (GTA V: 5-8 ms per frame).
+		static const bool drain_skip = [] {
+			const auto* value = std::getenv("KYTY_UNMAP_DRAIN_SKIP");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		const bool skip_drain = drain_skip && m_command_scheduler.Active() && GuestRange {vaddr, size}.Valid() &&
+		                        !m_buffer_cache.HasGpuDirtyBytes(vaddr, size) &&
+		                        !m_texture_cache.IsRegionGpuModified(vaddr, size) &&
+		                        !m_buffer_cache.HasPendingBackingPublication(vaddr, size) &&
+		                        (m_gpu == nullptr || m_gpu->DeferredLabelTick(vaddr, size) == 0);
+		Common::CruzStats::Add(Common::CruzStats::Counter::UnmapCalls);
+		if (skip_drain) {
+			Profiler::CountFrameEvent(Profiler::FrameEvent::UnmapDrainSkips);
+			Common::CruzStats::Add(Common::CruzStats::Counter::UnmapDrainSkips);
+		} else if (m_command_scheduler.Active()) {
 			Profiler::ScopedGpuWaitReason wait_reason(Profiler::FrameWait::GpuWaitUnmap);
+			const auto                    drain_start = Common::CruzStats::Enabled() ? Common::CruzStats::NowNs() : 0;
 			const auto                    tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
+			if (drain_start != 0) {
+				Common::CruzStats::Add(Common::CruzStats::Counter::UnmapDrainNs,
+				                       static_cast<uint64_t>(Common::CruzStats::NowNs() - drain_start));
+				Common::CruzStats::Add(Common::CruzStats::Counter::UnmapDrains);
+			}
 		}
+		m_buffer_cache.DropLivePages(vaddr, size); // KYTY_BDA_LIVE_PAGES (I-L2)
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		m_bindless_table.UnwatchRange(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		CleanVerdict::Invalidate(vaddr, size, Coherence::Source::UnmapMemory);
 		m_mapped_ranges.Subtract(vaddr, size);
@@ -364,12 +697,23 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
-	if (!m_bda_logged) {
-		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
-		m_bda_logged = true;
-	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_buffer_cache.SynchronizeBdaBuffers(m_mapped_ranges);
+	// KYTY_BDA_LIVE_PAGES (bufferCacheLive.cpp): promoted redirects back, the forced set uploaded.
+	m_buffer_cache.LivePagesPrePass();
+	// KYTY_BDA_ACCESS_TAGS (bufferCacheTags.cpp): 1 = only the pages DMA shaders accessed and new
+	// buffers; verify = the full pass plus the record of what 1 would have skipped.
+	const auto tags = m_buffer_cache.BdaAccessTagsMode();
+	BufferCache::s_tag_hops.prepares.fetch_add(1, std::memory_order_relaxed);
+	if (tags == 1) {
+		(void)m_buffer_cache.SynchronizeBdaTagged(m_mapped_ranges);
+	} else {
+		if (tags == 2) {
+			m_buffer_cache.PrepareBdaTagVerify();
+		}
+		m_buffer_cache.SynchronizeBdaBuffers(m_mapped_ranges);
+		m_buffer_cache.NoteBdaTagFullPass(); // registrations so far are uploaded
+	}
+	m_buffer_cache.ReportBdaTags();
 	m_fault_process_pending = true;
 }
 
@@ -411,6 +755,8 @@ void RenderContext::PrepareHostBackingWrite(uint64_t vaddr, uint64_t size,
                                             HostWriter writer) noexcept {
 	// Only the GPU thread: it alone marks pages GPU-dirty, so the ownership checked below cannot
 	// change before the invalidation (which would then download from a completion runner).
+	// KYTY_BDA_LIVE_PAGES (I-C1): recorded work that reads these pages live completes first.
+	m_buffer_cache.LivePagesBeforeCpWrite(vaddr, size);
 	if (!HostWriteTrackingEnabled() || !GuestGpu::IsGpuThread() || !IsMapped(vaddr, size)) {
 		NoteHostBackingWrite(vaddr, size, writer);
 		return;
@@ -471,9 +817,17 @@ void RenderContext::RunGarbageCollector() {
 	const CpGaps::Scope gap(CpGaps::Cat::Gc);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
-		m_buffer_cache.ProcessFaultBuffer();
+		// KYTY_FAULT_SCAN_MAPPED (faultManager.cpp): the scan is limited to the guest GPU mappings.
+		std::vector<std::pair<uint64_t, uint64_t>> mapped;
+		if (FaultManager::ScanMappedActive()) {
+			std::shared_lock lock(m_mapped_ranges_mutex);
+			mapped.reserve(m_mapped_ranges.Size());
+			m_mapped_ranges.ForEach([&](uint64_t begin, uint64_t end) { mapped.emplace_back(begin, end); });
+		}
+		m_buffer_cache.ProcessFaultBuffer(mapped);
 	}
 	m_texture_cache.ProcessDownloadImages();
+	m_buffer_cache.ProcessPendingBdaSettles(false);
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
 	m_graphics.TrimRetiredImages();

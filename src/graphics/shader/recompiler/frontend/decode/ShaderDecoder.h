@@ -58,7 +58,10 @@ enum class Opcode {
 	S_FF1_I32_B64,
 	S_FLBIT_I32_B32,
 	S_FLBIT_I32_B64,
+	S_FLBIT_I32,
+	S_FLBIT_I32_I64,
 	S_BITREPLICATE_B64_B32,
+	S_QUADMASK_B32,
 	S_QUADMASK_B64,
 	S_GETPC_B64,
 	S_SETPC_B64,
@@ -257,7 +260,9 @@ enum class Opcode {
 	V_MIN_I32,
 	V_MAX_I32,
 	V_MUL_I32_I24,
+	V_MUL_HI_I32_I24,
 	V_MUL_U32_U24,
+	V_MUL_HI_U32_U24,
 	V_MUL_LO_U32,
 	V_MUL_HI_U32,
 	V_MUL_LO_I32,
@@ -266,6 +271,7 @@ enum class Opcode {
 	V_CVT_PK_U8_F32,
 	V_MAD_F32,
 	V_MAD_I16,
+	V_MAD_U16,
 	V_MAD_I32_I24,
 	V_MAD_U32_U24,
 	V_MAD_U64_U32,
@@ -287,16 +293,20 @@ enum class Opcode {
 	V_MIN3_I32,
 	V_MIN3_U32,
 	V_MIN3_F16,
+	V_MIN3_I16,
 	V_MIN3_U16,
 	V_MAX3_F32,
 	V_MAX3_I32,
 	V_MAX3_U32,
 	V_MAX3_F16,
+	V_MAX3_I16,
+	V_MAX3_U16,
 	V_MED3_F32,
 	V_MED3_I32,
 	V_MED3_U32,
 	V_MED3_F16,
 	V_MED3_I16,
+	V_MED3_U16,
 	V_SAD_U32,
 	V_ADD3_U32,
 	V_LSHL_ADD_U32,
@@ -364,6 +374,7 @@ enum class Opcode {
 	V_ASHRREV_I32,
 	V_LSHLREV_B64,
 	V_LSHRREV_B64,
+	V_ASHRREV_I64,
 	V_LSHLREV_B16,
 	V_LSHRREV_B16,
 	V_ASHRREV_I16,
@@ -466,6 +477,7 @@ enum class Opcode {
 	V_CMP_GT_F16,
 	V_CMP_LG_F16,
 	V_CMP_GE_F16,
+	V_CMP_U_F16,
 	V_CMP_NGE_F16,
 	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
@@ -561,6 +573,7 @@ enum class Opcode {
 	BUFFER_LOAD_FORMAT_XYZ,
 	BUFFER_LOAD_FORMAT_XYZW,
 	BUFFER_LOAD_FORMAT_D16_X,
+	BUFFER_LOAD_FORMAT_D16_HI_X,
 	BUFFER_LOAD_FORMAT_D16_XY,
 	BUFFER_LOAD_FORMAT_D16_XYZ,
 	BUFFER_LOAD_FORMAT_D16_XYZW,
@@ -575,7 +588,10 @@ enum class Opcode {
 	BUFFER_STORE_FORMAT_D16_XYZW,
 	BUFFER_LOAD_UBYTE,
 	BUFFER_LOAD_UBYTE_D16,
+	BUFFER_LOAD_UBYTE_D16_HI,
 	BUFFER_LOAD_SBYTE,
+	BUFFER_LOAD_SBYTE_D16,
+	BUFFER_LOAD_SBYTE_D16_HI,
 	BUFFER_LOAD_USHORT,
 	BUFFER_LOAD_SSHORT,
 	BUFFER_LOAD_SHORT_D16,
@@ -694,6 +710,8 @@ enum class Opcode {
 	DS_READ2ST64_B64,
 	DS_READ_B96,
 	DS_READ_B128,
+	// PS5 Pro (Trinity) DS 0xe1: pushes up to eight BVH children on an LDS ring stack and pops one.
+	DS_BVH_STACK_PUSH8_POP1_RTN_B32,
 	DS_WRITE_B8,
 	DS_WRITE_B16,
 	DS_WRITE_B8_D16_HI,
@@ -730,18 +748,13 @@ enum class Opcode {
 	IMAGE_ATOMIC_FMIN,
 	IMAGE_ATOMIC_FMAX,
 	IMAGE_SAMPLE,
-	IMAGE_GATHER4_L,
-	IMAGE_GATHER4_LZ,
-	IMAGE_GATHER4_C,
-	IMAGE_GATHER4_C_L,
-	IMAGE_GATHER4_C_LZ,
-	IMAGE_GATHER4_LZ_O,
-	IMAGE_GATHER4_C_O,
-	IMAGE_GATHER4_C_LZ_O,
-	IMAGE_GATHER4H,
+	IMAGE_GATHER4,
 	// MIMG 0xe6/0xe7: one ray/BVH-node test (RDNA2 ISA 8.2.10). Four result dwords, no sampler.
 	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_BVH64_INTERSECT_RAY,
+	// PS5 Pro (Trinity) MIMG 0xe5: one ray against a BVH8 node (two 4-child boxes, a triangle pair or
+	// an instance). Eleven address dwords, ten result dwords; an instance also rewrites the ray.
+	IMAGE_BVH8_INTERSECT_RAY,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,
@@ -773,7 +786,21 @@ enum class Opcode {
 	S_INST_PREFETCH,
 	S_CLAUSE,
 	S_ENDPGM,
+	// Not an RDNA2 instruction: the emulator's call-split marker (SOPP opcode 0x7f, CallSplit.h).
+	// offset = sub-operation, secondary_offset = word index of its payload, word_count = 1 + payload.
+	S_KYTY_CALL_STATE,
 	EXP,
+	// Added after EXP so the values of the earlier opcodes stay the same.
+	FLAT_LOAD_SHORT_D16_HI,
+	// Pseudo instructions of the native ray tracing patch (RayTracingPatch.h, KYTY_RT_HW); they
+	// never come from guest code. Instruction::offset is the site.
+	RT_INIT,
+	RT_SELECT,
+	RT_LEAF,
+	RT_RESOLVE,
+	RT_EXIT,
+	RT_VERIFY_SAVE,
+	RT_VERIFY_CHECK,
 	COUNT
 };
 
@@ -792,6 +819,10 @@ enum class OperandKind {
 	Scc,
 	M0,
 	PopsExitingWaveId,
+	SharedBase,
+	SharedLimit,
+	PrivateBase,
+	PrivateLimit,
 	Null,
 	Vgpr,
 };
@@ -822,6 +853,39 @@ enum class ImageDimension : uint32_t {
 };
 
 constexpr uint32_t MaxInstructionRawWords       = 5u;
+
+// S_KYTY_CALL_STATE (CallSplit.h): SOPP opcode 0x7f, which RDNA2 does not define. Its word holds
+// the sub-operation in simm[15:12] and the payload length in simm[11:0]; the payload follows.
+constexpr uint32_t CallStateSoppOpcode = 0x7fu;
+// PartitionCompare / PartitionDrop (KYTY_CALL_PARTITIONS, ShaderCalls.h): one payload word, the
+// call's target pair register. Compare sets SCC to whether the pair equals the target the dispatch
+// passes in; Drop reports the pair to the dispatch's report set and drops the active lanes (they
+// leave EXEC for the rest of the program: another dispatch of the shader runs their target).
+// SplitTargetCompare (call-split callee programs, CallSplitPlan.cpp): one payload word, the call's
+// target pair register; sets SCC to whether the pair equals the callee the split dispatch runs
+// (CallSplit::ParamTargetLo/Hi). ShaderAddress: two payload words, a scalar pair register and a byte
+// offset; the pair becomes the shader base plus the offset (S_MOV_B32 semantics: SCC is kept). With
+// both, a callee program carries neither its callee's nor its kernel's guest address as a literal,
+// so its translation and pipeline are the same in every session wherever the game loaded them.
+// SaveChanged (end of a callee program): no payload stores every lane's changed registers; one payload
+// word 1 stores only the lanes whose call matched the callee (KYTY_SHADER_CALLS_SPLIT_SHADED_ONLY).
+enum class CallStateOp : uint32_t {
+	Header             = 1,
+	Save               = 2,
+	SaveChanged        = 3,
+	Probe              = 4,
+	PartitionCompare   = 5,
+	PartitionDrop      = 6,
+	SplitTargetCompare = 7,
+	ShaderAddress      = 8,
+	// KYTY_CALL_LEARN (ShaderCalls.h): one payload word, the target pair register, reported to the
+	// dispatch's report set as PartitionDrop does; the lanes stay (they take the skip path).
+	MissReport         = 9,
+};
+[[nodiscard]] constexpr uint32_t EncodeCallStateWord(CallStateOp op, uint32_t payload_words) {
+	return 0xbf800000u | (CallStateSoppOpcode << 16u) | (static_cast<uint32_t>(op) << 12u) |
+	       (payload_words & 0xfffu);
+}
 constexpr uint32_t MaxImageNsaAddressComponents = 12u;
 
 struct Operand {
@@ -893,7 +957,11 @@ struct Instruction {
 	// status dword in the VGPR right after the data dwords.
 	bool           tfe                                          = false;
 	bool           lwe                                          = false;
+	bool           image_cube                                   = false; // DIM is CUBE.
 	uint32_t       branch_target                                = 0;
+	// The pc the instruction had in the decoded guest code when a rewrite moved it (the native
+	// ray tracing patch); S_GETPC_B64 returns the address after it. UINT32_MAX: not moved.
+	uint32_t       guest_pc                                     = UINT32_MAX;
 	struct {
 		uint32_t target = 0;
 		uint32_t en     = 0;
@@ -908,6 +976,16 @@ struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
 	bool                     has_bvh = false;
+	// The guest TLAS of the native ray tracing patch (RayTracingPatch.h), when applied: the
+	// header address is the 64-bit value at the base of the V# at user data pointer `user_sgpr`
+	// + `vsharp_offset`, plus `header_offset`.
+	struct RayTracingSource {
+		uint32_t user_sgpr     = 0;
+		uint32_t vsharp_offset = 0;
+		uint32_t header_offset = 0;
+		uint32_t root          = 0;
+		bool     valid         = false;
+	} ray_tracing_source;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

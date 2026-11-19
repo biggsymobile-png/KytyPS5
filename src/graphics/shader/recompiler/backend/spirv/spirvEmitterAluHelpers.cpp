@@ -1,6 +1,9 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 
+#include <array>
+#include <atomic>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask) {
@@ -29,6 +32,11 @@ uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_
 	state.builder.AddFunction(spv::OpISub, TypeU32(state), ret, ConstantU32(state, constant),
 	                          value);
 	return ret;
+}
+
+// F32 bits (u32) to f16 bits, rounding toward zero (upstream's helper for 59d8256b3).
+uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
+	return EmitF32ToF16RtzBits(state, EmitBitcastU32ToF32(state, bits));
 }
 
 uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
@@ -137,8 +145,8 @@ F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
 	return EmitClassifyF32Bits(state, EmitBitcastF32ToU32(state, value));
 }
 
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match) {
+static uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
+                                      uint32_t class_match) {
 	const auto selected =
 	    EmitCompareU32Constant(state, spv::OpINotEqual, EmitAndConstant(state, mask, 1u << bit), 0);
 	return EmitLogicalAndBool(state, selected, class_match);
@@ -209,6 +217,13 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	// KYTY_RELAXED_FLOAT (upstream 8dbee8635): native NMin/NMax.
+	if (GetCodegenOptions().relaxed_float) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
+		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
+		return result;
+	}
 	const auto lhs_class = EmitClassifyF32(state, lhs);
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 
@@ -229,7 +244,85 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	return EmitBitcastU32ToF32(state, result_bits);
 }
 
+namespace {
+// Shader-side denormal flushes emitted, by DenormFlushStage (pixel, compute, geometry).
+std::array<std::atomic<uint64_t>, 3> g_denorm_flushes {};
+
+size_t DenormFlushStage(const EmitterState& state) {
+	switch (state.program.stage) {
+		case ShaderType::Pixel: return 0;
+		case ShaderType::Compute: return 1;
+		default: return 2;
+	}
+}
+} // namespace
+
+uint64_t DenormFlushCounter(uint32_t stage_index) {
+	return g_denorm_flushes[stage_index].load(std::memory_order_relaxed);
+}
+
+bool DenormFlushSkipped(const EmitterState& state) {
+	const auto skip = GetCodegenOptions().denorm_flush_skip;
+	return (skip & (1u << DenormFlushStage(state))) != 0u;
+}
+
+bool F32FlushHost(const EmitterState& state, uint8_t op_class) {
+	const auto& options = GetCodegenOptions();
+	return options.f32_flush_host && (options.f32_flush_host_classes & op_class) != 0u &&
+	       !state.requirements.float64;
+}
+
+// KYTY_NATIVE_F16 (Erlou93/KytyPS5-Yotei): V_PK_ADD/MUL/MIN/MAX_F16 as one f16vec2 instruction.
+// The module declares Float16, RoundingModeRTE 16 and SignedZeroInfNanPreserve 16
+// (SpirvRequirements::native_half). Adds and multiplies are NoContraction (the guest rounds each
+// to f16). Checked on an RTX 3090 over all 2^32 lane pairs against the f32 path they replace:
+// add and mul identical, f16 subnormals kept; NMin/NMax identical except the NaN payload when
+// both lanes are NaN (one signaling NaN is quieted by the translator's override as before).
+uint32_t EmitHalfPk(EmitterState& state, HalfPkOp op, uint32_t a, uint32_t b, uint32_t c) {
+	if (state.f16_type == 0) {
+		state.f16_type = state.builder.Type(spv::OpTypeFloat, 16);
+	}
+	if (state.f16_pair_type == 0) {
+		state.f16_pair_type = state.builder.Type(spv::OpTypeVector, state.f16_type, 2);
+	}
+	const auto pair = state.f16_pair_type;
+	const auto ha   = Unary(state, spv::OpBitcast, pair, a);
+	const auto hb   = Unary(state, spv::OpBitcast, pair, b);
+	uint32_t   result = 0;
+	switch (op) {
+		case HalfPkOp::Add:
+		case HalfPkOp::Mul:
+			result = Binary(state, op == HalfPkOp::Add ? spv::OpFAdd : spv::OpFMul, pair, ha, hb);
+			state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+			break;
+		case HalfPkOp::Min:
+		case HalfPkOp::Max:
+			result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpExtInst, pair, result, GlslStd450(state),
+			                          op == HalfPkOp::Max ? GLSLstd450NMax : GLSLstd450NMin, ha, hb);
+			break;
+		case HalfPkOp::Fma: {
+			// V_PK_FMA_F16 / V_PK_FMAC_F16: one fused f16 rounding per lane, as the guest does. The
+			// f32 path rounds once to f16 too, but the driver folds UnpackHalf2x16(PackHalf2x16(x))
+			// back to x, so a chain of emulated packed ops kept f32 precision and range (no f16
+			// overflow to infinity) where the guest rounds every step.
+			const auto hc = Unary(state, spv::OpBitcast, pair, c);
+			result        = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpExtInst, pair, result, GlslStd450(state), GLSLstd450Fma,
+			                          ha, hb, hc);
+			break;
+		}
+	}
+	return Unary(state, spv::OpBitcast, TypeU32(state), result);
+}
+
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	// KYTY_PS_FLUSH / KYTY_CS_FLUSH / KYTY_VS_FLUSH=off (CodegenOptions::denorm_flush_skip), or
+	// KYTY_RELAXED_FLOAT (upstream 8dbee8635: no input denormal flushes).
+	if (DenormFlushSkipped(state) || GetCodegenOptions().relaxed_float) {
+		return value;
+	}
+	g_denorm_flushes[DenormFlushStage(state)].fetch_add(1, std::memory_order_relaxed);
 	// A zero is its own sign bits, so "magnitude below the smallest normal" needs no separate
 	// non-zero test: selecting the sign bits of +-0 returns +-0 unchanged.
 	const auto bits      = state.builder.AllocateId();
@@ -294,3 +387,11 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+uint64_t EmittedDenormFlushes(uint32_t stage_index) {
+	return stage_index < 3u ? Emitter::DenormFlushCounter(stage_index) : 0u;
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv

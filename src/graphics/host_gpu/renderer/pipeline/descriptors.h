@@ -18,6 +18,7 @@
 namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
+struct BindlessHeap;
 
 namespace DrawPrep {
 struct StagePlan;
@@ -47,6 +48,9 @@ struct PreparedBindings {
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+	// KYTY_UNNORMALIZED_FIX: the stage runs a hull shader's normalized-LOD copy
+	// (ShaderProgram::normalized_samplers); its samplers are bound with FORCE_UNNORMALIZED cleared.
+	bool normalize_unnormalized = false;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
@@ -92,6 +96,10 @@ struct PreparedBindings {
 	// (user dwords and mip-statistics fields filled in, memory offsets zero).
 	DrawPrep::StagePlan*                  plan             = nullptr;
 	bool                                  plan_shader_data = false;
+	// Bindless images (Senaxx; RenderExecutor::PrepareBindlessHeaps): flattened-SRT words to patch
+	// (offset, region, entries) and the heaps whose images must be readable for this stage.
+	std::vector<std::array<uint32_t, 3>>  bindless_patches;
+	std::vector<BindlessHeap*>            bindless_heaps;
 };
 
 // NoteBufferOutOfBoundsMode's combination of a V# (OOB_SELECT, stride, swizzle, ADD_TID): the bit
@@ -99,6 +107,8 @@ struct PreparedBindings {
 [[nodiscard]] uint32_t BufferOutOfBoundsCombination(const ShaderBufferResource& descriptor);
 // KYTY_BUFFER_RANGE_FIXES (descriptors.cpp).
 [[nodiscard]] bool BufferRangeFixesEnabled();
+// KYTY_EMIT_SPLIT (descriptors.cpp): 0 off, 1 resolved draws, 2 verify.
+[[nodiscard]] int64_t EmitSplitMode();
 // The final sampler dwords of a program's sampler binding (depth-compare bits cleared unless the
 // shader compares, point filtering forced where the shader needs it): the SamplerCache key.
 [[nodiscard]] ShaderSamplerResource
@@ -119,6 +129,13 @@ bool WriteMipStatsFields(const ShaderRecompiler::IR::CompiledShaderInfo& program
 NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
                 TextureCache::BindingType binding);
 
+// KYTY_DMA_PREFAULT_KB=<n> (default 0, off; usa-ratt/KytyPS5-GT7 d3260d78e): before a shader
+// that reads guest memory through its page table (DMA) runs, the first n KiB its user-data
+// pointers point at are made resident (BufferCache::MakeResident). GT7's light-probe bake reads
+// its per-probe constants that way, a new page per probe; pages it read as zeros wrote whole cubes
+// of NaN (black or tinted lighting, different from load to load).
+void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage);
+
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
 [[nodiscard]] uint32_t
@@ -136,8 +153,15 @@ template <typename T>
 	return result;
 }
 
+// Whether a bindless heap entry with this T# can be held by the set-1 image array `binding`
+// (ir/BindlessBindings.h); anything else samples the placeholder.
+[[nodiscard]] bool BindlessKeyCompatible(const ShaderTextureResource& descriptor, uint32_t binding);
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    bool r128 = false);
+// KYTY_DEPTH_ENCODING_FIELDS: 1 = the T# differs from a supported depth encoding only in fields
+// the texture unit does not use for a non-array 1D/2D resource, 2 = the same with CORNER_SAMPLES
+// set, 0 = anything else (descriptors.cpp).
+[[nodiscard]] uint32_t DepthEncodingFieldsVerdict(const ShaderTextureResource& descriptor, bool r128);
 [[nodiscard]] bool IsSupportedSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
                                                    const ShaderTextureResource& descriptor,
                                                    vk::Format image_format, vk::Format view_format);

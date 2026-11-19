@@ -1,9 +1,12 @@
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/liveSwitch.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -502,6 +505,90 @@ void TestRecordedPreparationCertifies() {
   g_probe_memory = {};
 }
 
+// KYTY_NULL_BUFFER_SHARE: a formatted buffer slot read from user data specializes a null V# (all
+// zeros) like the slot's last live V#; without the switch the null V# is its own specialization.
+void TestNullBufferShare() {
+  using namespace Libs::Graphics::ShaderRecompiler;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto saved = GetCodegenOptions();
+  for (const bool share : {false, true}) {
+    auto options = saved;
+    options.null_buffer_share = share;
+    SetCodegenOptions(options);
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    auto &value_block = AddValueBlock(program);
+    DescriptorSource source;
+    for (uint32_t i = 0; i < 4; ++i) {
+      auto &user_data = value_block.AppendNewInst(
+          ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(i))});
+      source.dwords[i] = Value(&user_data);
+    }
+    source.dword_count = 4;
+    program.descriptor_sources.push_back(source);
+    program.info.buffers.push_back({.source = 0, .read = true, .formatted = true});
+    const auto plan = ExtractResourcePlan(program);
+    // A live V#: base 0x10000, stride 16, 64 records, DST_SEL X,Y,Z,1, format 77, OOB_SELECT 3.
+    const std::array<uint32_t, 4> live{0x10000u, 16u << 16u, 64u,
+                                       (3u << 28u) | (77u << 12u) | 4u | (5u << 3u) | (6u << 6u) | (1u << 9u)};
+    const std::array<uint32_t, 4> null{};
+    ResourceSnapshot live_snapshot, null_snapshot;
+    ResourceSpecialization live_spec, null_spec;
+    Check(MaterializeResources(plan, SrtRuntime{.user_data = live}, live_snapshot, live_spec),
+          "null share: live materialization failed");
+    Check(MaterializeResources(plan, SrtRuntime{.user_data = null}, null_snapshot, null_spec),
+          "null share: null materialization failed");
+    Check(live_spec.buffers.size() == 1 && null_spec.buffers.size() == 1,
+          "null share: one buffer expected");
+    if (share) {
+      Check(null_spec == live_spec, "null share: the null V# did not take the live specialization");
+      Check(std::ranges::all_of(null_snapshot.buffers[0].dwords, [](uint32_t w) { return w == 0u; }),
+            "null share: the null V#'s snapshot must stay null (the renderer binds the null buffer)");
+    } else {
+      Check(!(null_spec == live_spec) && null_spec.buffers[0].zero_stride_oob,
+            "null share off: the null V# must keep its own specialization");
+    }
+    // A raw slot: a live V# with stride 0 and OOB_SELECT 0 (every access out of range) is shared
+    // and bound like a null V#.
+    Program raw_program;
+    raw_program.stage = Libs::Graphics::ShaderType::Compute;
+    raw_program.shader_hash = 0x5ca1ab1e00000001ull;
+    raw_program.srt_plan_complete = true;
+    raw_program.resource_tracking_complete = true;
+    auto &raw_block = AddValueBlock(raw_program);
+    DescriptorSource raw_source;
+    for (uint32_t i = 0; i < 4; ++i) {
+      auto &user_data = raw_block.AppendNewInst(
+          ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(i))});
+      raw_source.dwords[i] = Value(&user_data);
+    }
+    raw_source.dword_count = 4;
+    raw_program.descriptor_sources.push_back(raw_source);
+    raw_program.info.buffers.push_back({.source = 0, .read = true});
+    const auto raw_plan = ExtractResourcePlan(raw_program);
+    const std::array<uint32_t, 4> raw_live{0x20000u, 12u << 16u, 64u, (77u << 12u) | 0xfacu};
+    const std::array<uint32_t, 4> raw_oob{0x30000u, 0u, 64u, (77u << 12u) | 0xfacu};
+    ResourceSnapshot raw_live_snapshot, raw_oob_snapshot;
+    ResourceSpecialization raw_live_spec, raw_oob_spec;
+    Check(MaterializeResources(raw_plan, SrtRuntime{.user_data = raw_live}, raw_live_snapshot,
+                               raw_live_spec) &&
+              MaterializeResources(raw_plan, SrtRuntime{.user_data = raw_oob}, raw_oob_snapshot,
+                                   raw_oob_spec),
+          "null share: raw materialization failed");
+    if (share) {
+      Check(raw_oob_spec == raw_live_spec &&
+                std::ranges::all_of(raw_oob_snapshot.buffers[0].dwords, [](uint32_t w) { return w == 0u; }),
+            "null share: a stride-0 OOB_SELECT-0 raw V# was not shared as null");
+    } else {
+      Check(raw_oob_spec.buffers[0].zero_stride_oob && raw_oob_snapshot.buffers[0].dwords[0] == 0x30000u,
+            "null share off: the stride-0 raw V# must keep its own specialization and words");
+    }
+  }
+  SetCodegenOptions(saved);
+}
+
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
@@ -673,6 +760,81 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan TracedPlan() {
   return ExtractResourcePlan(program);
 }
 
+// KYTY_SRT_GPU_FILL (GpuFillSlots): of three flat reads through one user-data-free table, the
+// one a descriptor uses stays a host value; the one the shader only stores as data may be left
+// to the GPU (1), and so may the one only a buffer store's offset uses (2: the renderer then
+// takes the binding as written whole). A slot is left when the runtime reports its dword
+// GPU-written: the snapshot gets a placeholder and a fill, the other slots their values.
+uint64_t g_gpu_written_address = 0;
+bool GpuWrittenForTest(uint64_t address) { return address == g_gpu_written_address; }
+
+void TestGpuFillSlotsLeaveShaderOnlyReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  alignas(16) static std::array<uint32_t, 4> table{0x1111u, 0x2222u, 0x3333u, 0u};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &value_block = AddValueBlock(program);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarAddress;
+  memory.planning_only = true;
+  program.memory_info.push_back(memory);
+  auto &handle = value_block.AppendNewInst(
+      ValueOpcode::GetAddressResource,
+      {Value(static_cast<uint32_t>(address)), Value(static_cast<uint32_t>(address >> 32u))});
+  auto &srt = value_block.AppendNewInst(ValueOpcode::GetSrtResource);
+  std::array<Value, 3> flat;
+  for (uint32_t i = 0; i < flat.size(); i++) {
+    auto &raw = value_block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                          {Value(&handle), Value(i * 4u), Value(0u), Value(true)});
+    raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40 + i * 4u});
+    program.srt_reads.push_back({Value(&raw), i});
+    flat[i] = Value(&value_block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(i)}));
+  }
+  DescriptorSource source;
+  source.dwords[0] = flat[0];
+  source.dwords[1] = Value(0u);
+  source.dwords[2] = Value(0u);
+  source.dwords[3] = Value(0u);
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  auto &buffer = value_block.AppendNewInst(ValueOpcode::GetBufferResource,
+                                           {flat[0], Value(0u), Value(0u), Value(0u)});
+  value_block.AppendNewInst(ValueOpcode::StoreBufferU32,
+                            {Value(&buffer), Value(0u), flat[2], Value(0u), flat[1], Value(true)});
+  const auto plan = ExtractResourcePlan(program);
+  Check(plan.gpu_fill_slots.size() == 3 && plan.gpu_fill_slots[0] == 0u &&
+            plan.gpu_fill_slots[1] == 1u && plan.gpu_fill_slots[2] == 2u,
+        "GPU-fill slots: the descriptor read is a host value, the others qualify");
+
+  for (const bool fill : {false, true}) {
+    for (const uint32_t written : {0u, 1u, 2u}) {
+      g_gpu_written_address = address + written * 4u;
+      SrtRuntime runtime{};
+      if (fill) {
+        runtime.gpu_written = GpuWrittenForTest;
+        runtime.gpu_fill_store_offsets = true;
+      }
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization),
+            "GPU-fill materialization failed");
+      const bool left = fill && written != 0u;
+      Check(snapshot.flattened_srt.size() == 3 && snapshot.flattened_srt[0] == 0x1111u &&
+                snapshot.flattened_srt[1] == (left && written == 1u ? 0u : 0x2222u) &&
+                snapshot.flattened_srt[2] == (left && written == 2u ? 0u : 0x3333u),
+            "GPU-fill materialization changed a host slot or read a GPU slot");
+      Check(left ? (snapshot.gpu_fills.size() == 1 && snapshot.gpu_fills[0].flat_offset == written &&
+                    snapshot.gpu_fills[0].address == address + written * 4u)
+                 : snapshot.gpu_fills.empty(),
+            "GPU-fill list wrong");
+    }
+  }
+}
+
 void TestTraceReplayMatchesWalk() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   alignas(4096) static std::array<uint32_t, 2048> pages{};
@@ -752,19 +914,317 @@ void TestTraceReplayMatchesWalk() {
   Check(g_probe_memory.strict_failures == 0, "traced refreshes reported failed reads");
 }
 
+// KYTY_MS_DEPTH_SAMPLE0 (usa-ratt/KytyPS5-GT7 round 124): a multisample T# read by an
+// instruction of a single-sample dimension. Depth tiling (a depth or stencil surface): the
+// single-sample dimension the instruction reads (the host binds a copy of the first sample).
+// Render-target tiling, an instruction of a multisample dimension, or the switch off: the
+// multisample dimension, as before.
+// One T# serves an image read in the entry block, an image read only behind a user-data branch,
+// and an image no block lists. With KYTY_SRT_IMAGE_REACH the guarded image reads zero while its
+// block is unreached; the others, and every image with the switch off, keep the T#.
+bool NoSpecializationRead(void *, uint64_t, std::span<uint32_t>) { return false; }
+
+void TestUnreachedImageIgnoresSharedDescriptor(bool image_reach) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::ImageType;
+  using Libs::Graphics::Prospero::TileMode;
+  auto options = Libs::Graphics::ShaderRecompiler::GetCodegenOptions();
+  const auto saved = options;
+  options.srt_image_reach = image_reach;
+  Libs::Graphics::ShaderRecompiler::SetCodegenOptions(options);
+
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 2u;
+  auto &entry = AddValueBlock(program);
+  auto &guarded = AddValueBlock(program);
+  auto &done = AddValueBlock(program);
+  for (uint32_t i = 0; i < 3u; ++i) program.block_info[i].id = i;
+  const uint32_t words[8] = {
+      0x0120fc00u, static_cast<uint32_t>(BufferFormat::k32Float) << 20u | 0xc0000000u,
+      0x021bc1dfu,
+      static_cast<uint32_t>(ImageType::kColor2D) << 28u |
+          static_cast<uint32_t>(TileMode::kRenderTarget) << 20u | 0xfacu,
+      0u, 0u, 0u, 0u};
+  DescriptorSource source;
+  source.dword_count = 8u;
+  for (uint32_t i = 0; i < 8u; ++i) source.dwords[i] = Value(words[i]);
+  program.descriptor_sources.push_back(source);
+  for (uint32_t image = 0; image < 3u; ++image)
+    program.info.images.push_back(
+        {.source = 0u,
+         .resource_class = ImageResourceClass::Sampled,
+         .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+         .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+  for (uint32_t image = 0; image < 2u; ++image)
+    program.memory_info.push_back({.kind = ResourceKind::Image, .resource = image});
+  entry.AppendNewInst(ValueOpcode::ImageRead, {Value(0u), Value(0u), Value(true)})
+      .SetFlags(MemoryFlags{.index = 0});
+  guarded.AppendNewInst(ValueOpcode::ImageRead, {Value(0u), Value(0u), Value(true)})
+      .SetFlags(MemoryFlags{.index = 1});
+  const auto user = Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(1))}));
+  program.block_info[0].condition =
+      Value(&entry.AppendNewInst(ValueOpcode::INotEqual32, {user, Value(0u)}));
+  program.block_info[0].terminator.kind = TerminatorKind::ConditionalBranch;
+  program.block_info[0].terminator.true_block = 1u;
+  program.block_info[0].terminator.false_block = 2u;
+  program.block_info[1].terminator.kind = TerminatorKind::Branch;
+  program.block_info[1].terminator.true_block = 2u;
+  program.block_info[2].terminator.kind = TerminatorKind::Return;
+  auto plan = ExtractResourcePlan(program);
+  Check(!plan.control_flow.empty(), "image reach test plan has no control flow");
+  for (const uint32_t reached : {0u, 1u}) {
+    const std::array<uint32_t, 2> data{0u, reached};
+    const SrtRuntime runtime{.user_data = data,
+                             .read_specialization_memory = NoSpecializationRead};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 3u,
+          "image reach test failed to materialize");
+    for (uint32_t image = 0; image < 3u; ++image) {
+      const bool zero = image_reach && image == 1u && reached == 0u;
+      for (uint32_t i = 0; i < 8u; ++i) {
+        Check(snapshot.images[image].dwords[i] == (zero ? 0u : words[i]),
+              zero ? "unreached image kept the shared descriptor"
+                   : "reached or unlisted image lost the shared descriptor");
+      }
+    }
+  }
+  Libs::Graphics::ShaderRecompiler::SetCodegenOptions(saved);
+}
+
+// KYTY_WORKGROUP_IMAGES with a runtime base and a constant division (upstream de3ed905c): the key
+// (3 + workgroup ID z) * 0xaaaaaaab >> 33 = (3 + z) / 3 over four workgroups reaches rows 1 and 2
+// only, and the key mapping that ends the flattened SRT lists exactly those.
+struct WorkgroupTableMemory {
+  uint64_t base = 0x10000u;
+  std::vector<uint32_t> words;
+};
+
+bool ReadWorkgroupTable(void *userdata, uint64_t address, std::span<uint32_t> values) {
+  const auto &memory = *static_cast<const WorkgroupTableMemory *>(userdata);
+  for (size_t i = 0; i < values.size(); ++i) {
+    const auto index = (address - memory.base) / 4u + i;
+    if (address < memory.base || index >= memory.words.size()) return false;
+    values[i] = memory.words[index];
+  }
+  return true;
+}
+
+void TestWorkgroupDividedImageKeys() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::ImageType;
+  using Libs::Graphics::Prospero::TileMode;
+  constexpr uint32_t table_offset = 0x100u;
+  WorkgroupTableMemory memory;
+  memory.words.resize((table_offset + 4u * 32u) / 4u);
+  for (uint32_t row = 0; row < 4u; ++row) {
+    const uint32_t words[8] = {
+        row + 1u, static_cast<uint32_t>(BufferFormat::k32Float) << 20u, 0u,
+        static_cast<uint32_t>(ImageType::kColor2D) << 28u |
+            static_cast<uint32_t>(TileMode::kRenderTarget) << 20u | 0xfacu,
+        0u, 0u, 0u, 0u};
+    std::copy_n(words, 8, memory.words.begin() + (table_offset + row * 32u) / 4u);
+  }
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  AddValueBlock(program);
+  DescriptorSource table;
+  table.dword_count = 2u;
+  table.dwords.fill(Value(0u));
+  table.dwords[0] = Value(static_cast<uint32_t>(memory.base));
+  program.descriptor_sources.push_back(table);
+  DescriptorSource image;
+  image.dword_count = 8u;
+  image.dwords.fill(Value(0u));
+  auto &indirect = image.indirect_descriptor.emplace();
+  indirect.table_source = 0u;
+  indirect.table_offset = table_offset;
+  indirect.table_stride = 32u;
+  indirect.workgroup_axis = 2u;
+  indirect.selector_first = Value(3u);
+  indirect.workgroup_multiplier = 0xaaaaaaabu;
+  indirect.workgroup_shift = 33u;
+  program.descriptor_sources.push_back(image);
+  program.info.images.push_back(
+      {.source = 1u,
+       .resource_class = ImageResourceClass::Sampled,
+       .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+       .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+  auto plan = ExtractResourcePlan(program);
+  const std::array<uint32_t, 3> groups{1u, 1u, 4u};
+  const SrtRuntime runtime{.userdata = &memory,
+                           .read_specialization_memory = ReadWorkgroupTable,
+                           .workgroup_counts = groups};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "divided workgroup image keys failed to materialize");
+  const auto &flat = snapshot.flattened_srt;
+  const std::array<uint32_t, 5> expected{2u, 1u, 0u, 2u, 1u};
+  Check(flat.size() >= expected.size() &&
+            std::equal(expected.begin(), expected.end(), flat.end() - expected.size()) &&
+            snapshot.images.size() == 2u && snapshot.images[0].dwords[0] == 2u &&
+            snapshot.images[1].dwords[0] == 3u,
+        "divided workgroup image keys enumerated other rows");
+}
+
+void TestMultisampleDepthReadAsSingleSample() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::ImageType;
+  using Libs::Graphics::Prospero::TileMode;
+
+  struct Case {
+    bool enabled;
+    ImageType type;
+    TileMode tile;
+    ImageDimension instruction;
+    ImageDimension expected;
+    const char *text;
+  };
+  const Case cases[] = {
+      {true, ImageType::kColor2DMsaa, TileMode::kDepth, ImageDimension::Dim2D,
+       ImageDimension::Dim2D, "a 2D read of a multisample depth T# is a single-sample 2D image"},
+      {true, ImageType::kColor2DMsaa, TileMode::kDepth, ImageDimension::Dim2DArray,
+       ImageDimension::Dim2D, "a 2D-array read of a multisample depth T# is a 2D image"},
+      {true, ImageType::kColor2DMsaa, TileMode::kDepth, ImageDimension::Dim2DMsaa,
+       ImageDimension::Dim2DMsaa, "a 2D-MSAA read of a multisample depth T# stays multisample"},
+      {true, ImageType::kColor2DMsaaArray, TileMode::kDepth, ImageDimension::Dim2DArray,
+       ImageDimension::Dim2DArray, "a 2D-array read of a multisample depth array is a 2D array"},
+      {true, ImageType::kColor2DMsaaArray, TileMode::kDepth, ImageDimension::Dim2DMsaaArray,
+       ImageDimension::Dim2DMsaaArray, "a 2D-MSAA-array read stays a multisample array"},
+      {true, ImageType::kColor2DMsaa, TileMode::kRenderTarget, ImageDimension::Dim2D,
+       ImageDimension::Dim2DMsaa, "a 2D read of a multisample colour T# keeps its samples"},
+      {false, ImageType::kColor2DMsaa, TileMode::kDepth, ImageDimension::Dim2D,
+       ImageDimension::Dim2DMsaa, "with the switch off a multisample depth T# stays multisample"},
+  };
+  for (const auto &test : cases) {
+    SetMsDepthSample0ForTesting(test.enabled);
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Pixel;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    AddValueBlock(program);
+    DescriptorSource source;
+    source.dword_count = 8;
+    const uint32_t fragments = 1u; // two samples
+    const uint32_t words[8] = {
+        0x0120fc00u, // base address 0x120fc0000 >> 8
+        static_cast<uint32_t>(BufferFormat::k32Float) << 20u | 0xc0000000u, // width - 1 low bits
+        0x021bc1dfu, // width - 1 high bits (1919 >> 2), height - 1 (2159) << 14
+        static_cast<uint32_t>(test.type) << 28u | static_cast<uint32_t>(test.tile) << 20u |
+            fragments << 16u | 0xfacu,
+        0u,
+        fragments << 4u,
+        0u,
+        0u};
+    for (uint32_t i = 0; i < 8; i++) {
+      source.dwords[i] = Value(words[i]);
+    }
+    program.descriptor_sources.push_back(source);
+    program.info.images.push_back(
+        {.source = 0,
+         .resource_class = ImageResourceClass::Sampled,
+         .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+         .dimension = test.instruction});
+    auto plan = ExtractResourcePlan(program);
+    const SrtRuntime runtime{};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization), test.text);
+    Check(specialization.images.size() == 1 &&
+              specialization.images[0].dimension == test.expected,
+          test.text);
+  }
+  SetMsDepthSample0ForTesting(false);
+}
+
+// KYTY_RAW_SMALL_SINT_STORAGE: a write-only 16/8-bit SINT storage image is specialized as a uint
+// storage image (the same low bits through an unsigned view); without the switch, or when the
+// shader also reads it, the program fails as before (Ghost of Yotei's cloud shadow precompute).
+void TestRawSmallSintStorage() {
+  using namespace Libs::Graphics::ShaderRecompiler;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::ImageType;
+  using Libs::Graphics::Prospero::TextureNumericClass;
+  using Libs::Graphics::Prospero::TileMode;
+  const auto saved = GetCodegenOptions();
+  struct Case {
+    bool enabled;
+    BufferFormat format;
+    bool read;
+    bool expected;
+    const char *text;
+  };
+  const Case cases[] = {
+      {false, BufferFormat::k16SInt, false, false, "16-bit SINT storage fails with the switch off"},
+      {true, BufferFormat::k16SInt, false, true, "write-only 16-bit SINT storage is raw uint storage"},
+      {true, BufferFormat::k8SInt, false, true, "write-only 8-bit SINT storage is raw uint storage"},
+      {true, BufferFormat::k16SInt, true, false, "read-write 16-bit SINT storage still fails"},
+  };
+  for (const auto &test : cases) {
+    auto options = saved;
+    options.raw_small_sint_storage = test.enabled;
+    SetCodegenOptions(options);
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    AddValueBlock(program);
+    DescriptorSource source;
+    source.dword_count = 8;
+    const uint32_t words[8] = {
+        0x0120fc00u, // base address 0x120fc0000 >> 8
+        static_cast<uint32_t>(test.format) << 20u | 0xc0000000u, // width - 1 low bits
+        0x007fc07fu, // width 512, height 512
+        static_cast<uint32_t>(ImageType::kColor2D) << 28u |
+            static_cast<uint32_t>(TileMode::kRenderTarget) << 20u | 0xfacu,
+        0u,
+        0u,
+        0u,
+        0u};
+    for (uint32_t i = 0; i < 8; i++) {
+      source.dwords[i] = Value(words[i]);
+    }
+    program.descriptor_sources.push_back(source);
+    program.info.images.push_back({.source = 0,
+                                   .resource_class = ImageResourceClass::Storage,
+                                   .numeric_class = TextureNumericClass::Uint,
+                                   .dimension = ImageDimension::Dim2D,
+                                   .read = test.read,
+                                   .written = true});
+    auto plan = ExtractResourcePlan(program);
+    const SrtRuntime runtime{};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+    Check(materialized == test.expected, test.text);
+    if (materialized) {
+      Check(specialization.images.size() == 1 &&
+                specialization.images[0].numeric_class == TextureNumericClass::Uint,
+            test.text);
+    }
+  }
+  SetCodegenOptions(saved);
+}
+
 } // namespace
 
 namespace Common {
 
-int DbgExitHandler(const char *, int, std::string_view) { std::abort(); }
+void DbgExitHandler(const char *, int, std::string_view) { std::abort(); }
 
-int DbgExitHandler(const char *, int, fmt::text_style, std::string_view) {
-  std::abort();
-}
-
-int DbgExitIfHandler(const char *, const char *, int) { return 1; }
-
-void DbgExit(int) { std::abort(); }
+void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
 } // namespace Common
 
@@ -781,7 +1241,13 @@ int main() {
   TestSpeculativeRuntimeMatchesSerial();
   TestRecordedPreparationCertifies();
   TestTraceReplayMatchesWalk();
+  TestGpuFillSlotsLeaveShaderOnlyReads();
   }
+  TestMultisampleDepthReadAsSingleSample();
+  TestNullBufferShare();
+  TestRawSmallSintStorage();
+  for (const bool image_reach : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(image_reach);
+  TestWorkgroupDividedImageKeys();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

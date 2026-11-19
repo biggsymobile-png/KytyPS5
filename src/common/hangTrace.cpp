@@ -1,7 +1,10 @@
 #include "common/hangTrace.h"
+#include "common/staticOnce.h"
 
+#include "common/compileWatch.h"
 #include "common/cpuPlacement.h"
 #include "common/hangWatchdog.h"
+#include "common/kytyEvents.h"
 
 #include <algorithm>
 #include <array>
@@ -1068,13 +1071,22 @@ bool ImportsEnabled() {
 }
 
 bool CpTraceEnabled() {
-	static const bool enabled = Enabled() && EnvFlag("KYTY_HANG_TRACE_CP", false);
+	static constinit Common::StaticOnce<bool> enabled_once;
+	const bool& enabled = enabled_once.Get([&] { return Enabled() && EnvFlag("KYTY_HANG_TRACE_CP", false); });
 	return enabled;
 }
 
 void SetCpContext(uint32_t queue, uint64_t sequence) {
 	g_cp_queue    = queue;
 	g_cp_sequence = sequence;
+}
+
+uint32_t CpContextQueue() {
+	return g_cp_queue;
+}
+
+uint64_t CpContextSequence() {
+	return g_cp_sequence;
 }
 
 void RecordCp(const CpEvent& event) {
@@ -1899,6 +1911,8 @@ void RecordDoneWait(uint64_t wait_ns) {
 
 void RecordFlip() {
 	HangWatchdog::NoteFlip();
+	CompileWatch::NoteFlip();
+	KytyEvents::NoteFlip();
 	// KYTY_FRAME_TIMES_LOG=<file> (default off, independent of the hang trace): one line per guest
 	// flip, "t_us,interval_us" (present-thread clock), for frame-time percentiles and stutter counts.
 	static FILE* frame_log = [] {

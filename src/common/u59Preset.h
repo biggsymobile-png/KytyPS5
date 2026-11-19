@@ -38,11 +38,33 @@ struct LoadResult {
 };
 
 // Parses preset text. False with `error` set for anything but a JSON object whose keys start with
-// KYTY_ or TRACY_ and whose values are strings (the launcher then applies nothing).
+// KYTY_ or TRACY_ and whose values are strings (the launcher then applies nothing). A trailing comma
+// and // or /* */ comments are accepted; a syntax error names its line and column.
 [[nodiscard]] bool Parse(std::string_view text, std::vector<Entry>& entries, std::string& error);
 
 // The first directory of `dirs` that holds FileName decides; Missing when none does.
 [[nodiscard]] LoadResult Load(const std::vector<std::filesystem::path>& dirs);
+
+// Per-title overrides: u59-preset.<TITLE_ID>.json (same format) next to u59-preset.json. When the
+// launcher starts that title it sets the file's variables over the bundled preset, in that game's
+// process only (e.g. a switch that breaks one game), and names the file in KYTY_TITLE_PRESET, which
+// the emulator prints at startup.
+[[nodiscard]] std::string TitleFileName(std::string_view title_id);
+
+// The title file in the first directory of `dirs` that holds it; Missing when none does, or when
+// the title id is not nine upper-case letters and digits (e.g. PPSA01417).
+[[nodiscard]] LoadResult LoadTitle(const std::vector<std::filesystem::path>& dirs,
+                                   std::string_view                           title_id);
+
+// The title id of a game's sce_sys/param.json text: "titleId", else the nine characters of a
+// "contentId" (XX0000-PPSA01474_00-...); empty when neither is there or the text is not JSON.
+[[nodiscard]] std::string TitleIdFromParamJson(std::string_view text);
+
+// Whether the emulator applies u59-preset.<TITLE_ID>.json itself: only when no launcher named a
+// title preset (KYTY_TITLE_PRESET unset or empty). A launcher older than the per-title presets
+// (int21 and before) starts int22 and later emulators without them; any other value, such as
+// "none", turns the emulator's own load off.
+[[nodiscard]] bool EmulatorTitleFallbackWanted(const char* title_preset_env);
 
 // One paragraph for the launcher (window and log) about a preset that was not applied, naming the
 // file or the directories searched. Empty for Loaded.

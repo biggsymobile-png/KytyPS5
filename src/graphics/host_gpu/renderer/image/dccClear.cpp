@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/liveSwitch.h"
 #include "common/profiler.h"
 #include "gpu_dcc_shaders/gpu_dcc_clear_spv.h"
 #include "gpu_dcc_shaders/gpu_dcc_validate_spv.h"
@@ -14,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <span>
@@ -80,7 +82,8 @@ DccClearHelper::DccClearHelper(GraphicContext& graphics, CommandScheduler& sched
 	create_pipeline(GPU_DCC_CLEAR_SPV, m_clear_pipeline);
 	m_scratch = std::make_unique<Buffer>(
 	    graphics, scheduler, MemoryUsage::DeviceLocal, 0,
-	    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer,
+	    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer |
+	        vk::BufferUsageFlagBits::eTransferSrc,
 	    ScratchSize);
 	m_palette = std::make_unique<Buffer>(
 	    graphics, scheduler, MemoryUsage::DeviceLocal, 0,
@@ -180,8 +183,29 @@ DccClearHelper::Support DccClearHelper::SupportsImage(const Image& image, vk::Fo
 	return Support::Ok;
 }
 
+// KYTY_DCC_PALETTE_REUSE (live, default off): a DCC clear whose view format and decoded clear values
+// equal those of the previous one reuses the palette buffer as it is (only RecordPalette writes it,
+// in queue order) instead of rebuilding it with three barriers, up to six image clears and a copy.
+static Live::Switch g_dcc_palette_reuse("KYTY_DCC_PALETTE_REUSE", Live::ParseDefaultOff);
+
 void DccClearHelper::RecordPalette(vk::CommandBuffer command, vk::Format view_format,
                                    uint32_t texel_bytes, const ClearValues& values) {
+	uint32_t                                               mask = 0;
+	std::array<std::array<uint32_t, 4>, ClearCodes.size()> bits {};
+	for (uint32_t index = 0; index < ClearCodes.size(); ++index) {
+		if (values[index]) {
+			mask |= 1u << index;
+			std::memcpy(bits[index].data(), &*values[index], sizeof(bits[index]));
+		}
+	}
+	if (g_dcc_palette_reuse.On() && m_palette_valid && m_palette_format == view_format &&
+	    m_palette_mask == mask && m_palette_bits == bits) {
+		return;
+	}
+	m_palette_valid  = true;
+	m_palette_format = view_format;
+	m_palette_mask   = mask;
+	m_palette_bits   = bits;
 	auto& slot = m_palette_images->images[view_format];
 	if (slot == nullptr) {
 		slot = std::make_unique<VulkanImage>();
@@ -278,7 +302,8 @@ void DccClearHelper::RecordPalette(vk::CommandBuffer command, vk::Format view_fo
 
 void DccClearHelper::RecordSlice(Image& image, vk::Format view_format, uint32_t layer,
                                  vk::Buffer metadata, uint64_t metadata_offset,
-                                 uint64_t metadata_size, const ClearValues& values) {
+                                 uint64_t metadata_size, const ClearValues& values, bool keep_keys,
+                                 vk::Buffer decision_copy, uint64_t decision_offset) {
 	KYTY_GPU_OP_SITE("dcc.clear");
 	KYTY_PROFILER_DETAIL_FUNCTION();
 	EXIT_IF(SupportsImage(image, view_format, metadata_size) != Support::Ok ||
@@ -303,7 +328,7 @@ void DccClearHelper::RecordSlice(Image& image, vk::Format view_format, uint32_t 
 	                 image.backing.extent.width,
 	                 image.backing.extent.height,
 	                 static_cast<uint32_t>(groups),
-	                 decodable,
+	                 decodable | (keep_keys ? KeepKeysBit : 0u),
 	                 texel_bytes};
 	ImageViewInfo view_info {};
 	view_info.format      = alias;
@@ -391,6 +416,19 @@ void DccClearHelper::RecordSlice(Image& image, vk::Format view_format, uint32_t 
 	complete.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	dependency.pMemoryBarriers = &complete;
 	command.pipelineBarrier2(dependency);
+	if (decision_copy != nullptr) {
+		// The decision's group count (dispatch_args.x) for the verification, read by the host.
+		const vk::BufferCopy copy {0, decision_offset, sizeof(uint32_t)};
+		command.copyBuffer(m_scratch->Handle(), decision_copy, 1, &copy);
+		vk::MemoryBarrier2 host {};
+		host.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		host.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		host.dstStageMask  = vk::PipelineStageFlagBits2::eHost | vk::PipelineStageFlagBits2::eAllCommands;
+		host.dstAccessMask = vk::AccessFlagBits2::eHostRead | vk::AccessFlagBits2::eMemoryRead |
+		                     vk::AccessFlagBits2::eMemoryWrite;
+		dependency.pMemoryBarriers = &host;
+		command.pipelineBarrier2(dependency);
+	}
 }
 
 } // namespace Libs::Graphics

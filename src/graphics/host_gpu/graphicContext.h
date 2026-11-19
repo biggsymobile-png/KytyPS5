@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/queueSubmission.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -46,7 +47,17 @@ struct GraphicContext;
 [[nodiscard]] const void*
 RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
 [[nodiscard]] bool DeviceFaultDiagnosticsEnabled();
+// KYTY_ADDRESS_BINDING_REPORT=1 (diagnostic, default off): VK_EXT_device_address_binding_report.
+// Every GPU virtual address range the driver binds or unbinds for an object is recorded (live
+// ranges, plus a ring of the newest events); a device fault then prints the objects that cover the
+// faulting address, end just below it or were unbound there, with their Kyty names (the names are
+// kept for this report even without the debug dump) and how long before the fault they changed.
+[[nodiscard]] bool AddressBindingReportRequested();
+void               AddressBindingReportCreateMessenger(vk::Instance instance);
+void               AddressBindingReportDump(uint64_t address);
 void DumpDeviceLossDiagnostics(GraphicContext& graphics, uint64_t tick = 0, bool queue_locked = false);
+// A component's own lines for the device-loss report (printed after the device fault; up to 4 notes).
+void SetDeviceLossNote(void (*note)());
 // A thread about to exit on a device loss: lets a device-loss report another thread is writing
 // (the VK_EXT_device_fault vendor dump, _device_fault.nv-gpudmp) finish first. Waits up to
 // `start_ms` for one to begin and then up to 10 s for it to end.
@@ -58,6 +69,18 @@ void WaitForDeviceLossDiagnostics(uint32_t start_ms = 500);
 [[nodiscard]] uint64_t NewestDiagnosticSequence();
 [[nodiscard]] const char* DiagnosticOpName(uint32_t op);
 
+// KYTY_DEAD_VIEW_SCRUB=1 (default off; the GT7 preset; usa-ratt/KytyPS5-GT7 ae60f82a5): destroyed
+// image views are remembered (the last 64K); one named as a rendering attachment or a storage-image
+// descriptor when the command runs is reported ("DEAD image view") and replaced with a null view
+// instead of being left to fault the GPU. The callers check DeadViewScrubEnabled(); the functions
+// themselves always work (tests).
+[[nodiscard]] bool DeadViewScrubEnabled();
+void               NoteImageViewCreated(vk::ImageView view);
+void               NoteImageViewDestroyed(vk::ImageView view, uint64_t guest_address, vk::Format format);
+[[nodiscard]] bool DiagnosticViewIsLive(vk::ImageView view);
+void               ScrubDeadRenderingViews(const vk::RenderingInfo& info, const char* where);
+void ScrubDeadDescriptorViews(const vk::WriteDescriptorSet* writes, uint32_t count, const char* where);
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -67,6 +90,12 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_external_memory_host, requested only with KYTY_INPLACE (InplaceHeap).
+	bool                               external_memory_host_enabled          = false;
+	// KYTY_FULLSCREEN_EXCLUSIVE=0|1 (Windows): the swapchain asks the driver to keep out of exclusive
+	// fullscreen (0) or allows it (1), through VK_EXT_full_screen_exclusive; -1 (unset, or the
+	// extension missing): the driver's own choice.
+	int                                full_screen_exclusive                 = -1;
 	bool                               diagnostic_checkpoints_enabled        = false;
 	bool                               device_fault_enabled                  = false;
 	// KYTY_GPU_BREADCRUMBS (gpuBreadcrumbs.h): VK_AMD_buffer_marker enabled for breadcrumbs, and
@@ -80,9 +109,41 @@ struct GraphicContext {
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
 	bool                               subgroup_size_control_enabled         = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// KYTY_EQAA_MIXED=1 (from usa-ratt/KytyPS5-GT7 18979e65b, df310f7a9): attachments with
+	// different sample counts in one draw (PS5 EQAA: depth at the coverage count, colour at the
+	// fragment count). AMD allows either side to be larger; NV only colour < depth, rasterizing at
+	// the depth count. None: the switch is off or the device has neither extension.
+	enum class MixedAttachmentSamples : uint8_t { None, Amd, Nv };
+	MixedAttachmentSamples             mixed_attachment_samples              = MixedAttachmentSamples::None;
+	// Whether one draw can attach colour and depth at these sample counts (0 colour: depth only).
+	[[nodiscard]] bool AcceptsMixedSamples(uint32_t color_samples,
+	                                       uint32_t depth_samples) const noexcept {
+		if (color_samples == 0 || color_samples == depth_samples) {
+			return true;
+		}
+		switch (mixed_attachment_samples) {
+			case MixedAttachmentSamples::Amd: return true;
+			case MixedAttachmentSamples::Nv: return color_samples < depth_samples;
+			case MixedAttachmentSamples::None: return false;
+		}
+		return false;
+	}
+	// The (raster samples, depth/stencil sample mask, colour sample mask) combinations the device
+	// lists for VK_NV_coverage_reduction_mode's TRUNCATE (colour sample i covered by raster sample
+	// i alone, as the PS5's colour buffer sees only the samples exposed to it; MERGE lets both
+	// triangles of a shared edge blend into its pixels). Empty: MERGE.
+	std::vector<std::array<uint32_t, 3>> coverage_truncate_combinations;
+	[[nodiscard]] bool CoverageTruncate(uint32_t raster, uint32_t depth, uint32_t color) const {
+		for (const auto& combination: coverage_truncate_combinations) {
+			if (combination[0] == raster && (combination[1] & depth) != 0 &&
+			    (combination[2] & color) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
 	bool                               precise_occlusion_enabled             = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
-	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	// VK_EXT_color_write_enable: draws turn attachments without an image off through dynamic
@@ -92,6 +153,11 @@ struct GraphicContext {
 	// VK_EXT_depth_clip_enable: depth clipping set apart from the always-on depth clamp (the DB's
 	// behaviour). Without it, pipelines clamp only where the guest turns Z clipping off.
 	bool                               depth_clip_enable_enabled             = false;
+	// robustBufferAccess2 (ee034be4b): out-of-range storage accesses read zero / drop writes.
+	bool                               robust_buffer_access_enabled          = false;
+	// R8/R8G8 sRGB formats sample with linear filtering (e914ec6db): 8 and 8_8 sRGB textures.
+	bool                               r8_srgb_views                         = false;
+	bool                               r8g8_srgb_views                       = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	// shaderStorageImageReadWithoutFormat (TileManager::TileFromImage).
@@ -102,6 +168,16 @@ struct GraphicContext {
 	// made it a hard requirement in fd66f580b; shaders that index storage-buffer arrays
 	// non-uniformly need it).
 	bool                               storage_buffer_array_non_uniform_indexing_enabled = false;
+	// Descriptor indexing for bindless images (BindlessTable, Senaxx): runtime arrays indexed
+	// non-uniformly, partially bound, updated after bind. Enabled when supported unless
+	// KYTY_BINDLESS=0. The limit is the update-after-bind sampled images one set and one stage may
+	// hold; bindless_layout is created on first use (BindlessSetLayout, under its mutex).
+	bool                               bindless_enabled                      = false;
+	uint32_t                           bindless_max_sampled_images           = 0;
+	// KYTY_BINDLESS_SAMPLERS: the update-after-bind samplers one set and one stage may hold.
+	uint32_t                           bindless_max_samplers                 = 0;
+	vk::DescriptorSetLayout            bindless_layout                       = nullptr;
+	Common::Mutex                      bindless_layout_mutex;
 	// VK_KHR_maintenance8: vkCmdCopyImage between a depth aspect and a compatible color format
 	// (D32 <-> R32, D16 <-> R16). KYTY_DIRECT_IMAGE_COPY_M8=0 leaves the extension disabled.
 	bool                               maintenance8_enabled                  = false;
@@ -121,6 +197,8 @@ struct GraphicContext {
 	// KYTY_TEXTURE_SPARSE_RESIDENCY=1: sparseBinding + sparseResidencyImage2D enabled, strict.
 	bool                               sparse_residency_image_enabled        = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// KYTY_RT_HW: VK_KHR_acceleration_structure + VK_KHR_ray_query enabled (NativeRayTracing).
+	bool                                      native_ray_tracing_enabled            = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -166,6 +244,14 @@ struct GraphicContext {
 			physical_device.getFormatProperties(format, &it->second);
 		}
 		return it->second;
+	}
+
+	// Sampled views of format filter linearly, as guest samplers may.
+	[[nodiscard]] bool SamplesFiltered(vk::Format format) const {
+		constexpr vk::FormatFeatureFlags features =
+		    vk::FormatFeatureFlagBits::eSampledImage |
+		    vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+		return (GetFormatProperties(format).optimalTilingFeatures & features) == features;
 	}
 
 	[[nodiscard]] vk::Result GetImageFormatProperties(vk::Format format, vk::ImageType type,

@@ -70,6 +70,15 @@ void TestParse() {
 	Check(!Parse("{\"KYTY_A\": \"1\"", entries, error) && entries.empty() && !error.empty(),
 	      "truncated JSON is invalid");
 	Check(!Parse(R"(["KYTY_A"])", entries, error), "an array is not a preset");
+	// Issue #85: keys added by hand with a comma after the last one.
+	Check(Parse("{\n  \"KYTY_A\": \"1\",\n  \"KYTY_B\": \"2\",\n}\n", entries, error) &&
+	          entries.size() == 2 && entries[1].key == "KYTY_B",
+	      "a trailing comma after the last key is accepted");
+	Check(Parse("{\n  // added by me\n  \"KYTY_A\": \"1\"\n}", entries, error) && entries.size() == 1,
+	      "a // comment line is accepted");
+	Check(!Parse("{\n  \"KYTY_A\": \"1\"\n  \"KYTY_B\": \"2\"\n}", entries, error) &&
+	          entries.empty() && Contains(error, "line 3"),
+	      "a missing comma is rejected and its line is named");
 	Check(!Parse(R"({"KYTY_A": "1", "PATH": "x"})", entries, error) && entries.empty() &&
 	          Contains(error, "PATH"),
 	      "a key outside KYTY_/TRACY_ rejects the whole file and is named");
@@ -114,6 +123,58 @@ void TestLoad() {
 	      "the Invalid message names the file and the reason");
 
 	std::filesystem::remove_all(root, ec);
+}
+
+// u59-preset.<TITLE_ID>.json: found like the bundled preset, only for a well-formed title id.
+void TestLoadTitle() {
+	const auto root = std::filesystem::temp_directory_path() /
+	                  ("kyty_u59_title_preset_tests_" + std::to_string(KYTY_TEST_PID));
+	std::error_code ec;
+	std::filesystem::remove_all(root, ec);
+	const auto first  = root / "launcher";
+	const auto second = root;
+	std::filesystem::create_directories(first, ec);
+	Check(!ec, "the test can create its directories");
+
+	Check(TitleFileName("PPSA01417") == "u59-preset.PPSA01417.json", "the title file name");
+	Check(LoadTitle({first, second}, "PPSA01417").status == Status::Missing,
+	      "no title file: Missing");
+	WriteFile(second / "u59-preset.PPSA01417.json", R"({"KYTY_DRAW_RUN": "0"})");
+	const auto title = LoadTitle({first, second}, "PPSA01417");
+	Check(title.status == Status::Loaded && title.entries.size() == 1 &&
+	          title.entries[0].key == "KYTY_DRAW_RUN" && title.entries[0].value == "0" &&
+	          title.path == second / "u59-preset.PPSA01417.json",
+	      "the title file one folder up is found");
+	Check(LoadTitle({first, second}, "PPSA21567").status == Status::Missing,
+	      "another title does not take this title's file");
+	// The title presets this repository ships parse.
+	for (const char* id: {"PPSA01340", "PPSA01341", "PPSA01342", "PPSA01417", "PPSA01474", "PPSA03671", "PPSA08705"}) {
+		const auto shipped = LoadTitle({std::filesystem::path(KYTY_U59_PRESET_DIR)}, id);
+		Check(shipped.status == Status::Loaded && !shipped.entries.empty(),
+		      "every shipped tools/u59-preset.<TITLE_ID>.json loads");
+	}
+	for (const char* bad: {"", "PPSA0141", "../PPSA0141", "ppsa01417", "PPSA01417x"}) {
+		Check(LoadTitle({first, second}, bad).status == Status::Missing,
+		      "a malformed title id loads nothing");
+	}
+	std::filesystem::remove_all(root, ec);
+}
+
+// The emulator's own load of the title preset when the launcher did not apply it.
+void TestEmulatorTitleFallback() {
+	Check(TitleIdFromParamJson(R"({"titleId": "PPSA01474", "contentId": "UP9000-PPSA01474_00-RATCHETPS5000000"})") ==
+	          "PPSA01474",
+	      "param.json titleId is the title id");
+	Check(TitleIdFromParamJson(R"({"contentId": "UP9000-PPSA01417_00-0000000000000000"})") == "PPSA01417",
+	      "without titleId, the contentId's nine characters are the title id");
+	Check(TitleIdFromParamJson(R"({"contentId": "short"})").empty(), "a malformed contentId gives nothing");
+	Check(TitleIdFromParamJson("not json").empty(), "text that is not JSON gives nothing");
+	Check(TitleIdFromParamJson("[]").empty(), "a JSON array gives nothing");
+	Check(EmulatorTitleFallbackWanted(nullptr) && EmulatorTitleFallbackWanted(""),
+	      "no KYTY_TITLE_PRESET (an int21 launcher, a direct start): the emulator loads the file");
+	Check(!EmulatorTitleFallbackWanted("C:/Kyty/u59-preset.PPSA01474.json"),
+	      "a launcher that applied the file is not overridden");
+	Check(!EmulatorTitleFallbackWanted("none"), "KYTY_TITLE_PRESET=none turns the emulator's load off");
 }
 
 // The preset this repository ships parses, covers every marker and sets what the defaults need.
@@ -237,6 +298,8 @@ void TestCodegenDefaults() {
 int main() {
 	TestParse();
 	TestLoad();
+	TestLoadTitle();
+	TestEmulatorTitleFallback();
 	TestShippedPreset();
 	TestTextureSparseResidency();
 	TestStartupWarnings();

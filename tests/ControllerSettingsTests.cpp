@@ -27,6 +27,7 @@ bool                               haptics_handles_rumble = false;
 std::array<Rumble, 6>               pad_rumble {};
 std::vector<int>                    closed_pads;
 std::array<std::array<Uint8, 3>, 6> pad_colors {};
+std::array<bool, 6>                 mono_led {};
 } // namespace
 
 namespace Fake {
@@ -66,6 +67,12 @@ void CloseGamepad(SDL_Gamepad* pad) {
 	closed_pads.push_back(static_cast<int>(reinterpret_cast<uintptr_t>(pad)));
 }
 void Delay(Uint32) {}
+SDL_PropertiesID GetGamepadProperties(SDL_Gamepad* pad) {
+	return static_cast<SDL_PropertiesID>(reinterpret_cast<uintptr_t>(pad));
+}
+bool GetBooleanProperty(SDL_PropertiesID pad, const char* name, bool) {
+	return std::strcmp(name, SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN) == 0 && mono_led[pad];
+}
 } // namespace Fake
 
 #define SDL_GetTicks                Fake::GetTicks
@@ -78,6 +85,8 @@ void Delay(Uint32) {}
 #define SDL_SetGamepadSensorEnabled Fake::SetGamepadSensorEnabled
 #define SDL_CloseGamepad            Fake::CloseGamepad
 #define SDL_Delay                   Fake::Delay
+#define SDL_GetGamepadProperties    Fake::GetGamepadProperties
+#define SDL_GetBooleanProperty      Fake::GetBooleanProperty
 #include "libs/controller.cpp"
 #undef SDL_GetTicks
 #undef SDL_GetGamepadFromID
@@ -89,6 +98,8 @@ void Delay(Uint32) {}
 #undef SDL_SetGamepadSensorEnabled
 #undef SDL_CloseGamepad
 #undef SDL_Delay
+#undef SDL_GetGamepadProperties
+#undef SDL_GetBooleanProperty
 
 namespace Libs::Controller {
 // No virtual headset in these tests (padVr.cpp is not linked here).
@@ -207,6 +218,25 @@ void TestPadPortOwnership() {
 	Check(PadOpen(user, 0, 0, nullptr) == handle && PadReadState(handle, &data) == 0,
 	      "a closed port could not reopen");
 	Shutdown();
+}
+
+void TestSpecialPortWithoutDevice() {
+	Controller controller;
+	const int user = Config::GetUserId();
+	Check(PadOpenExt(user, 2, 0, nullptr) == PAD_ERROR_DEVICE_NOT_CONNECTED,
+	      "a third-party controller port opened without a device");
+	const int special = PadOpen(user, 2, 0, nullptr);
+	Check(special > 1 && PadGetHandle(user, 2, 0) == special,
+	      "the special port did not open its own handle");
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	PadData data {};
+	Check(PadReadState(special, &data) == OK && !data.connected && data.buttons == 0,
+	      "host input reached the special port");
+	Check(PadReadState(1, &data) == OK && data.connected && data.buttons == PAD_BUTTON_CROSS,
+	      "the special port took the standard pad");
+	Check(PadClose(special) == OK && PadGetHandle(user, 2, 0) == PAD_ERROR_NO_HANDLE &&
+	          PadGetHandle(user, 0, 0) == 1,
+	      "closing the special port changed the standard one");
 }
 
 void TestSettingCycles() {
@@ -414,6 +444,18 @@ void TestIndependentOutputsAndPadSwitch() {
 	}
 }
 
+void TestMonoLedPadGetsNoLightBar() {
+	Controller             controller;
+	const PadLightBarParam first {10, 20, 30, 0};
+	const PadLightBarParam second {40, 50, 60, 0};
+	Check(PadSetLightBar(1, &first) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
+	      "a pad without an LED capability did not receive the light bar");
+	mono_led[1] = true;
+	Check(PadSetLightBar(1, &second) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
+	      "a mono-LED pad received the light bar");
+	mono_led[1] = false;
+}
+
 void TestPlayerUserIds() {
 	Check(Config::IsConfiguredUserIdValid(Config::MAX_USER_ID) &&
 	          !Config::IsConfiguredUserIdValid(Config::MAX_USER_ID + 1) &&
@@ -619,19 +661,115 @@ void TestTriggerEffectState() {
 	GetTriggerEffectState(state);
 	Check(state[0] == 7, "muting trigger effects changed the reported state");
 }
+
+// KYTY_PAD_SCRIPT entries: buttons, l2/r2, held sticks and hold times.
+void TestPadScriptEntries() {
+	const auto parse = [](const char* text, PadScriptEvent* event) {
+		*event = {};
+		return PadScriptParseEntry(text, std::strlen(text), event);
+	};
+	PadScriptEvent e;
+	Check(parse("20:cross", &e) && e.button == PAD_BUTTON_CROSS && e.at == 20.0 && !e.by_flip &&
+	          e.hold_us == 300000 && e.stick == 0,
+	      "a plain press did not parse with the default hold");
+	Check(parse("f1200:r2:2000", &e) && e.button == PAD_BUTTON_R2 && e.by_flip && e.at == 1200.0 &&
+	          e.hold_us == 2000000,
+	      "a timed R2 hold did not parse");
+	Check(parse("40.5:lstick=128/0:2500", &e) && e.stick == 1 && e.stick_x == 128 && e.stick_y == 0 &&
+	          e.button == 0 && e.hold_us == 2500000 && e.at == 40.5,
+	      "a held left stick did not parse");
+	Check(parse("1:rstick=255/128", &e) && e.stick == 2 && e.stick_x == 255 && e.hold_us == 300000,
+	      "a right stick push did not parse");
+	Check(!parse("1:lstick=300/0", &e) && !parse("1:lstick=12", &e) && !parse("1:cross:0", &e) &&
+	          !parse("1:cross:x", &e) && !parse("cross", &e) && !parse("1:l3", &e),
+	      "a malformed entry parsed");
+	PadScriptEvent action;
+	Check(PadScriptParseAction("lstick=0/128:900", 16, &action) && action.stick == 1 && action.stick_x == 0 &&
+	          action.hold_us == 900000,
+	      "a trigger-file stick action did not parse");
+
+	// Holds: the stick entry fired last wins while both hold; l2/r2 count as buttons.
+	g_pad_script.clear();
+	g_pad_start_us = 0;
+	PadScriptEvent up;
+	parse("1:lstick=128/0:3000", &up);
+	PadScriptEvent left;
+	parse("2:lstick=0/128:500", &left);
+	PadScriptEvent r2;
+	parse("1.5:r2:1000", &r2);
+	g_pad_script = {up, left, r2};
+	auto held = PadScriptHeldAt(500000, 0);
+	Check(!held.stick[0] && held.buttons == 0, "an entry held before its time");
+	held = PadScriptHeldAt(1600000, 0);
+	Check(held.stick[0] && held.y[0] == 0 && held.buttons == PAD_BUTTON_R2, "the stick and R2 holds were missing");
+	held = PadScriptHeldAt(2100000, 0);
+	Check(held.stick[0] && held.x[0] == 0 && held.y[0] == 128, "the later stick entry did not win");
+	held = PadScriptHeldAt(2700000, 0);
+	Check(held.stick[0] && held.y[0] == 0 && held.buttons == 0, "expired holds stayed or the earlier stick was lost");
+	// Holds count from the poll that fired them (1.6 s here).
+	held = PadScriptHeldAt(4500000, 0);
+	Check(held.stick[0], "a stick hold ended early");
+	held = PadScriptHeldAt(4700000, 0);
+	Check(!held.stick[0], "a stick hold outlived its time");
+	g_pad_script.clear();
+}
+
+void TestUnreadPressSurvivesStickBurst() {
+	// Our coalescing is behind KYTY_PAD_STATE_COALESCE=1 (default off; upstream 39faa62eb).
+	const char* coalesce = std::getenv("KYTY_PAD_STATE_COALESCE");
+	if (coalesce == nullptr || std::strcmp(coalesce, "1") != 0) {
+		return;
+	}
+
+	Controller              controller;
+	std::array<PadData, 64> data {};
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	for (int value = 0; value < 100; value++) {
+		SetAxis(1, Axis::LeftX, value);
+	}
+	SetButton(1, PAD_BUTTON_CROSS, false);
+	for (int value = 100; value < 200; value++) {
+		SetAxis(1, Axis::LeftX, value);
+	}
+	Check(PadRead(1, data.data(), 64) == 2 && data[0].buttons == PAD_BUTTON_CROSS &&
+	          data[0].left_stick_x == 99 && data[1].buttons == 0 && data[1].left_stick_x == 199,
+	      "a stick burst pushed an unread press out of the pad history");
+	SetAxis(1, Axis::LeftX, 50);
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	Check(PadRead(1, data.data(), 64) == 2 && data[0].buttons == 0 &&
+	          data[0].left_stick_x == 50 && data[1].buttons == PAD_BUTTON_CROSS,
+	      "a stick move after a read did not add a sample");
+}
+
+void TestTouchWithoutClick() {
+	Controller controller;
+	PadData    data {};
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 1, true, 0.2f, 0.5f, false);
+	Check(PadReadState(1, &data) == 0 && data.touch_data.touch_num == 1 && data.buttons == 0,
+	      "a touch without a click pressed the touch pad button");
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 0, true, 0.25f, 0.5f);
+	Check(PadReadState(1, &data) == 0 && data.buttons == PAD_BUTTON_TOUCH_PAD,
+	      "a host input touch did not press the touch pad button");
+}
+
 } // namespace
 
 int main() {
 	Config::Initialize();
+	TestPadScriptEntries();
 	TestPlayerUserIds();
 	TestPadPortOwnership();
+	TestSpecialPortWithoutDevice();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
 	// Each following test initializes another controller and requires strong defaults.
 	TestVibrationLifetime();
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
+	TestMonoLedPadGetsNoLightBar();
 	TestTriggerEffectState();
+	TestUnreadPressSurvivesStickBurst();
+	TestTouchWithoutClick();
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();
 	Config::Shutdown();

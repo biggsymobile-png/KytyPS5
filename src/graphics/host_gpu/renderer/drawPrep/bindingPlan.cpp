@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "kernel/memory.h"
 
@@ -232,6 +233,14 @@ bool PlanBufferWrites(const CompiledShaderInfo& program, const ResourceSnapshot&
 bool PredictTargets(const GraphicContext& graphics, const HW::Context& ctx,
                     const PreparedDraw& prepared, PipelineCache::PipelineTargets& targets) {
 	targets = {};
+	// KYTY_LAYER_CLAMP: the key of a draw that exports the layer index takes the bound layer count,
+	// which only the resolution knows: the serial path.
+	if (ShaderRecompiler::GetCodegenOptions().layer_clamp && prepared.vertex_info.stage &&
+	    std::ranges::any_of(prepared.vertex_info.stage.program->info.outputs, [](const auto& output) {
+		    return output.kind == ShaderRecompiler::IR::StageOutputKind::Layer;
+	    })) {
+		return false;
+	}
 	uint32_t mrt_mask = 0;
 	if (prepared.pixel_active) {
 		for (const auto& output: prepared.pixel_info.stage.program->info.outputs) {
@@ -245,6 +254,10 @@ bool PredictTargets(const GraphicContext& graphics, const HW::Context& ctx,
 	}
 	if (SkipInactivePixelShadersEnabled()) {
 		mrt_mask &= DrawColorOutputFilter(ctx); // as PrepareDrawRenderState
+	}
+	// KYTY_OBJPRIM_ID: the slot of the hardware ObjPrimID write (not a pixel-shader export).
+	if (prepared.pixel_active && prepared.pixel_info.HasObjprimOutput()) {
+		mrt_mask |= 1u << prepared.pixel_info.objprim_slot;
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((mrt_mask & (1u << slot)) == 0) {
@@ -300,8 +313,11 @@ void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& reg
 	              BindingPlan& plan, bool prefetch_only = false) {
 	using E = Profiler::FrameEvent;
 	// Rare (a pipeline not created yet, the map lock busy): shared totals are fine here.
-	const auto abstain = [prefetch_only](E event) {
+	const auto abstain = [prefetch_only](E event, size_t reason = 5) {
 		if (prefetch_only) return;
+		if (event != E::DrawPrepBindingAbstainPipelineBusy) {
+			g_binding_totals.pipeline_abstain_reasons[reason].fetch_add(1, std::memory_order_relaxed);
+		}
 		Profiler::CountFrameEvent(event);
 		(event == E::DrawPrepBindingAbstainPipelineBusy ? g_binding_totals.pipeline_busy
 		                                                : g_binding_totals.pipeline_abstains)
@@ -310,13 +326,13 @@ void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& reg
 	const auto& ctx   = registers.context;
 	const auto& ucfg  = registers.user_config;
 	if (!DrawTopology(ucfg, plan.topology)) {
-		return abstain(E::DrawPrepBindingAbstainPipeline);
+		return abstain(E::DrawPrepBindingAbstainPipeline, 0);
 	}
 	plan.primitive_restart = false;
 	if (index_args != nullptr) {
 		const auto element_size = IndexElementSize(index_args->index_type_and_size);
 		if (element_size == 0) {
-			return abstain(E::DrawPrepBindingAbstainPipeline);
+			return abstain(E::DrawPrepBindingAbstainPipeline, 1);
 		}
 		const bool allow_custom = MeshPrimitiveRestartEnabled() &&
 		                          prepared.vertex_info.stage.program->stage == ShaderType::Mesh;
@@ -324,11 +340,11 @@ void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& reg
 			case RestartDecision::Disabled: break;
 			case RestartDecision::Enabled: plan.primitive_restart = true; break;
 			case RestartDecision::Scan:
-			case RestartDecision::Unsupported: return abstain(E::DrawPrepBindingAbstainPipeline);
+			case RestartDecision::Unsupported: return abstain(E::DrawPrepBindingAbstainPipeline, 2);
 		}
 	}
 	if (!PredictTargets(*context.graphics, ctx, prepared, plan.targets)) {
-		return abstain(E::DrawPrepBindingAbstainPipeline);
+		return abstain(E::DrawPrepBindingAbstainPipeline, 3);
 	}
 	auto programs = prepared.programs;
 	if (plan.plain_pixel) {
@@ -360,7 +376,7 @@ void PlanPipeline(const BindingPlanContext& context, const RegisterSnapshot& reg
 			}
 			return abstain(E::DrawPrepBindingAbstainPipeline);
 		case PipelineCache::PlanLookup::Unsupported:
-			return abstain(E::DrawPrepBindingAbstainPipeline);
+			return abstain(E::DrawPrepBindingAbstainPipeline, 4);
 	}
 }
 
@@ -535,7 +551,8 @@ BindingTotals& GetBindingTotals() {
 
 void PrefetchBindingPipeline(const BindingPlanContext& context, const RegisterSnapshot& registers,
                              const DrawIndexArgs* index_args, const PreparedDraw& prepared) {
-	if (!context.pipelines->PipelinePrefetchEnabled() || !prepared.ok) return;
+	// KYTY_DRAW_PREP_TESS: a tessellated draw's three vertex stages are not planned.
+	if (!context.pipelines->PipelinePrefetchEnabled() || !prepared.ok || prepared.vertex_stages != 1) return;
 	// A regular pipeline binding plan below already requests the same key.
 	if (BindingPartEnabled(BindingParts(), BindingPart::Pipeline)) return;
 	BindingPlan plan;
@@ -554,7 +571,7 @@ void ComputeBindingPlan(const BindingPlanContext& context, const RegisterSnapsho
                         BindingPlan& plan) {
 	plan.Reset();
 	const auto parts = BindingParts();
-	if (parts == 0 || !prepared.ok) {
+	if (parts == 0 || !prepared.ok || prepared.vertex_stages != 1) {
 		return;
 	}
 	Profiler::ScopedFrameWait wait(Profiler::FrameWait::DrawPrepBindingPlan);

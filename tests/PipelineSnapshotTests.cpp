@@ -4,11 +4,15 @@
 // identical create info with the modules looked up again, and malformed or unresolvable records are
 // refused. No device is needed: modules and layouts are opaque handles here.
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineFeedback.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
+
+// pipelineFeedback.cpp (KYTY_EMPTY_FS) creates its module through the default dispatcher.
+VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 using namespace Libs::Graphics;
 
@@ -257,12 +261,96 @@ int main() {
 		CHECK(GraphicsPipelineSnapshot::Capture(vertex.info, true) == nullptr);
 	}
 
-	// Ineligible create infos are not captured (tessellation).
+	// Tessellation: not captured for the library path; with allow_mesh (journal and known keys) the
+	// control and evaluation stages and the patch size round-trip, under another magic, so pipelines
+	// without tessellation keep their words.
 	{
 		Example tess;
 		vk::PipelineTessellationStateCreateInfo tessellation {};
-		tess.info.pTessellationState = &tessellation;
+		tessellation.patchControlPoints = 16;
+		tess.info.pTessellationState    = &tessellation;
 		CHECK(GraphicsPipelineSnapshot::Capture(tess.info) == nullptr);
+		vk::PipelineShaderStageCreateInfo stages[4] {};
+		stages[0]                 = tess.stages[0];
+		stages[1].stage           = vk::ShaderStageFlagBits::eTessellationControl;
+		stages[1].module          = FakeHandle<vk::ShaderModule>(0x1000);
+		stages[1].pName           = "main";
+		stages[2].stage           = vk::ShaderStageFlagBits::eTessellationEvaluation;
+		stages[2].module          = FakeHandle<vk::ShaderModule>(0x2000);
+		stages[2].pName           = "main";
+		stages[3]                 = tess.stages[1];
+		tess.info.stageCount      = 4;
+		tess.info.pStages         = stages;
+		tess.input_assembly.topology = vk::PrimitiveTopology::ePatchList;
+		const auto captured = GraphicsPipelineSnapshot::Capture(tess.info, true);
+		CHECK(captured != nullptr);
+		if (captured != nullptr) {
+			std::vector<uint32_t> tess_words;
+			CHECK(captured->Serialize(tess_words, HashOf) && tess_words[0] != words[0]);
+			CHECK(GraphicsPipelineSnapshot::SerializedModules(tess_words).size() == 4);
+			const auto back = GraphicsPipelineSnapshot::Deserialize(tess_words, ModuleFor, layout);
+			CHECK(back != nullptr);
+			if (back != nullptr) {
+				const auto& info = back->Info();
+				CHECK(info.stageCount == 4 && info.pStages[2].stage == vk::ShaderStageFlagBits::eTessellationEvaluation);
+				CHECK(info.pTessellationState != nullptr && info.pTessellationState->patchControlPoints == 16);
+				std::vector<uint32_t> again;
+				CHECK(back->Serialize(again, [](vk::ShaderModule module) {
+					return HashOf(FakeHandle<vk::ShaderModule>(HandleValue(module) - 1));
+				}) && again == tess_words);
+			}
+			// A different patch size is another pipeline.
+			tessellation.patchControlPoints = 3;
+			std::vector<uint32_t> other;
+			CHECK(GraphicsPipelineSnapshot::Capture(tess.info, true)->Serialize(other, HashOf) && other != tess_words);
+		}
+		// Two control stages are refused.
+		stages[2].stage = vk::ShaderStageFlagBits::eTessellationControl;
+		CHECK(GraphicsPipelineSnapshot::Capture(tess.info, true) == nullptr);
+	}
+
+	// KYTY_EMPTY_FS (pipelineFeedback.h): the driver's copy of a pipeline without a fragment stage
+	// gets the empty stage appended; the caller's create info, and so every key serialized from it,
+	// is untouched; pipelines with a fragment stage, libraries and linked pipelines are left alone.
+	{
+		CHECK(EmptyFragment::Eligible(false, false, 1, false, false));
+		CHECK(!EmptyFragment::Eligible(false, false, 2, true, false));
+		CHECK(!EmptyFragment::Eligible(true, false, 1, false, false));
+		CHECK(!EmptyFragment::Eligible(false, true, 1, false, false));
+		CHECK(!EmptyFragment::Eligible(false, false, 0, false, false));
+		CHECK(!EmptyFragment::Eligible(false, false, 1, false, true));
+		Example depth_only;
+		depth_only.info.stageCount = 1;
+		std::vector<uint32_t> before;
+		CHECK(GraphicsPipelineSnapshot::Capture(depth_only.info, true)->Serialize(before, HashOf));
+		EmptyFragment::Storage storage;
+		// Off: the same create info.
+		CHECK(&EmptyFragment::Apply(depth_only.info, storage) == &depth_only.info);
+		const auto empty = FakeHandle<vk::ShaderModule>(0x3000);
+		EmptyFragment::SetModuleForTest(empty);
+		const auto& applied = EmptyFragment::Apply(depth_only.info, storage);
+		CHECK(&applied != &depth_only.info && applied.stageCount == 2 &&
+		      applied.pStages[0].module == depth_only.stages[0].module &&
+		      applied.pStages[1].stage == vk::ShaderStageFlagBits::eFragment && applied.pStages[1].module == empty &&
+		      std::string(applied.pStages[1].pName) == "main" && applied.layout == depth_only.info.layout &&
+		      applied.pRasterizationState == depth_only.info.pRasterizationState);
+		CHECK(depth_only.info.stageCount == 1 && depth_only.info.pStages == depth_only.stages);
+		std::vector<uint32_t> after;
+		CHECK(GraphicsPipelineSnapshot::Capture(depth_only.info, true)->Serialize(after, HashOf) && after == before);
+		// A pipeline with the guest's pixel shader, a library and a discarding one: unchanged.
+		Example shaded;
+		CHECK(&EmptyFragment::Apply(shaded.info, storage) == &shaded.info);
+		Example library;
+		library.info.stageCount = 1;
+		library.info.flags      = vk::PipelineCreateFlagBits::eLibraryKHR;
+		CHECK(&EmptyFragment::Apply(library.info, storage) == &library.info);
+		Example discard;
+		discard.info.stageCount                    = 1;
+		discard.rasterization.rasterizerDiscardEnable = VK_TRUE;
+		CHECK(&EmptyFragment::Apply(discard.info, storage) == &discard.info);
+		CHECK(EmptyFragment::AppliedCount() == 1);
+		EmptyFragment::SetModuleForTest(nullptr);
+		CHECK(&EmptyFragment::Apply(depth_only.info, storage) == &depth_only.info);
 	}
 
 	if (g_failed != 0) {

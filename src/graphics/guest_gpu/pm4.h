@@ -45,7 +45,9 @@ constexpr uint32_t IT_DRAW_INDEX_OFFSET_2       = 0x35;
 constexpr uint32_t IT_WRITE_DATA                = 0x37;
 constexpr uint32_t IT_MEM_SEMAPHORE             = 0x39;
 constexpr uint32_t IT_DRAW_INDEX_INDIRECT_MULTI = 0x38;
-constexpr uint32_t IT_DISPATCH_DRAW_PREAMBLE    = 0x3A;
+constexpr uint32_t IT_DRAW_INDEX_MULTI_INST     = 0x3A;
+// The old name of IT_DRAW_INDEX_MULTI_INST (draw-prep packet classes and tests use it).
+constexpr uint32_t IT_DISPATCH_DRAW_PREAMBLE    = IT_DRAW_INDEX_MULTI_INST;
 constexpr uint32_t IT_WAIT_REG_MEM              = 0x3C;
 constexpr uint32_t IT_INDIRECT_BUFFER           = 0x3F;
 constexpr uint32_t IT_COPY_DATA                 = 0x40;
@@ -92,6 +94,7 @@ constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_RELEASE_MEM    = 0x18;
 constexpr uint32_t R_DMA_DATA       = 0x19;
 constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
+constexpr uint32_t R_PSSR           = 0x1B; // experimental Pro mode (libPsml linear PSSR)
 
 constexpr uint32_t R_NUM = 0x3F + 1;
 

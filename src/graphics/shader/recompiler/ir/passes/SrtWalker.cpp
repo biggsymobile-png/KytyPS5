@@ -1,16 +1,20 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/guestProbe.h"
 #include "common/liveSwitch.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -22,6 +26,66 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+namespace {
+
+// KYTY_SRT_GPU_FILL_DIAG=1 (diagnostic, default off; needs KYTY_SRT_GPU_FILL=1): host reads of
+// GPU-written SRT dwords the fill did not take, by shader and flat slot (or "descriptor/other"
+// outside the flat refresh, "trace" inside a replayed flat refresh), every 10 s on the console.
+bool GpuFillDiagEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_SRT_GPU_FILL_DIAG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+constexpr uint32_t DiagSlotNone  = UINT32_MAX;
+constexpr uint32_t DiagSlotTrace = UINT32_MAX - 1u;
+
+void NoteGpuFillMiss(const ResourcePlan& program, uint32_t slot) {
+	struct Key {
+		uint64_t hash;
+		uint32_t slot;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const { return key.hash * 31u + key.slot; }
+	};
+	static std::mutex                                mutex;
+	static std::unordered_map<Key, uint64_t, KeyHash> misses;
+	static auto last = std::chrono::steady_clock::now();
+	std::scoped_lock lock(mutex);
+	misses[{program.shader_hash, slot}]++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(10)) {
+		return;
+	}
+	last = now;
+	std::vector<std::pair<Key, uint64_t>> sorted(misses.begin(), misses.end());
+	std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+	std::string line = "SrtGpuFill misses 10s:";
+	for (size_t i = 0; i < std::min<size_t>(sorted.size(), 12); i++) {
+		const auto& [key, count] = sorted[i];
+		if (key.slot == DiagSlotNone) {
+			line += fmt::format(" {:016x}/other x{}", key.hash, count);
+		} else if (key.slot == DiagSlotTrace) {
+			line += fmt::format(" {:016x}/trace x{}", key.hash, count);
+		} else {
+			line += fmt::format(" {:016x}/slot{}{} x{}", key.hash, key.slot,
+			                    key.slot < program.gpu_fill_slots.size() && program.gpu_fill_slots[key.slot] != 0u &&
+			                            key.hash == program.shader_hash
+			                        ? "(fillable)"
+			                        : "",
+			                    count);
+		}
+	}
+	std::printf("%s\n", line.c_str());
+	std::fflush(stdout);
+	misses.clear();
+}
+
+} // namespace
+
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	if (runtime.read_specialization_memory == nullptr) {
 		runtime.try_read_clean_backing = nullptr;
@@ -31,6 +95,9 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
+	// Strict reads are host values by definition: never left to the GPU.
+	runtime.gpu_written = nullptr;
+	runtime.gpu_fills   = nullptr;
 	return runtime;
 }
 
@@ -94,6 +161,25 @@ bool ComputeRawAddress(bool buffer, int64_t immediate, uint64_t low, uint64_t hi
 		const auto size = stride == 0u ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                              : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (aligned > size || size - aligned < sizeof(uint32_t)) {
+			// KYTY_SRT_OOR_LOG=1 (diagnostic, default off): the first 64 distinct (base, stride,
+			// records) of SRT constant-buffer reads past the V#'s size, which read as 0.
+			static const bool oor_log = [] {
+				const char* value = std::getenv("KYTY_SRT_OOR_LOG");
+				return value != nullptr && value[0] == '1';
+			}();
+			if (oor_log) {
+				static std::mutex                   mutex;
+				static std::unordered_set<uint64_t> seen;
+				const uint64_t key = base ^ (uint64_t {stride} << 48u) ^ (static_cast<uint64_t>(records) << 20u);
+				std::scoped_lock lock(mutex);
+				if (seen.size() < 64 && seen.insert(key).second) {
+					std::printf("SrtOOR: base 0x%llx stride %u records %u size %llu read at %llu (V# hi 0x%08x)\n",
+					            static_cast<unsigned long long>(base), stride, static_cast<uint32_t>(records),
+					            static_cast<unsigned long long>(size), static_cast<unsigned long long>(aligned),
+					            static_cast<uint32_t>(high));
+					std::fflush(stdout);
+				}
+			}
 			address   = OutOfRangeReadAddress;
 			available = 0;
 			return true;
@@ -141,6 +227,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::CompositeConstructU64:
 		case ValueOpcode::CompositeExtractU64:
@@ -157,6 +244,8 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::IMul32:
 		case ValueOpcode::IMul64:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::SMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -173,9 +262,11 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::SelectF32:
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::IEqual32:
+		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
+		case ValueOpcode::INotEqual64:
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
@@ -394,10 +485,41 @@ public:
 				}
 			}
 		}
+		// KYTY_SNAPSHOT_WRITTEN_GUARD (Senaxx/KytyPS5-GT7 2e002fb55): memory the shader itself
+		// writes is not snapshotted; a pointer whose base is also the base of a written or
+		// atomically updated buffer or address stays in the shader.
+		std::vector<Value> written_bases;
+		const bool         guard = GetCodegenOptions().snapshot_written_guard;
+		if (guard) {
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					const auto op     = inst.GetOpcode();
+					const auto buffer = BufferAccessOf(op);
+					if ((buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+					     AddressOpcodeInfoOf(op).access == AddressAccess::Write) &&
+					    inst.NumArgs() != 0) {
+						if (const auto* handle = inst.Arg(0).ResolveInstruction();
+						    handle != nullptr && handle->NumArgs() != 0) {
+							written_bases.push_back(handle->Arg(0));
+						}
+					}
+				}
+			}
+		}
+		const auto written = [&](const Inst& load) {
+			if (!guard) {
+				return false;
+			}
+			const auto* handle = load.Arg(0).ResolveInstruction();
+			return handle == nullptr || handle->NumArgs() == 0 ||
+			       std::ranges::any_of(written_bases, [&](const Value& base) {
+				       return EquivalentValue(m_program, base, handle->Arg(0));
+			       });
+		};
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && IsRawRead(m_program, inst) &&
-				    inst.Arg(1).Resolve().IsImmediate() &&
+				    inst.Arg(1).Resolve().IsImmediate() && !written(inst) &&
 				    ValidateRuntimeValue(m_program, Value(&inst))) {
 					Collect(Value(&inst), inst.Flags<MemoryFlags>().pc);
 				}
@@ -419,59 +541,111 @@ private:
 		std::abort();
 	}
 
-	void Collect(Value value, uint32_t use_pc) {
-		value = value.Resolve();
-		if (value.IsImmediate()) {
-			return;
-		}
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) {
-			Fail(use_pc, "invalid typed planning value");
-		}
-		const auto cycle = std::ranges::find(m_visiting, inst);
-		if (cycle != m_visiting.end()) {
-			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			});
-			if (contains_phi) {
+	// Depth first over the operands, each instruction finished after its operands. An explicit
+	// stack (the m_visiting path) instead of recursion, in the same order: an operand chain through
+	// thousands of blocks (PPSA03671's expanded material kernel 0xe6d76d24f59f8015) overflowed a
+	// 1 MiB thread stack.
+	void Collect(Value root, uint32_t use_pc) {
+		std::vector<size_t> next_operand; // per m_visiting entry pushed here
+		const size_t        base = m_visiting.size();
+		// Starts `value`'s instruction, unless it needs no visit.
+		const auto enter = [&](Value value) {
+			value = value.Resolve();
+			if (value.IsImmediate()) {
 				return;
 			}
-			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
-			                         ValueOpcodeName(inst->GetOpcode())));
+			auto* inst = value.TryInstruction();
+			if (inst == nullptr) {
+				Fail(use_pc, "invalid typed planning value");
+			}
+			if (m_visited.contains(inst)) {
+				return;
+			}
+			const auto cycle = m_visiting_set.contains(inst) ? std::ranges::find(m_visiting, inst)
+			                                                 : m_visiting.end();
+			if (cycle != m_visiting.end()) {
+				const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* other) {
+					return other->GetOpcode() == ValueOpcode::Phi;
+				});
+				if (contains_phi) {
+					return;
+				}
+				Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
+				                         ValueOpcodeName(inst->GetOpcode())));
+			}
+			m_visiting.push_back(inst);
+			m_visiting_set.insert(inst);
+			next_operand.push_back(0);
+		};
+		enter(root);
+		while (m_visiting.size() > base) {
+			auto* inst = m_visiting.back();
+			if (auto& next = next_operand.back(); next < inst->NumArgs()) {
+				enter(inst->Arg(next++));
+				continue;
+			}
+			next_operand.pop_back();
+			m_visiting.pop_back();
+			m_visiting_set.erase(inst);
+			m_visited.insert(inst);
+			Finish(inst);
 		}
-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
-			return;
-		}
-		m_visiting.push_back(inst);
-		for (size_t index = 0; index < inst->NumArgs(); index++) {
-			Collect(inst->Arg(index), use_pc);
-		}
-		m_visiting.pop_back();
-		m_visited.push_back(inst);
+	}
+
+	void Finish(Inst* inst) {
+		const auto value = Value(inst);
 		if (!IsRawRead(m_program, *inst)) {
 			return;
 		}
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
 		    (m_variant_reads && !EvaluableBeforeDispatch(inst->Arg(0)))) {
-			if (std::ranges::find(m_program.dynamic_reads, value) ==
-			    m_program.dynamic_reads.end()) {
+			if (m_dynamic_reads.insert(inst).second) {
 				m_program.dynamic_reads.push_back(value);
 			}
 			return;
 		}
-		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
+		// Equivalent reads have the same opcode and memory metadata (EquivalentValue compares
+		// them first): only the slots of that shape are compared.
+		auto& candidates = m_slots_by_shape[ReadShape(*inst)];
+		for (const auto slot: candidates) {
 			if (EquivalentValue(m_program, value, m_program.srt_reads[slot].value)) {
 				m_patches.push_back({inst, slot, false});
 				return;
 			}
 		}
 		const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
+		candidates.push_back(slot);
 		m_program.srt_reads.push_back({value, slot});
 		m_patches.push_back({inst, slot, true});
 	}
 
+	// What EquivalentValue compares first for two runtime reads: the opcode and the memory entry's
+	// fields (offset, kind) that equal entries share.
+	uint64_t ReadShape(const Inst& inst) const {
+		const auto index = inst.Flags<MemoryFlags>().index;
+		uint64_t   shape = static_cast<uint64_t>(inst.GetOpcode()) << 48u;
+		if (index < m_program.memory_info.size()) {
+			const auto& memory = m_program.memory_info[index];
+			shape ^= (static_cast<uint64_t>(memory.offset) << 8u) ^ static_cast<uint64_t>(memory.kind);
+		}
+		return shape;
+	}
+
 	void PatchReads() {
+		// Block conditions and indirect targets by the instruction they name, so a patch does
+		// not scan every block.
+		std::unordered_map<const Inst*, std::vector<size_t>> conditions;
+		std::unordered_map<const Inst*, std::vector<size_t>> targets;
+		for (size_t index = 0; index < m_program.block_info.size(); ++index) {
+			const auto& info = m_program.block_info[index];
+			if (const auto* inst = info.condition.Resolve().TryInstruction(); inst != nullptr) {
+				conditions[inst].push_back(index);
+			}
+			if (const auto* inst = info.indirect_target.Resolve().TryInstruction(); inst != nullptr) {
+				targets[inst].push_back(index);
+			}
+		}
 		for (const auto& patch: m_patches) {
 			auto* block = patch.inst->Parent();
 			auto& list  = block->Instructions();
@@ -485,12 +659,18 @@ private:
 			for (const auto& use: uses) {
 				use.user->SetArg(use.operand, flat);
 			}
-			for (auto& info: m_program.block_info) {
-				if (info.condition.Resolve() == Value(patch.inst)) {
-					info.condition = flat;
+			if (const auto found = conditions.find(patch.inst); found != conditions.end()) {
+				for (const auto index: found->second) {
+					if (m_program.block_info[index].condition.Resolve() == Value(patch.inst)) {
+						m_program.block_info[index].condition = flat;
+					}
 				}
-				if (info.indirect_target.Resolve() == Value(patch.inst)) {
-					info.indirect_target = flat;
+			}
+			if (const auto found = targets.find(patch.inst); found != targets.end()) {
+				for (const auto index: found->second) {
+					if (m_program.block_info[index].indirect_target.Resolve() == Value(patch.inst)) {
+						m_program.block_info[index].indirect_target = flat;
+					}
 				}
 			}
 			if (patch.keep) {
@@ -523,7 +703,10 @@ private:
 
 	Program&           m_program;
 	std::vector<Inst*> m_visiting;
-	std::vector<Inst*> m_visited;
+	std::unordered_set<const Inst*> m_visiting_set;
+	std::unordered_set<const Inst*> m_visited;
+	std::unordered_set<const Inst*> m_dynamic_reads;
+	std::unordered_map<uint64_t, std::vector<uint32_t>> m_slots_by_shape;
 	std::vector<Patch> m_patches;
 	bool               m_variant_reads = false;
 	std::unordered_map<const Inst*, bool> m_evaluable_memo;
@@ -610,6 +793,7 @@ uint32_t ArithmeticArity(const ResourcePlan::EvaluationRecipe& recipe) {
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::BitwiseNot32:
 		case ValueOpcode::LogicalNot:
@@ -623,6 +807,8 @@ uint32_t ArithmeticArity(const ResourcePlan::EvaluationRecipe& recipe) {
 		case ValueOpcode::IMul32:
 		case ValueOpcode::IMul64:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::SMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -778,7 +964,7 @@ void BuildSrtEvaluationRecipes(ResourcePlan& program) {
 		program.flat_read_roots[slot] = compile(program.srt_reads[slot].value);
 	}
 	program.condition_roots.resize(program.control_flow.size());
-	program.initial_active_sources.assign(program.descriptor_sources.size(), 1u);
+	program.initial_active_sources.assign(ActiveSlotCount(program), 1u);
 	for (size_t block = 0; block < program.control_flow.size(); ++block) {
 		const auto& flow = program.control_flow[block];
 		program.condition_roots[block] = compile(flow.condition);
@@ -1423,6 +1609,18 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t& result, bool allow_probe
 		result = 0;
 		return true;
 	}
+	if (m_runtime.gpu_written != nullptr && !m_fill_active && GpuFillDiagEnabled() &&
+	    address != 0 && m_runtime.gpu_written(address)) [[unlikely]] {
+		NoteGpuFillMiss(m_program, m_diag_slot);
+	}
+	if (m_fill_active && m_runtime.gpu_written(address)) [[unlikely]] {
+		// KYTY_SRT_GPU_FILL: only the shader uses this slot, and the GPU wrote its bytes; the
+		// renderer copies them into the flat buffer on the GPU before the dispatch, where reading
+		// them here would wait for the GPU.
+		m_runtime.gpu_fills->push_back({m_fill_offset, address});
+		result = 0;
+		return true;
+	}
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
@@ -1715,6 +1913,20 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 				return true;
 			}
 			return false;
+		// Runtime descriptor values may take a maximum (upstream 2c63453c6: SMax32).
+		case ValueOpcode::UMax32:
+			if (binary()) {
+				result = std::max(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+				return true;
+			}
+			return false;
+		case ValueOpcode::SMax32:
+			if (binary()) {
+				result = static_cast<uint32_t>(std::max(static_cast<int32_t>(static_cast<uint32_t>(a)),
+				                                        static_cast<int32_t>(static_cast<uint32_t>(b))));
+				return true;
+			}
+			return false;
 		case ValueOpcode::ConvertF32U32:
 			if (arg(0, a)) {
 				result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
@@ -1732,6 +1944,22 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 					result = UINT32_MAX;
 				} else {
 					result = static_cast<uint32_t>(value);
+				}
+				return true;
+			}
+			return false;
+		case ValueOpcode::ConvertS32F32:
+			if (arg(0, a)) {
+				// V_CVT_I32_F32 saturates and maps NaN to zero.
+				const auto value = Float32(a);
+				if (std::isnan(value)) {
+					result = 0u;
+				} else if (value >= 2147483648.0f) {
+					result = static_cast<uint32_t>(INT32_MAX);
+				} else if (value <= -2147483648.0f) {
+					result = static_cast<uint32_t>(INT32_MIN);
+				} else {
+					result = static_cast<uint32_t>(static_cast<int32_t>(value));
 				}
 				return true;
 			}
@@ -1912,6 +2140,11 @@ bool SrtWalker::EvaluateInstWithOperands(const Inst& inst, uint64_t& result, Rea
 				return true;
 			}
 			return false;
+		case ValueOpcode::IEqual64:
+		case ValueOpcode::INotEqual64:
+			if (!binary()) return false;
+			result = inst.GetOpcode() == ValueOpcode::IEqual64 ? a == b : a != b;
+			return true;
 		case ValueOpcode::ULessThan32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
@@ -1995,7 +2228,7 @@ std::span<const uint8_t> SrtWalker::FindActiveSourcesImpl() {
 	} else if (decoded) {
 		active = m_program.initial_active_sources;
 	} else {
-		active.assign(m_program.descriptor_sources.size(), 1u);
+		active.assign(ActiveSlotCount(m_program), 1u);
 		for (const auto& block: m_program.control_flow) {
 			for (const auto source: block.sources) {
 				active.at(source) = 0u;
@@ -2062,6 +2295,27 @@ bool SrtWalker::RefreshFlatBufferImpl(std::vector<uint32_t>& flat) {
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		if (read.flat_offset >= flat.size()) return false;
+		evaluator.m_diag_slot = index;
+		if (!clean && m_runtime.gpu_fills != nullptr &&
+		    read.flat_offset < m_program.gpu_fill_slots.size() &&
+		    (m_program.gpu_fill_slots[read.flat_offset] == 1u ||
+		     (m_program.gpu_fill_slots[read.flat_offset] == 2u &&
+		      m_runtime.gpu_fill_store_offsets))) [[unlikely]] {
+			// KYTY_SRT_GPU_FILL: this slot alone, outside read runs; its one raw read (ReadRawWord)
+			// leaves GPU-written bytes to the GPU.
+			m_fill_active = true;
+			m_fill_offset = read.flat_offset;
+			const bool ok = index < m_program.flat_read_roots.size()
+			    ? EvaluateRoot(read.value, m_program.flat_read_roots[index], flat[read.flat_offset])
+			    : Evaluate(read.value, flat[read.flat_offset]);
+			m_fill_active = false;
+			m_diag_slot   = DiagSlotNone;
+			if (!ok) {
+				return false;
+			}
+			++index;
+			continue;
+		}
 		if (evaluator.m_runtime.try_read_clean_backing != nullptr &&
 		    index < m_program.srt_read_run_ends.size() &&
 		    m_program.srt_read_run_ends[index] > index) {
@@ -2085,6 +2339,7 @@ bool SrtWalker::RefreshFlatBufferImpl(std::vector<uint32_t>& flat) {
 		const bool ok = index < m_program.flat_read_roots.size()
 		    ? evaluator.EvaluateRoot(read.value, m_program.flat_read_roots[index], flat[read.flat_offset])
 		    : evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		evaluator.m_diag_slot = DiagSlotNone;
 		if (!ok) {
 			return false;
 		}
@@ -2308,8 +2563,11 @@ bool IsTracePure(ValueOpcode op) {
 		case ValueOpcode::IMul32:
 		case ValueOpcode::IMul64:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::SMax32:
 		case ValueOpcode::ConvertF32U32:
 		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertS32F32:
 		case ValueOpcode::FPMul32:
 		case ValueOpcode::FPTrunc32:
 		case ValueOpcode::FPIsNan32:
@@ -2448,7 +2706,107 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	return FindActiveSourcesImpl();
 }
 
+// KYTY_SRT_SLOT_WATCH=<shader hash>:<flat slot>[,<flat slot>...] (diagnostic, default off): for
+// that shader, the guest address each listed flat slot's raw read resolves to, the flat value and
+// the guest dwords around it (refreshes 1-4, then every 2000th, at most 80 lines), and a hardware
+// write watch (GuestWatch: lines) on the first listed slot whose value is 0. Trace replay is
+// bypassed for the shader so the walk runs.
+namespace {
+struct SlotWatch {
+	uint64_t              hash = 0;
+	std::vector<uint32_t> slots;
+};
+const SlotWatch& SlotWatchSettings() {
+	static const SlotWatch watch = [] {
+		SlotWatch   parsed;
+		const char* value = std::getenv("KYTY_SRT_SLOT_WATCH");
+		if (value == nullptr || value[0] == '\0') return parsed;
+		char* end   = nullptr;
+		parsed.hash = std::strtoull(value, &end, 16);
+		while (end != nullptr && (*end == ':' || *end == ',')) {
+			parsed.slots.push_back(static_cast<uint32_t>(std::strtoul(end + 1, &end, 10)));
+		}
+		return parsed;
+	}();
+	return watch;
+}
+} // namespace
+
+static uint64_t GetTickCountMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void SrtWalker::DiagWatchSlots(const std::vector<uint32_t>& flat) {
+	static std::mutex mutex;
+	static uint64_t   refreshes = 0;
+	static uint32_t   lines     = 0;
+	static bool       armed     = false;
+	static uint32_t   last_first = 0xdeadbeefu;
+	static auto       last_time  = std::chrono::steady_clock::now();
+	std::scoped_lock  lock(mutex);
+	const auto        n     = ++refreshes;
+	const auto&       slots = SlotWatchSettings().slots;
+	const uint32_t    first = !slots.empty() && slots[0] < flat.size() ? flat[slots[0]] : 0u;
+	const auto        now   = std::chrono::steady_clock::now();
+	// Refreshes 1-4, whenever the first listed slot changes, and every 10 s; at most 160 lines.
+	if (!(n <= 4 || first != last_first || now - last_time >= std::chrono::seconds(10)) || lines >= 160) return;
+	last_first = first;
+	last_time  = now;
+	auto* const saved = m_trace;
+	m_trace           = nullptr;
+	for (const auto slot: slots) {
+		std::string line  = fmt::format("SrtSlotWatch: t={} shader {:016x} refresh {} flat[{}]", GetTickCountMs(),
+		                                m_program.shader_hash, n, slot);
+		uint32_t    index = UINT32_MAX;
+		for (uint32_t i = 0; i < m_program.srt_reads.size(); i++) {
+			if (m_program.srt_reads[i].flat_offset == slot) {
+				index = i;
+				break;
+			}
+		}
+		if (index == UINT32_MAX) {
+			line += " not a flat read";
+		} else {
+			line += fmt::format(" = {:08x} read {}", slot < flat.size() ? flat[slot] : 0u, index);
+			uint32_t    memo    = 0;
+			const auto* inst    = FlatReadInstruction(index, memo);
+			uint64_t    address = 0, available = 0;
+			if (inst == nullptr || (inst->GetOpcode() != ValueOpcode::LoadAddressU32 &&
+			                        inst->GetOpcode() != ValueOpcode::ReadConstBuffer)) {
+				line += fmt::format(" derived (op {})", inst != nullptr ? static_cast<int>(inst->GetOpcode()) : -1);
+			} else if (!ResolveRawReadAddress(*inst, address, available)) {
+				line += " address unresolved";
+			} else if (address == OutOfRangeReadAddress) {
+				line += " OUT OF RANGE (reads 0)";
+			} else {
+				line += fmt::format(" {} addr 0x{:x} avail {} mem",
+				                    inst->GetOpcode() == ValueOpcode::ReadConstBuffer ? "cb" : "ptr", address, available);
+				for (int k = -4; k < 8; k++) {
+					uint64_t   word = 0;
+					const auto a    = address + static_cast<uint64_t>(static_cast<int64_t>(k) * 4);
+					line += ReadRawWord(a, word, false) ? fmt::format(" {:08x}", static_cast<uint32_t>(word)) : " ????????";
+				}
+				if (!armed && slot == slots[0] && slot < flat.size() && flat[slot] == 0u) {
+					armed = true;
+					line += " -> write watch armed";
+					Common::GuestProbe::ArmWriteWatch(address & ~uint64_t {7});
+				}
+			}
+		}
+		lines++;
+		Log::WriteToConsoleAndLog(line + "\n");
+	}
+	m_trace = saved;
+}
+
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	if (SlotWatchSettings().hash != 0 && SlotWatchSettings().hash == m_program.shader_hash) [[unlikely]] {
+		const bool ok = RefreshFlatBufferImpl(flat);
+		if (ok) DiagWatchSlots(flat);
+		return ok;
+	}
 	if (m_trace != nullptr && m_program.srt_plan_complete) [[unlikely]] {
 		return m_trace->FlatBuffer(*this, flat);
 	}
@@ -2766,7 +3124,13 @@ bool SrtTraceSession::FlatBuffer(SrtWalker& walker, std::vector<uint32_t>& flat)
 		}
 		return ok;
 	}
+	for (auto* each: m_walkers) {
+		each->m_diag_slot = DiagSlotTrace;
+	}
 	const auto* call = NextCall(id);
+	for (auto* each: m_walkers) {
+		each->m_diag_slot = DiagSlotNone;
+	}
 	if (call == nullptr) {
 		return walker.RefreshFlatBufferImpl(flat);
 	}

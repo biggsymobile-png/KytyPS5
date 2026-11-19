@@ -9,6 +9,15 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
+                 std::initializer_list<uint32_t> args) {
+	const auto            result = state.builder.AllocateId();
+	std::vector<uint32_t> words {spv::OpExtInst, type, result, GlslStd450(state), opcode};
+	words.insert(words.end(), args.begin(), args.end());
+	state.builder.AddFunction(words);
+	return result;
+}
+
 struct Pair {
 	uint32_t low  = 0;
 	uint32_t high = 0;
@@ -22,6 +31,11 @@ Pair ExtractPair(EmitterState& state, uint32_t value) {
 }
 
 uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	// KYTY_RELAXED_FLOAT (upstream 8dbee8635): native f64 min/max.
+	if (GetCodegenOptions().relaxed_float) {
+		return EmitExt(state, TypeF64(state), max_value ? GLSLstd450NMax : GLSLstd450NMin,
+		               {lhs, rhs});
+	}
 	const auto bits_type = TypeU32Vector(state, 2);
 	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
 	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
@@ -102,8 +116,8 @@ bool IsPlainConstant(const F32Operand& operand) {
 // non-zero constant never forms two zeros.
 F32Operand EmitFastMinMaxF32(EmitterState& state, F32Operand lhs, F32Operand rhs,
                              bool max_value) {
-	if (GetCodegenOptions().native_float_min_max) {
-		// KYTY_NATIVE_FMINMAX: NMin/NMax return the other operand for one NaN, as the guest does;
+	if (GetCodegenOptions().native_float_min_max || GetCodegenOptions().relaxed_float) {
+		// KYTY_NATIVE_FMINMAX / KYTY_RELAXED_FLOAT: NMin/NMax return the other operand for one NaN, as the guest does;
 		// which zero min/max(-0, +0) returns is left to the host.
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
@@ -168,17 +182,10 @@ bool FastFloatMinMax() {
 	return GetCodegenOptions().fast_float_min_max;
 }
 
+// KYTY_FLOAT_PROFILE=relaxed (this fork's shader maths profile; separate from upstream's
+// KYTY_RELAXED_FLOAT, which still works on its own).
 bool Relaxed() {
 	return GetCodegenOptions().float_profile == FloatProfile::Relaxed;
-}
-
-uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
-                 std::initializer_list<uint32_t> args) {
-	const auto            result = state.builder.AllocateId();
-	std::vector<uint32_t> words {spv::OpExtInst, type, result, GlslStd450(state), opcode};
-	words.insert(words.end(), args.begin(), args.end());
-	state.builder.AddFunction(words);
-	return result;
 }
 
 // KYTY_FLOAT_PROFILE=relaxed: GLSL NMin/NMax return the non-NaN operand when one is NaN, as
@@ -231,6 +238,20 @@ uint32_t EmitFPMedTri32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1, I
 		                                        ctx.Def(arg2), false);
 		return EmitRelaxedMinMax(state, f32, EmitRelaxedMinMax(state, f32, a, b, false), high_min,
 		                         true);
+	}
+	if (GetCodegenOptions().relaxed_float) {
+		// KYTY_RELAXED_FLOAT (upstream 8dbee8635): the smallest pairwise maximum from native
+		// min/max; a NaN source gives the minimum of the other two.
+		const auto a       = ctx.Def(arg0);
+		const auto b       = ctx.Def(arg1);
+		const auto c       = ctx.Def(arg2);
+		const auto min_max = [&](uint32_t x, uint32_t y, bool max_value) {
+			return EmitExt(state, TypeF32(state), max_value ? GLSLstd450NMax : GLSLstd450NMin, {x, y});
+		};
+		const auto ab = min_max(a, b, true);
+		const auto bc = min_max(b, c, true);
+		const auto ac = min_max(a, c, true);
+		return min_max(min_max(ab, bc, false), ac, false);
 	}
 	if (FastFloatMinMax()) {
 		return EmitFastMedTri32(state, OperandF32(ctx, arg0), OperandF32(ctx, arg1),
@@ -308,8 +329,11 @@ uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
 	    Binary(state, spv::OpLogicalAnd, TypeBool(state),
 	           EmitCompareU32Constant(state, spv::OpUGreaterThan, exponent, 0x47e00000u),
 	           EmitCompareU32Constant(state, spv::OpULessThan, exponent, 0x7ff00000u));
-	const auto clamped = EmitOrU32(state, EmitAndConstant(state, source, 0x80000000u),
-	                               ConstantU32(state, 0x7f7fffffu));
+	// KYTY_CVT_F32_F64_INF: round to nearest (FLOAT_MODE 0xC0) overflows to +-INF; the legacy result
+	// saturates at +-FLT_MAX.
+	const auto clamped = EmitOrU32(
+	    state, EmitAndConstant(state, source, 0x80000000u),
+	    ConstantU32(state, GetCodegenOptions().cvt_f32_f64_inf ? 0x7f800000u : 0x7f7fffffu));
 	return EmitFlushF32DenormToSignedZero(
 	    state, Select(state, TypeF32(state), overflow,
 	                  Unary(state, spv::OpBitcast, TypeF32(state), clamped), converted));
@@ -381,6 +405,60 @@ uint32_t EmitFastF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	return EmitOrU32(state, result, sign);
 }
 
+// KYTY_F16_EXACT_ROUND: f32 bits -> f16 bits, round to nearest even (V_CVT_F16_F32, ISA p.137),
+// in integer arithmetic so that a host compiler cannot fold it against a later UnpackHalf2x16:
+//  - |x| >= 2^-14: rebias the exponent ((e - 112) << 23), add 0xfff plus the kept LSB, shift by 13;
+//    a carry rounds into the exponent, results past the range saturate at 0x7c00 (+-INF).
+//  - |x| < 2^-14: the f16 subnormal (mantissa | hidden) >> s, s = 126 - e limited to 25, rounded
+//    to nearest even with (m + (2^(s-1) - 1) + ((m >> s) & 1)) >> s; f32 zeros and denormals give
+//    a signed zero.
+//  - NaN: quiet (0x7e00) with the top payload bits; INF: 0x7c00.
+uint32_t EmitF32ToF16RteBits(EmitterState& state, uint32_t f32) {
+	const auto bits   = EmitBitcastF32ToU32(state, f32);
+	const auto abs    = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto sign   = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 16), 0x8000u);
+	const auto rebias = Binary(state, spv::OpISub, TypeU32(state), abs, ConstantU32(state, 0x38000000u));
+	const auto keep   = EmitAndConstant(state, EmitShiftRightConstant(state, rebias, 13), 1u);
+	const auto normal = EmitMinMaxU32Value(
+	    state,
+	    EmitShiftRightConstant(
+	        state,
+	        Binary(state, spv::OpIAdd, TypeU32(state),
+	               Binary(state, spv::OpIAdd, TypeU32(state), rebias, ConstantU32(state, 0xfffu)),
+	               keep),
+	        13),
+	    ConstantU32(state, 0x7c00u), false);
+	const auto exponent = EmitShiftRightConstant(state, abs, 23);
+	const auto shift    = EmitMinMaxU32Value(state, EmitSubConstantMinusU32(state, 126, exponent),
+	                                         ConstantU32(state, 25), false);
+	const auto mantissa =
+	    EmitOrU32(state, EmitAndConstant(state, abs, 0x007fffffu), ConstantU32(state, 0x00800000u));
+	const auto half_minus_one = Binary(
+	    state, spv::OpISub, TypeU32(state),
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1u),
+	           Binary(state, spv::OpISub, TypeU32(state), shift, ConstantU32(state, 1u))),
+	    ConstantU32(state, 1u));
+	const auto odd = EmitAndConstant(
+	    state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), mantissa, shift), 1u);
+	const auto subnormal = Binary(
+	    state, spv::OpShiftRightLogical, TypeU32(state),
+	    Binary(state, spv::OpIAdd, TypeU32(state),
+	           Binary(state, spv::OpIAdd, TypeU32(state), mantissa, half_minus_one), odd),
+	    shift);
+	auto result =
+	    EmitSelectValueU32(state, EmitCompareU32Constant(state, spv::OpULessThan, abs, 0x38800000u),
+	                       subnormal, normal);
+	const auto nan = EmitOrU32(state, EmitAndConstant(state, EmitShiftRightConstant(state, abs, 13), 0x3ffu),
+	                           ConstantU32(state, 0x7e00u));
+	const auto special =
+	    EmitSelectValueU32(state, EmitCompareU32Constant(state, spv::OpUGreaterThan, abs, 0x7f800000u),
+	                       nan, ConstantU32(state, 0x7c00u));
+	result = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, abs, 0x7f800000u), special,
+	    result);
+	return EmitOrU32(state, result, sign);
+}
+
 uint32_t EmitFastPackFloat2x16Rtz(EmitterState& state, uint32_t x, uint32_t y) {
 	const auto low  = EmitFastF32ToF16RtzBits(state, x);
 	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
@@ -389,6 +467,18 @@ uint32_t EmitFastPackFloat2x16Rtz(EmitterState& state, uint32_t x, uint32_t y) {
 }
 
 } // namespace
+
+uint32_t EmitPackHalf2x16(EmitterState& state, uint32_t pair) {
+	if (!GetCodegenOptions().f16_exact_round) {
+		return EmitGlslPackHalf2x16(state, pair);
+	}
+	const auto x    = EmitNative<spv::OpCompositeExtract, IR::Type::F32>(state, pair, 0u);
+	const auto y    = EmitNative<spv::OpCompositeExtract, IR::Type::F32>(state, pair, 1u);
+	const auto low  = EmitF32ToF16RteBits(state, x);
+	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	                         EmitF32ToF16RteBits(state, y), ConstantU32(state, 16));
+	return EmitOrU32(state, low, high);
+}
 
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	if (Relaxed()) {
@@ -502,6 +592,9 @@ uint32_t EmitFloatBinary(ValueEmitContext& ctx, const IR::Inst& inst, spv::Op op
 // shaders computing the same position (depth pre-pass and main pass) cannot be compiled to
 // different roundings.
 bool NoContraction(EmitterState& state, const IR::Inst& inst) {
+	if (MadExactProgram(static_cast<uint32_t>(state.program.stage), state.program.shader_hash)) {
+		return true;
+	}
 	switch (GetCodegenOptions().mad_mode) {
 		case MadMode::Exact: return true;
 		case MadMode::Fused: return false;
@@ -532,17 +625,28 @@ uint32_t EmitFPMul32(ValueEmitContext& ctx, const IR::Inst& inst) {
 // MadMode::Position off the position data flow) keep the cheaper fused FMA of the old code.
 uint32_t EmitFPMad32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
-	const auto a     = ctx.Def(inst.Arg(0));
-	const auto b     = ctx.Def(inst.Arg(1));
-	const auto c     = ctx.Def(inst.Arg(2));
+	auto       a     = ctx.Def(inst.Arg(0));
+	auto       b     = ctx.Def(inst.Arg(1));
+	auto       c     = ctx.Def(inst.Arg(2));
 	if (!NoContraction(state, inst)) {
 		return EmitExt(state, TypeF32(state), GLSLstd450Fma, {a, b, c});
 	}
-	const auto product = Binary(state, spv::OpFMul, TypeF32(state), a, b);
+	// KYTY_MAD_FLUSH: the legacy MAD has no f32 denormal support; flush its operands, the rounded
+	// product and the sum in the shader (a module with DenormFlushToZero 32 already does).
+	const bool flush = GetCodegenOptions().mad_flush;
+	if (flush) {
+		a = EmitFlushF32DenormToSignedZero(state, a);
+		b = EmitFlushF32DenormToSignedZero(state, b);
+		c = EmitFlushF32DenormToSignedZero(state, c);
+	}
+	auto product = Binary(state, spv::OpFMul, TypeF32(state), a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
+	if (flush) {
+		product = EmitFlushF32DenormToSignedZero(state, product);
+	}
 	const auto sum = Binary(state, spv::OpFAdd, TypeF32(state), product, c);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
-	return sum;
+	return flush ? EmitFlushF32DenormToSignedZero(state, sum) : sum;
 }
 
 uint32_t EmitFPMin32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1) {
@@ -614,16 +718,21 @@ uint32_t EmitFPMaxTri32(ValueEmitContext& ctx, IR::Value arg0, IR::Value arg1, I
 // FLOAT_MODE 0xC0 flushes f32 denormal inputs to zeros of the same sign (so rcp(-denorm) is
 // -inf). KYTY_HOST_FTZ_INPUTS=1 leaves that to a module declaring DenormFlushToZero 32
 // (CodegenTranscendentalDenormInputs checks the host keeps the sign).
-static uint32_t FlushTranscendentalInput(EmitterState& state, uint32_t value) {
+static uint32_t FlushTranscendentalInput(EmitterState& state, uint32_t value, uint8_t op_class) {
 	if (Relaxed() ||
 	    (GetCodegenOptions().host_ftz_inputs && GetHostFloatControls().denorm_flush_f32)) {
+		return value;
+	}
+	// KYTY_F32_FLUSH_HOST: the host's default f32 mode flushes these inputs (CodegenOptions; per op
+	// class with "nvidia", F32FlushSelfTest.h).
+	if (F32FlushHost(state, op_class)) {
 		return value;
 	}
 	return EmitFlushF32DenormToSignedZero(state, value);
 }
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
-	const auto source = FlushTranscendentalInput(state, arg0);
+	const auto source = FlushTranscendentalInput(state, arg0, F32FlushClassRcp);
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 
@@ -639,19 +748,19 @@ uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {
 
 uint32_t EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450InverseSqrt,
-	               {FlushTranscendentalInput(state, arg0)});
+	               {FlushTranscendentalInput(state, arg0, F32FlushClassRsq)});
 }
 
 uint32_t EmitFPSqrt(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450Sqrt, {FlushTranscendentalInput(state, arg0)});
+	return EmitExt(state, TypeF32(state), GLSLstd450Sqrt, {FlushTranscendentalInput(state, arg0, F32FlushClassSqrt)});
 }
 
 uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450Exp2, {FlushTranscendentalInput(state, arg0)});
+	return EmitExt(state, TypeF32(state), GLSLstd450Exp2, {FlushTranscendentalInput(state, arg0, F32FlushClassExp)});
 }
 
 uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450Log2, {FlushTranscendentalInput(state, arg0)});
+	return EmitExt(state, TypeF32(state), GLSLstd450Log2, {FlushTranscendentalInput(state, arg0, F32FlushClassLog)});
 }
 
 uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {
@@ -660,9 +769,9 @@ uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 }
 
 uint32_t EmitFPSin(EmitterState& state, uint32_t arg0) {
-	// Relaxed: the fractional cycle alone (no |x| >= 2^23 or signed-zero selects).
+	// Relaxed (KYTY_FLOAT_PROFILE): the fractional cycle alone (no |x| >= 2^23 or signed-zero selects).
 	auto source = Relaxed() ? EmitExt(state, TypeF32(state), GLSLstd450Fract, {arg0})
-	                        : EmitTrigCycleF32(state, arg0, true);
+	                        : EmitTrigCycleF32(state, arg0, !GetCodegenOptions().relaxed_float);
 	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
 	return EmitExt(state, TypeF32(state), GLSLstd450Sin, {source});
 }

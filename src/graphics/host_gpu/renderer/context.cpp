@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/staticOnce.h"
 #include "common/common.h"
 #include "common/hangTrace.h"
 #include "common/liveSwitch.h"
@@ -14,6 +15,8 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep/prepStats.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/gpuOpProfiler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -24,6 +27,8 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <string_view>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -39,6 +44,178 @@ namespace Libs::Graphics {
 static Live::Switch g_sink_routes("KYTY_CP_SINK_ROUTES", Live::ParseDefaultOn);
 // KYTY_DISPATCH_OVERLAP (render.h DispatchOverlapEnabled): live; default on.
 static Live::Switch g_dispatch_overlap("KYTY_DISPATCH_OVERLAP", Live::ParseDefaultOn);
+// KYTY_DISPATCH_OVERLAP_UPLOADS (render.h DispatchOverlapUploadsEnabled): live; default off.
+static Live::Switch g_dispatch_overlap_uploads("KYTY_DISPATCH_OVERLAP_UPLOADS", Live::ParseDefaultOff);
+// KYTY_PM4_BARRIERS=guest (render.h GuestSyncBarriersEnabled): live; default off.
+static Live::Switch g_pm4_guest_barriers("KYTY_PM4_BARRIERS", [](const char* value) -> int64_t {
+	return value != nullptr && std::strcmp(value, "guest") == 0 ? 1 : 0;
+});
+
+// KYTY_GPU_HAZARD / KYTY_GPU_HAZARD_COUNT (render.h GpuHazardMode): live; default 0.
+static Live::Switch g_gpu_hazard("KYTY_GPU_HAZARD", [](const char* value) -> int64_t {
+	return value != nullptr ? std::clamp<int64_t>(std::strtoll(value, nullptr, 10), 0, 4) : 0;
+});
+static Live::Switch g_gpu_hazard_count("KYTY_GPU_HAZARD_COUNT", Live::ParseDefaultOff);
+
+namespace HazCount {
+enum : uint32_t {
+	Disp,        // direct dispatches seen with KYTY_GPU_HAZARD != 0
+	Ovl,         // the dispatch-overlap chain already dropped the pending request
+	Impre,       // accesses not all in bindings
+	Inval,       // no intact chain (something else recorded since the last reset)
+	Raw,         // read-after-write overlap with the chain (guest ranges)
+	War,         // write-after-read
+	Waw,         // write-after-write
+	HostMis,     // guest ranges free, host ranges overlap (the verify count)
+	FreeEmpty,   // free, nothing pending
+	FreeMem,     // free, only ShaderAccess/guest memory dependencies pending
+	FreeSide,    // free, plus the dispatch's own image/buffer barriers or uploads
+	FreeForeign, // free, but other image/buffer barriers or uploads pending
+	FreeOther,   // free, but memory dependencies of other origins pending
+	Skips,       // the dispatch skipped (mode >= 2)
+	Flushes,     // batches recorded
+	Full,        // ... with a full ALL -> ALL memory dependency
+	ImageBarriers, // image barriers recorded in batches
+	ImageOnly,   // batches of image barriers only
+	Begins,      // rendering instances begun
+	ImgRoLayout, // image barrier requests: read-only before and after, layout change only
+	ImgWr,       // write before, read after
+	ImgRw,       // read before, write after
+	ImgWw,       // write before and after
+	ImgSameLayout, // ... of all requests: old layout == new layout
+	ISplit,      // KYTY_INDIRECT_ARGS_RANGES (render.h HazIndirect)
+	ISkip,
+	IConf,
+	IImp,
+	IHost,
+	FullGuest,   // full batches whose memory origins include a guest barrier
+	FullDispatch, // ... include ShaderAccess or ShaderWriteHazard
+	FullDraw,    // ... include a draw's ShaderWrite
+	FullOther,   // ... include none of these
+	InvalNone,   // inval split: no chain since the command buffer began / an invalidation
+	Count
+};
+constexpr const char* Names[Count] = {"disp", "ovl", "impre", "inval", "raw", "war", "waw", "hostmis", "fempty",
+                                      "fmem", "fside", "fforeign", "fother", "skip", "flush", "full", "imgb",
+                                      "imgonly", "rbeg", "iro", "iwr", "irw", "iww", "isame", "isplit", "iskip", "iconf",
+                                      "iimp", "ihost", "fguest", "fdisp", "fdraw", "fother2",
+                                      "invnone"};
+std::atomic<uint64_t> g_values[Count] {};
+inline void Add(uint32_t index, uint64_t amount = 1) {
+	g_values[index].fetch_add(amount, std::memory_order_relaxed);
+}
+std::string Line() {
+	uint64_t values[Count];
+	uint64_t any = 0;
+	for (uint32_t i = 0; i < Count; i++) {
+		values[i] = g_values[i].load(std::memory_order_relaxed);
+		any |= values[i];
+	}
+	// emitsplit measurement: the recorder thread's spin (TSC ticks; the cpidle tsc converts) and the
+	// KYTY_EMIT_SPLIT counters (resolved draws expanded, verify-only records checked, mismatches).
+	const auto r        = CommandStream::ResolvedDrawPublished();
+	uint64_t   mismatch = 0;
+	for (const auto m: r.mismatches) {
+		mismatch += m;
+	}
+	std::string text = " rec [busy_us " + std::to_string(CommandRecorder::TotalBusyNs() / 1000u) + ", spin_tsc " +
+	                   std::to_string(DrawPrep::PrepStats::g_spin.recorder.load(std::memory_order_relaxed)) +
+	                   ", es " + std::to_string(r.records) + ", espush " + std::to_string(r.pushes) + ", esvchk " +
+	                   std::to_string(r.verify_checks) + ", esvmis " + std::to_string(mismatch) + "]";
+	if (any == 0) {
+		return text;
+	}
+	text += " haz [";
+	for (uint32_t i = 0; i < Count; i++) {
+		text += Names[i];
+		text += ' ';
+		text += std::to_string(values[i]);
+		text += i + 1 < Count ? ", " : "]";
+	}
+	return text;
+}
+[[maybe_unused]] const bool g_line_registered = (Live::SetLineSuffixProvider(&Line), true);
+} // namespace HazCount
+
+int64_t GpuHazardMode() {
+	return BarrierBatchEnabled() ? g_gpu_hazard.Get() : 0;
+}
+
+bool GpuHazardCountEnabled() {
+	return g_gpu_hazard_count.On();
+}
+
+void GpuHazardCountIndirect(HazIndirect what) {
+	if (g_gpu_hazard_count.On()) {
+		HazCount::Add(HazCount::ISplit + static_cast<uint32_t>(what));
+	}
+}
+
+// KYTY_GUEST_BARRIER_SCOPE (render.h GuestBarrierScope): live; default every kind full.
+int64_t ParseGuestBarrierScope(const char* value) {
+	if (value == nullptr || value[0] == '\0') {
+		return 0;
+	}
+	constexpr auto Kinds = static_cast<uint32_t>(GuestBarrierKind::Count);
+	auto set = [](int64_t bits, uint32_t kind, uint32_t mode) {
+		return (bits & ~(int64_t {3} << (2 * kind))) | (int64_t {mode} << (2 * kind));
+	};
+	auto mode_of = [](std::string_view text) -> int {
+		if (text == "full") return 0;
+		if (text == "narrow") return 1;
+		if (text == "drop") return 2;
+		return -1;
+	};
+	int64_t          bits = 0;
+	std::string_view rest(value);
+	while (!rest.empty()) {
+		const auto comma = rest.find(',');
+		auto       item  = rest.substr(0, comma);
+		rest             = comma == std::string_view::npos ? std::string_view {} : rest.substr(comma + 1);
+		if (item.empty()) {
+			continue;
+		}
+		const auto equals = item.find('=');
+		if (equals == std::string_view::npos) {
+			// Shorthand: the four EVENT_WRITE kinds.
+			const int mode = mode_of(item);
+			if (mode < 0) {
+				return -1;
+			}
+			for (uint32_t kind = 0; kind <= static_cast<uint32_t>(GuestBarrierKind::MetaWriteback); kind++) {
+				bits = set(bits, kind, static_cast<uint32_t>(mode));
+			}
+			continue;
+		}
+		const auto name = item.substr(0, equals);
+		const int  mode = mode_of(item.substr(equals + 1));
+		if (mode < 0) {
+			return -1;
+		}
+		static constexpr std::string_view Names[Kinds] = {"cs", "gfx", "cbdb", "meta", "rel", "sync"};
+		bool found = false;
+		for (uint32_t kind = 0; kind < Kinds; kind++) {
+			if (name == Names[kind] || name == "all") {
+				bits  = set(bits, kind, static_cast<uint32_t>(mode));
+				found = true;
+			}
+		}
+		if (!found) {
+			return -1;
+		}
+	}
+	return bits;
+}
+
+static Live::Switch g_guest_barrier_scope("KYTY_GUEST_BARRIER_SCOPE", [](const char* value) -> int64_t {
+	const auto bits = ParseGuestBarrierScope(value);
+	return bits < 0 ? 0 : bits; // malformed: every kind full
+});
+
+GuestBarrierMode GuestBarrierScope(GuestBarrierKind kind) {
+	const auto bits = g_guest_barrier_scope.Get();
+	return static_cast<GuestBarrierMode>((bits >> (2 * static_cast<uint32_t>(kind))) & 3);
+}
 
 // ------------------------------------------------------------------------------------------------
 // Barrier batcher
@@ -59,10 +236,12 @@ static bool EnvSwitch(const char* name, bool default_value) {
 // write-after-write the barrier made for the shader reads did not cover) and a write-back for the
 // driver.
 static vk::AttachmentStoreOp DepthStoreOp(vk::ImageLayout layout, bool stencil) {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_DEPTH_RO_STORE_NONE");
 		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	if (enabled) {
 		switch (layout) {
 			case vk::ImageLayout::eDepthStencilReadOnlyOptimal: return vk::AttachmentStoreOp::eNone;
@@ -97,7 +276,8 @@ bool BarrierSinkEnabled() {
 }
 
 bool UploadBatchEnabled() {
-	static const bool enabled = BarrierBatchEnabled() && EnvSwitch("KYTY_UPLOAD_BATCH", true);
+	static constinit Common::StaticOnce<bool> enabled_once;
+	const bool& enabled = enabled_once.Get([&] { return BarrierBatchEnabled() && EnvSwitch("KYTY_UPLOAD_BATCH", true); });
 	return enabled;
 }
 
@@ -219,7 +399,24 @@ constinit GpuOpProfiler::Site g_batch_sites[static_cast<size_t>(BarrierOrigin::C
     GpuOpProfiler::Site {"batch.mixed"},
 };
 
-GpuOpProfiler::Site& BatchSite(uint32_t origins) {
+// Batches with exactly one GuestBarrierKind: guest-only, and mixed with other origins.
+constinit GpuOpProfiler::Site g_guest_kind_sites[2][static_cast<size_t>(GuestBarrierKind::Count)] = {
+    {GpuOpProfiler::Site {"batch.guest.cs_flush"}, GpuOpProfiler::Site {"batch.guest.gfx_flush"},
+     GpuOpProfiler::Site {"batch.guest.cbdb_wb"}, GpuOpProfiler::Site {"batch.guest.meta_wb"},
+     GpuOpProfiler::Site {"batch.guest.release_mem"}, GpuOpProfiler::Site {"batch.guest.pm4_sync"}},
+    {GpuOpProfiler::Site {"batch.mixed.guest.cs_flush"}, GpuOpProfiler::Site {"batch.mixed.guest.gfx_flush"},
+     GpuOpProfiler::Site {"batch.mixed.guest.cbdb_wb"}, GpuOpProfiler::Site {"batch.mixed.guest.meta_wb"},
+     GpuOpProfiler::Site {"batch.mixed.guest.release_mem"}, GpuOpProfiler::Site {"batch.mixed.guest.pm4_sync"}},
+};
+
+GpuOpProfiler::Site& BatchSite(uint32_t origins, uint32_t guest_kinds) {
+	constexpr uint32_t GuestBit = 1u << static_cast<uint32_t>(BarrierOrigin::Guest);
+	if ((origins & GuestBit) != 0 && guest_kinds != 0 && std::has_single_bit(guest_kinds)) {
+		const auto kind = static_cast<size_t>(std::countr_zero(guest_kinds));
+		if (kind < static_cast<size_t>(GuestBarrierKind::Count)) {
+			return g_guest_kind_sites[origins == GuestBit ? 0 : 1][kind];
+		}
+	}
 	if (origins != 0 && std::has_single_bit(origins)) {
 		const auto index = static_cast<size_t>(std::countr_zero(origins));
 		if (index < static_cast<size_t>(BarrierOrigin::Count)) {
@@ -261,7 +458,8 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 		NoteForeignCommand();
 	}
 	// Including push-constant updates with other layouts (helper passes, occlusion reductions).
-	m_push_constants.valid = false;
+	SettleEncode();
+	m_shadow.InvalidatePushConstants();
 	if (Encoding()) {
 		// KYTY_CP_RECORDER: the recorder executes everything encoded so far (including the batch
 		// flushed above); the caller then records natively at exactly this position.
@@ -285,7 +483,8 @@ CommandSink CommandBuffer::Sink() const {
 		FlushBarriers();
 		NoteForeignCommand();
 	}
-	m_push_constants.valid = false;
+	SettleEncode();
+	m_shadow.InvalidatePushConstants();
 	return CommandSink(*this);
 }
 
@@ -318,6 +517,7 @@ void CommandBuffer::OpenDirectWindow(const void* caller) const {
 	}
 	m_recorder->Drain(site != nullptr ? site : caller, site != nullptr);
 	m_direct_window = true;
+	m_record_reset  = true; // KYTY_EMIT_SPLIT: native commands follow
 	m_recorder->SetWindowOpen(true);
 }
 
@@ -337,10 +537,25 @@ void CommandBuffer::ResetBarrierState() const {
 	m_internal_recording   = 0;
 	m_feedback_keep.reset();
 	m_overlap_open         = false;
+	m_overlap_upload_fenced = false;
+	m_upload_narrow         = false;
+	m_dispatch_prep         = false;
+	// KYTY_GPU_HAZARD: commands of earlier submissions precede this buffer; no chain until a reset.
+	++m_haz_foreign;
+	m_haz_chain.Invalidate();
+	m_haz_stash_valid = false;
 }
 
 bool DispatchOverlapEnabled() {
 	return BarrierBatchEnabled() && g_dispatch_overlap.Get() != 0;
+}
+
+bool DispatchOverlapUploadsEnabled() {
+	return DispatchOverlapEnabled() && UploadBatchEnabled() && g_dispatch_overlap_uploads.Get() != 0;
+}
+
+bool GuestSyncBarriersEnabled() {
+	return g_pm4_guest_barriers.Get() != 0;
 }
 
 void CommandBuffer::NoteGuestDispatch(bool lds) const {
@@ -352,20 +567,197 @@ void CommandBuffer::NoteGuestDispatch(bool lds) const {
 	m_overlap_lds = lds;
 }
 
+bool CommandBuffer::KeepUploadsForDispatch() const {
+	return m_dispatch_prep && m_overlap_open && DispatchOverlapUploadsEnabled() &&
+	       m_pending.has_memory && m_pending.images.empty() && m_pending.buffers.empty() &&
+	       (m_pending.origins & ~(OriginBit(BarrierOrigin::ShaderAccess) | OriginBit(BarrierOrigin::Upload))) == 0;
+}
+
 bool CommandBuffer::TakeDispatchOverlap(bool lds, bool take) const {
 	const bool open = m_overlap_open;
 	m_overlap_open  = false;
+	// KYTY_DISPATCH_OVERLAP_UPLOADS: upload copies queued for this dispatch (CPU-written pages its
+	// bindings need) do not end the chain.
+	const bool with_uploads = !m_pending.uploads.empty() && DispatchOverlapUploadsEnabled();
+	const uint32_t allowed  = OriginBit(BarrierOrigin::ShaderAccess) |
+	                         (with_uploads ? OriginBit(BarrierOrigin::Upload) : 0u);
 	if (!open || lds || m_overlap_lds || !m_pending.has_memory || !m_pending.images.empty() ||
-	    !m_pending.buffers.empty() || !m_pending.uploads.empty() ||
-	    m_pending.origins != OriginBit(BarrierOrigin::ShaderAccess)) {
+	    !m_pending.buffers.empty() || (!m_pending.uploads.empty() && !with_uploads) ||
+	    m_pending.origins != allowed) {
+		m_overlap_upload_fenced = false;
 		return false;
 	}
 	if (take) {
 		// The next dispatch's own ShaderAccess request covers the dropped one: its first scope is
 		// every earlier compute shader access, the dropped dispatch's included.
-		m_pending.Clear();
+		if (with_uploads) {
+			// The first upload of a chain keeps its full pre-copy barrier (everything earlier,
+			// the chain's first dispatch included, before the copies). Later ones only wait for
+			// earlier copies (RecordPendingUploads): the CPU wrote those pages while no guest
+			// synchronization separated the chain's dispatches, which on the console run
+			// concurrently with such writes too. The copies' post barrier still orders them
+			// before this dispatch.
+			m_pending.memory     = vk::MemoryBarrier2 {};
+			m_pending.has_memory = false;
+			m_pending.origins    = OriginBit(BarrierOrigin::Upload);
+			m_pending.memory_origins = 0;
+			m_upload_narrow         = m_overlap_upload_fenced;
+			m_overlap_upload_fenced = true;
+		} else {
+			m_pending.Clear();
+		}
 	}
 	return true;
+}
+
+template <typename Handle>
+static uint64_t HandleBits(Handle handle) {
+	return std::bit_cast<uint64_t>(static_cast<typename Handle::CType>(handle));
+}
+
+bool CommandBuffer::DecideDispatchHazard(const DispatchAccess& access, bool overlap) const {
+	const auto mode = GpuHazardMode();
+	if (mode == 0) {
+		return false;
+	}
+	const bool count = GpuHazardCountEnabled();
+	auto       note  = [count](uint32_t index) {
+        if (count) {
+            HazCount::Add(index);
+        }
+	};
+	note(HazCount::Disp);
+	if (overlap) {
+		note(HazCount::Ovl);
+		return false;
+	}
+	if (!access.precise) {
+		note(HazCount::Impre);
+		return false;
+	}
+	if (!m_haz_chain.Intact(m_haz_foreign) || m_haz_chain.guest.Poisoned()) {
+		note(HazCount::Inval);
+		if (!m_haz_chain.valid) {
+			note(HazCount::InvalNone);
+		}
+		return false;
+	}
+	switch (m_haz_chain.guest.Check(access.guest)) {
+		case Hazard::Verdict::Raw: note(HazCount::Raw); return false;
+		case Hazard::Verdict::War: note(HazCount::War); return false;
+		case Hazard::Verdict::Waw: note(HazCount::Waw); return false;
+		case Hazard::Verdict::Free: break;
+	}
+	// Verify: the conservative host-range check of the same bindings (a mismatch keeps the barrier).
+	if (m_haz_chain.host.Check(access.host) != Hazard::Verdict::Free) {
+		note(HazCount::HostMis);
+		return false;
+	}
+	if (m_pending.Empty()) {
+		note(HazCount::FreeEmpty);
+		if (mode < 2) {
+			return false;
+		}
+		note(HazCount::Skips);
+		return true;
+	}
+	constexpr uint32_t Allowed = OriginBit(BarrierOrigin::ShaderAccess) | OriginBit(BarrierOrigin::Guest) |
+	                             OriginBit(BarrierOrigin::ShaderWriteHazard);
+	if (m_pending.has_memory && (m_pending.memory_origins & ~Allowed) != 0) {
+		note(HazCount::FreeOther);
+		return false;
+	}
+	const bool side = !m_pending.images.empty() || !m_pending.buffers.empty() || !m_pending.uploads.empty();
+	auto       own  = [&access](uint64_t handle) {
+        return std::ranges::find(access.handles, handle) != access.handles.end();
+	};
+	if (side) {
+		bool foreign = false;
+		for (const auto& barrier: m_pending.images) {
+			foreign |= !own(HandleBits(barrier.image));
+		}
+		for (const auto& barrier: m_pending.buffers) {
+			foreign |= !own(HandleBits(barrier.buffer));
+		}
+		uint32_t destinations = 0;
+		for (size_t i = 0; i < m_pending.uploads.size(); i++) {
+			const auto destination = m_pending.uploads[i].destination;
+			foreign |= !own(HandleBits(destination));
+			bool seen = false;
+			for (size_t j = 0; j < i; j++) {
+				seen |= m_pending.uploads[j].destination == destination;
+			}
+			destinations += seen ? 0u : 1u;
+		}
+		// More destinations make RecordPendingUploads merge the post-copy barrier into the memory
+		// dependency, which the dispatch needs before it.
+		if (foreign || destinations > 8) {
+			note(HazCount::FreeForeign);
+			return false;
+		}
+		note(HazCount::FreeSide);
+		if (mode < 3) {
+			return false;
+		}
+	} else {
+		note(HazCount::FreeMem);
+		if (mode < 2) {
+			return false;
+		}
+	}
+	// Take the memory dependency off the batch; NoteHazardDispatch re-queues it after the dispatch.
+	if (m_pending.has_memory) {
+		if (m_haz_stash_valid) {
+			m_haz_stash.srcStageMask |= m_pending.memory.srcStageMask;
+			m_haz_stash.srcAccessMask |= m_pending.memory.srcAccessMask;
+			m_haz_stash.dstStageMask |= m_pending.memory.dstStageMask;
+			m_haz_stash.dstAccessMask |= m_pending.memory.dstAccessMask;
+		} else {
+			m_haz_stash = m_pending.memory;
+		}
+		m_haz_stash_valid = true;
+		m_haz_stash_origins |= m_pending.memory_origins;
+		m_haz_stash_kinds |= m_pending.guest_kinds;
+		m_pending.origins &= ~m_pending.memory_origins;
+		m_pending.memory         = vk::MemoryBarrier2 {};
+		m_pending.has_memory     = false;
+		m_pending.memory_origins = 0;
+		m_pending.guest_kinds    = 0;
+	}
+	if (side) {
+		// The dispatch's own transitions, buffer barriers and uploads, each complete in itself, before it.
+		FlushBarriersImpl(true);
+	}
+	note(HazCount::Skips);
+	return true;
+}
+
+void CommandBuffer::NoteHazardDispatch(const DispatchAccess& access) const {
+	if (const auto mode = GpuHazardMode(); mode != 0) {
+		m_haz_chain.NoteDispatch(m_haz_foreign - 1, m_haz_foreign, access.precise, access.guest, access.host,
+		                         mode >= 4);
+	} else if (m_haz_chain.valid) {
+		m_haz_chain.Invalidate();
+	}
+	if (m_haz_stash_valid) {
+		// The memory dependency taken off before the dispatch, queued again after it: every later
+		// command sees it as it would have (it also covers the dispatch, which recorded no barrier).
+		if (m_pending.has_memory) {
+			m_pending.memory.srcStageMask |= m_haz_stash.srcStageMask;
+			m_pending.memory.srcAccessMask |= m_haz_stash.srcAccessMask;
+			m_pending.memory.dstStageMask |= m_haz_stash.dstStageMask;
+			m_pending.memory.dstAccessMask |= m_haz_stash.dstAccessMask;
+		} else {
+			m_pending.memory     = m_haz_stash;
+			m_pending.has_memory = true;
+		}
+		m_pending.origins |= m_haz_stash_origins;
+		m_pending.memory_origins |= m_haz_stash_origins;
+		m_pending.guest_kinds |= m_haz_stash_kinds;
+		m_haz_stash_valid   = false;
+		m_haz_stash_origins = 0;
+		m_haz_stash_kinds   = 0;
+	}
 }
 
 void CommandBuffer::NoteFeedbackKeep(const vk::ImageMemoryBarrier2& ordering) const {
@@ -415,7 +807,14 @@ void CommandBuffer::RequestMemoryBarrier(vk::PipelineStageFlags2 src_stages,
 		m_pending.has_memory = true;
 	}
 	m_pending.origins |= OriginBit(origin);
+	m_pending.memory_origins |= OriginBit(origin);
 	CountOriginRequest(origin);
+}
+
+void CommandBuffer::NoteGuestBarrierKind(GuestBarrierKind kind) const {
+	if (GpuOpProfiler::Active() && (m_pending.origins & OriginBit(BarrierOrigin::Guest)) != 0) {
+		m_pending.guest_kinds |= 1u << static_cast<uint32_t>(kind);
+	}
 }
 
 void CommandBuffer::RequestBufferBarrier(const vk::BufferMemoryBarrier2& barrier,
@@ -449,6 +848,20 @@ bool CommandBuffer::BatchImageBarriers(std::span<const vk::ImageMemoryBarrier2> 
 	CountBatch(GpuOpProfiler::BarrierBatchEvent::Requests);
 	if (!m_pending.Empty()) {
 		CountBatch(GpuOpProfiler::BarrierBatchEvent::Merged);
+	}
+	if (GpuHazardCountEnabled()) {
+		constexpr vk::AccessFlags2 Writes = Access2::eShaderWrite | Access2::eShaderStorageWrite |
+		                                    Access2::eColorAttachmentWrite | Access2::eDepthStencilAttachmentWrite |
+		                                    Access2::eTransferWrite | Access2::eMemoryWrite | Access2::eHostWrite;
+		for (const auto& barrier: barriers) {
+			const bool before = static_cast<bool>(barrier.srcAccessMask & Writes);
+			const bool after  = static_cast<bool>(barrier.dstAccessMask & Writes);
+			HazCount::Add(before ? (after ? HazCount::ImgWw : HazCount::ImgWr)
+			                     : (after ? HazCount::ImgRw : HazCount::ImgRoLayout));
+			if (barrier.oldLayout == barrier.newLayout) {
+				HazCount::Add(HazCount::ImgSameLayout);
+			}
+		}
 	}
 	for (const auto& barrier: barriers) {
 		// Layout transitions of one image stay in separate, ordered barrier commands.
@@ -528,6 +941,12 @@ void CommandBuffer::RecordPendingUploads() const {
 		                        vk::AccessFlagBits2::eMemoryWrite |
 		                        vk::AccessFlagBits2::eTransferRead |
 		                        vk::AccessFlagBits2::eTransferWrite;
+		if (m_upload_narrow) {
+			// KYTY_DISPATCH_OVERLAP_UPLOADS (TakeDispatchOverlap): a later upload of an open
+			// dispatch chain waits for the earlier copies only.
+			barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+			barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+		}
 		barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
 		barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
 		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -574,6 +993,7 @@ void CommandBuffer::RecordPendingUploads() const {
 	const auto     post_dst_access =
 	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	if (global) {
+		m_pending.memory_origins |= OriginBit(BarrierOrigin::Upload);
 		if (m_pending.has_memory) {
 			m_pending.memory.srcStageMask |= post_src_stage;
 			m_pending.memory.srcAccessMask |= post_src_access;
@@ -601,6 +1021,10 @@ void CommandBuffer::RecordPendingUploads() const {
 }
 
 void CommandBuffer::FlushBarriers() const {
+	FlushBarriersImpl(false);
+}
+
+void CommandBuffer::FlushBarriersImpl(bool side_own) const {
 	if (m_pending.Empty()) {
 		return;
 	}
@@ -615,10 +1039,11 @@ void CommandBuffer::FlushBarriers() const {
 		// is entered, so the end is attributed to the site whose command needed the flush.
 		EndRendering();
 	}
+	const bool side = !m_pending.uploads.empty() || !m_pending.images.empty() || !m_pending.buffers.empty();
 	if (!m_pending.uploads.empty()) {
 		RecordPendingUploads();
 	}
-	const GpuOpProfiler::ScopedSite site(BatchSite(m_pending.origins));
+	const GpuOpProfiler::ScopedSite site(BatchSite(m_pending.origins, m_pending.guest_kinds));
 	++m_internal_recording;
 	if (m_pending.has_memory) {
 		// The requests were issued in some order with nothing recorded between them. Widening
@@ -648,6 +1073,48 @@ void CommandBuffer::FlushBarriers() const {
 	StateSink().pipelineBarrier2(dependency);
 	--m_internal_recording;
 
+	// KYTY_GPU_HAZARD: the chain restarts at a barrier that orders everything (or the chain's
+	// dispatches) before later compute accesses; other recorded barriers end it.
+	if (GpuHazardMode() != 0) {
+		const auto& memory = m_pending.memory;
+		m_haz_chain.OnFlush(m_haz_foreign, m_pending.has_memory,
+		                    static_cast<VkPipelineStageFlags2>(memory.srcStageMask),
+		                    static_cast<VkAccessFlags2>(memory.srcAccessMask),
+		                    static_cast<VkPipelineStageFlags2>(memory.dstStageMask),
+		                    static_cast<VkAccessFlags2>(memory.dstAccessMask), side && !side_own);
+	} else if (m_haz_chain.valid) {
+		m_haz_chain.Invalidate();
+	}
+	if (GpuHazardCountEnabled()) {
+		HazCount::Add(HazCount::Flushes);
+		if (m_pending.has_memory && IsFullBarrier(m_pending.memory)) {
+			HazCount::Add(HazCount::Full);
+			const auto o = m_pending.memory_origins;
+			bool       any = false;
+			if (o & OriginBit(BarrierOrigin::Guest)) {
+				HazCount::Add(HazCount::FullGuest);
+				any = true;
+			}
+			if (o & (OriginBit(BarrierOrigin::ShaderAccess) | OriginBit(BarrierOrigin::ShaderWriteHazard))) {
+				HazCount::Add(HazCount::FullDispatch);
+				any = true;
+			}
+			if (o & OriginBit(BarrierOrigin::ShaderWrite)) {
+				HazCount::Add(HazCount::FullDraw);
+				any = true;
+			}
+			if (!any) {
+				HazCount::Add(HazCount::FullOther);
+			}
+		}
+		if (!m_pending.images.empty()) {
+			HazCount::Add(HazCount::ImageBarriers, m_pending.images.size());
+			if (!m_pending.has_memory && m_pending.buffers.empty()) {
+				HazCount::Add(HazCount::ImageOnly);
+			}
+		}
+	}
+
 	m_last_memory_valid = m_pending.has_memory;
 	if (m_pending.has_memory) {
 		m_last_memory = m_pending.memory;
@@ -658,6 +1125,7 @@ void CommandBuffer::FlushBarriers() const {
 	m_epoch_clean    = m_pending.has_memory && IsFullBarrier(m_pending.memory);
 	m_epoch_instance = 0;
 	m_overlap_open   = false;
+	m_upload_narrow  = false;
 	m_pending.Clear();
 }
 
@@ -693,6 +1161,7 @@ bool CommandBuffer::CanSinkDrawWrites() const {
 void CommandBuffer::NoteDrawRecorded() const {
 	m_recorded_since_flush = true;
 	m_overlap_open         = false;
+	++m_haz_foreign;
 	if (!(m_draw_scope && m_draw_safe && m_rendering && m_epoch_instance == m_rendering_serial)) {
 		m_epoch_clean = false;
 	}
@@ -700,16 +1169,10 @@ void CommandBuffer::NoteDrawRecorded() const {
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	m_bound_pipelines = {};
-	for (auto& state: m_descriptor_states) {
-		state.layout    = nullptr;
-		state.bound_set = nullptr;
-	}
-	for (auto& epoch: m_descriptor_epochs) {
-		epoch++;
-	}
-	// Push constants are undefined at the start of a command buffer.
-	m_push_constants.valid = false;
+	// Nothing bound, every descriptor epoch advances, push constants are undefined.
+	SettleEncode();
+	m_shadow.Begin();
+	m_record_reset = true;
 	// Commands of other submissions can precede this buffer on the queue: no epoch, no elision.
 	ResetBarrierState();
 	m_direct_window = false;
@@ -746,163 +1209,47 @@ void CommandBuffer::End() const {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
-static size_t BindingPointIndex(vk::PipelineBindPoint point) {
-	EXIT_IF(point != vk::PipelineBindPoint::eGraphics && point != vk::PipelineBindPoint::eCompute);
-	return point == vk::PipelineBindPoint::eCompute ? 1u : 0u;
+DrawEncode::ShadowFlags CommandBuffer::EncodeFlags() {
+	return {Common::RendererBatchEnabled(), PushConstantShadowEnabled(), DescriptorSetReuseEnabled()};
 }
 
+// State commands: not ordered by barriers, so not batch flush points (render.h).
 void CommandBuffer::BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) {
-	auto& current = m_bound_pipelines[BindingPointIndex(point)];
-	if (Common::RendererBatchEnabled() && current == pipeline) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::PipelineBindsAvoided);
-		return;
-	}
-	// State commands: not ordered by barriers, so not a batch flush point (render.h).
-	StateSink().bindPipeline(point, pipeline);
-	current = pipeline;
+	auto sink = StateSink();
+	m_shadow.BindPipeline(sink, EncodeFlags(), point, pipeline);
 }
 
 void CommandBuffer::ForgetBoundState() {
-	m_bound_pipelines = {};
-	InvalidateDescriptors(vk::PipelineBindPoint::eGraphics);
-	InvalidateDescriptors(vk::PipelineBindPoint::eCompute);
-	m_push_constants.valid = false;
+	// As at Begin(): no pipeline bound, descriptor epochs advanced, push constants undefined.
+	SettleEncode();
+	m_shadow.Begin();
 }
 
 void CommandBuffer::InvalidateDescriptors(vk::PipelineBindPoint point) {
-	auto& state     = m_descriptor_states[BindingPointIndex(point)];
-	state.layout    = nullptr;
-	state.bound_set = nullptr;
-	m_descriptor_epochs[BindingPointIndex(point)]++;
+	SettleEncode();
+	m_shadow.InvalidateDescriptors(point);
 }
 
 void CommandBuffer::BindDescriptorSet(vk::PipelineBindPoint point, vk::PipelineLayout layout,
                                       vk::DescriptorSet set) {
-	auto& state = m_descriptor_states[BindingPointIndex(point)];
-	EXIT_IF(set == nullptr || layout == nullptr);
-	if (DescriptorSetReuseEnabled() && state.bound_set == set && state.layout == layout) {
-		// Still bound as set 0 with this layout: nothing since disturbed it (every other bind and
-		// every push descriptor update of this bind point passes through this class), and binding
-		// a pipeline never disturbs descriptor sets.
-		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorSetBindsAvoided);
-		return;
-	}
-	StateSink().bindDescriptorSets(point, layout, 0, 1, &set, 0, nullptr);
-	m_descriptor_epochs[BindingPointIndex(point)]++;
-	state.layout    = DescriptorSetReuseEnabled() ? layout : nullptr;
-	state.bound_set = DescriptorSetReuseEnabled() ? set : nullptr;
-	state.writes.clear();
-	state.buffers.clear();
-	state.images.clear();
+	SettleEncode();
+	auto sink = StateSink();
+	m_shadow.BindDescriptorSet(sink, EncodeFlags(), point, layout, set);
 }
 
 void CommandBuffer::PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages,
                                   uint32_t size, const void* data) {
-	auto& shadow = m_push_constants;
-	// Push-constant values persist in the command buffer across pipeline binds; values set with
-	// this very layout are valid for every pipeline created with it.
-	if (PushConstantShadowEnabled() && shadow.valid && shadow.layout == layout &&
-	    shadow.stages == stages && shadow.size == size &&
-	    std::memcmp(shadow.dwords.data(), data, size) == 0) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::PushConstantUpdatesAvoided);
-		return;
-	}
-	StateSink().pushConstants(layout, stages, 0, size, data);
-	Profiler::CountFrameEvent(Profiler::FrameEvent::PushConstantUpdates);
-	shadow.valid = PushConstantShadowEnabled() && size <= sizeof(shadow.dwords);
-	if (shadow.valid) {
-		shadow.layout = layout;
-		shadow.stages = stages;
-		shadow.size   = size;
-		std::memcpy(shadow.dwords.data(), data, size);
-	}
+	SettleEncode();
+	auto sink = StateSink();
+	m_shadow.PushConstants(sink, EncodeFlags(), layout, stages, size, data);
 }
 
 int32_t CommandBuffer::PushDescriptors(vk::PipelineBindPoint point, vk::PipelineLayout layout,
                                        uint32_t set, uint32_t count,
                                        const vk::WriteDescriptorSet* writes, bool known_miss) {
-	auto& state = m_descriptor_states[BindingPointIndex(point)];
-	if (known_miss) {
-		// The comparison below could only miss. No copy is kept for the next update either: one
-		// equal to this (its upload deduplicated to the same range) is then recorded again, which
-		// is only redundant; the Sky Garden start avoids no push at all (DescriptorPushesAvoided).
-		StateSink().pushDescriptorSetKHR(point, layout, set, count, writes);
-		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
-		state.layout    = nullptr;
-		state.bound_set = nullptr;
-		return PushMissFresh;
-	}
-	bool supported = Common::RendererBatchEnabled() && set == 0;
-	size_t buffer_count = 0, image_count = 0;
-	for (uint32_t i = 0; supported && i < count; ++i) {
-		const auto& write = writes[i];
-		const bool buffer_type = write.descriptorType == vk::DescriptorType::eStorageBuffer ||
-		                         write.descriptorType == vk::DescriptorType::eUniformBuffer;
-		const bool image_type = write.descriptorType == vk::DescriptorType::eSampler ||
-		                        write.descriptorType == vk::DescriptorType::eSampledImage ||
-		                        write.descriptorType == vk::DescriptorType::eStorageImage ||
-		                        write.descriptorType == vk::DescriptorType::eCombinedImageSampler;
-		supported = write.pNext == nullptr && write.pTexelBufferView == nullptr &&
-		            ((buffer_type && write.pBufferInfo != nullptr) ||
-		             (image_type && write.pImageInfo != nullptr));
-		buffer_count += buffer_type ? write.descriptorCount : 0u;
-		image_count += image_type ? write.descriptorCount : 0u;
-	}
-	int32_t result = PushMissState;
-	if (supported && state.layout == layout && state.bound_set == nullptr) {
-		result = state.writes.size() == count && state.buffers.size() == buffer_count &&
-		                 state.images.size() == image_count
-		             ? PushAvoided
-		             : PushMissShape;
-		size_t buffer_index = 0, image_index = 0;
-		for (uint32_t i = 0; result == PushAvoided && i < count; ++i) {
-			const auto& write = writes[i];
-			const auto& old   = state.writes[i];
-			if (write.dstBinding != old.dstBinding || write.dstArrayElement != old.dstArrayElement ||
-			    write.descriptorCount != old.descriptorCount ||
-			    write.descriptorType != old.descriptorType) {
-				result = PushMissShape;
-				break;
-			}
-			const bool buffer_type = write.descriptorType == vk::DescriptorType::eStorageBuffer ||
-			                         write.descriptorType == vk::DescriptorType::eUniformBuffer;
-			for (uint32_t j = 0; j < write.descriptorCount; ++j) {
-				const bool equal = buffer_type ? write.pBufferInfo[j] == state.buffers[buffer_index++]
-				                               : write.pImageInfo[j] == state.images[image_index++];
-				if (!equal) {
-					result = static_cast<int32_t>(i);
-					break;
-				}
-			}
-		}
-	}
-	if (result == PushAvoided) {
-		Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushesAvoided);
-		return result;
-	}
-	StateSink().pushDescriptorSetKHR(point, layout, set, count, writes);
-	m_descriptor_epochs[BindingPointIndex(point)]++;
-	Profiler::CountFrameEvent(Profiler::FrameEvent::DescriptorPushes);
-	state.layout    = nullptr;
-	state.bound_set = nullptr;
-	if (!supported) return result;
-	state.writes.assign(writes, writes + count);
-	state.buffers.clear();
-	state.images.clear();
-	state.buffers.reserve(buffer_count);
-	state.images.reserve(image_count);
-	for (auto& write: state.writes) {
-		const bool buffer_type = write.descriptorType == vk::DescriptorType::eStorageBuffer ||
-		                         write.descriptorType == vk::DescriptorType::eUniformBuffer;
-		if (buffer_type) state.buffers.insert(state.buffers.end(), write.pBufferInfo,
-		                                     write.pBufferInfo + write.descriptorCount);
-		else state.images.insert(state.images.end(), write.pImageInfo,
-		                         write.pImageInfo + write.descriptorCount);
-		write.pBufferInfo = nullptr;
-		write.pImageInfo = nullptr;
-	}
-	state.layout = layout;
-	return result;
+	SettleEncode();
+	auto sink = StateSink();
+	return m_shadow.PushDescriptors(sink, EncodeFlags(), point, layout, set, count, writes, known_miss);
 }
 
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
@@ -1005,8 +1352,6 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		CountBatch(GpuOpProfiler::BarrierBatchEvent::RenderSplits);
 		barrier_split = true;
 	}
-	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
-	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	if (m_rendering) {
 		// Attribution of the end (GpuOps.EndRendering.<site>): a pending barrier that could not
 		// be sunk, or different targets/state/occlusion control.
@@ -1073,6 +1418,10 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
+	if (DeadViewScrubEnabled()) {
+		// KYTY_DEAD_VIEW_SCRUB: also checked when an encoded rendering runs (commandRecorder.cpp).
+		ScrubDeadRenderingViews(rendering, "a draw's rendering");
+	}
 	StateSink().beginRendering(rendering);
 	m_context.GetOcclusionCounter().Begin();
 	--m_internal_recording;
@@ -1099,6 +1448,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering    = true;
 	++m_rendering_serial;
+	if (GpuHazardCountEnabled()) {
+		HazCount::Add(HazCount::Begins);
+	}
 	m_occlusion_control = count_control;
 	if (BarrierBatchEnabled()) {
 		// The attachment load operations of the first instance begun after a full barrier belong

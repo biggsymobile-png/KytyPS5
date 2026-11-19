@@ -26,7 +26,14 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			// HW_ID2 identifies graphics compute as QUEUE=6, ME=0.
 			WriteOperand(inst.dst, IR::Value(inst.src0.value == 0x1818u ? 6u : 0u));
 			return;
-		case O::S_SETREG_B32: EmitControlNop(); return;
+		case O::S_SETREG_B32:
+			// hwreg id = SIMM16[5:0]; 25 = POPS_PACKER opens a POPS (primitive-ordered pixel
+			// shading) section (KYTY_POPS_INTERLOCK, ShaderInfo::pops). The write itself stays a no-op.
+			if (program.stage == ShaderType::Pixel && (inst.src1.value & 0x3fu) == 25u) {
+				program.info.pops = true;
+			}
+			EmitControlNop();
+			return;
 		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
 		case O::S_WAITCNT: S_WAITCNT(inst); return;
 
@@ -278,13 +285,16 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_FF1_I32_B64: return S_FF_I32_B64(inst, false);
 		case O::S_FLBIT_I32_B32: return V_FFBH_32(inst, false);
 		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst);
+		case O::S_FLBIT_I32: return V_FFBH_32(inst, true);
+		case O::S_FLBIT_I32_I64: return S_FLBIT_I32_B64(inst, true);
 
 		case O::S_BITSET0_B32: return S_BITSET_B32(inst, false);
 		case O::S_BITSET1_B32: return S_BITSET_B32(inst, true);
 		case O::S_BITSET0_B64: return S_BITSET_B64(inst, false);
 		case O::S_BITSET1_B64: return S_BITSET_B64(inst, true);
 		case O::S_BITREPLICATE_B64_B32: return S_BITREPLICATE_B64_B32(inst);
-		case O::S_QUADMASK_B64: return S_QUADMASK_B64(inst);
+		case O::S_QUADMASK_B32: return S_QUADMASK(inst, false);
+		case O::S_QUADMASK_B64: return S_QUADMASK(inst, true);
 		case O::S_BFM_B32: return BFM_B32(inst);
 		case O::S_BFM_B64: return S_BFM_B64(inst);
 		case O::S_BFE_U32: return S_BFE_U32(inst, false);
@@ -320,6 +330,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_CDBGSYS_OR_USER:
 		case O::S_CBRANCH_CDBGSYS_AND_USER:
 		case O::S_ENDPGM: return;
+		case O::S_KYTY_CALL_STATE: S_KYTY_CALL_STATE(inst); return;
 		default: return FailMissingTranslation(inst);
 	}
 }

@@ -85,6 +85,12 @@ VALUE_OPCODE(PackHalf2x16, U32, F32x2)
 VALUE_OPCODE(PackSnorm2x16, U32, F32x2)
 VALUE_OPCODE(PackUnorm2x16, U32, F32x2)
 VALUE_OPCODE(PackFloat2x16Rtz, U32, F32, F32)
+// KYTY_NATIVE_F16: two f16 lanes packed in each u32, one f16vec2 operation.
+VALUE_OPCODE(HalfPkAdd, U32, U32, U32)
+VALUE_OPCODE(HalfPkMul, U32, U32, U32)
+VALUE_OPCODE(HalfPkMin, U32, U32, U32)
+VALUE_OPCODE(HalfPkMax, U32, U32, U32)
+VALUE_OPCODE(HalfPkFma, U32, U32, U32, U32)
 
 // Source/destination modifiers made explicit by translation.
 VALUE_OPCODE(FPAbs32, F32, F32)
@@ -100,6 +106,7 @@ VALUE_OPCODE(WqmU64, U64, U64)
 // Core value operations used to expand architectural side effects.
 VALUE_OPCODE(SelectU1, U1, U1, U1, U1)
 VALUE_OPCODE(SelectF32, F32, U1, F32, F32)
+VALUE_OPCODE(SelectF64, F64, U1, F64, F64)
 VALUE_OPCODE(IAdd32, U32, U32, U32)
 VALUE_OPCODE(IAdd64, U64, U64, U64)
 VALUE_OPCODE(IAddCarry32, U32x2, U32, U32)
@@ -226,12 +233,23 @@ VALUE_OPCODE(FPFract32, F32, F32)
 VALUE_OPCODE(FPFract64, F64, F64)
 
 VALUE_OPCODE(LaneId, U32)
+// Call-split programs (CallSplit.h, KYTY_SHADER_CALLS_SPLIT): push-data parameter i of the call
+// state, a dword load/store at a device address of the call-state buffer (no page table, no exec
+// mask), a store that skips a value equal to the loaded original, and the probe of a scalar
+// register's value at a call loop (planning translations only, never emitted).
+VALUE_OPCODE(CallStateParam, U32, U32)
+VALUE_OPCODE(CallStateLoad, U32, U64)
+VALUE_OPCODE(CallStateStore, Void, U64, U32)
+VALUE_OPCODE(CallStateStoreChanged, Void, U64, U32, U32)
+VALUE_OPCODE(CallStateProbe, Void, U32, U32)
+// KYTY_CALL_PARTITIONS: report set address, key, leader lane (ShaderCalls.h).
+VALUE_OPCODE(CallStateReport, Void, U64, U32, U1)
 VALUE_OPCODE(Ballot, U32x4, U1)
 VALUE_OPCODE(AnyLane, U1, U1)
 VALUE_OPCODE(ReadFirstLane, U32, U32, U1)
 VALUE_OPCODE(ReadLane, U32, U32, U32)
 VALUE_OPCODE(WriteLane, U32, U32, U32, U32)
-VALUE_OPCODE(Permlane16U32, U32, U32, U32, U32, U1)
+VALUE_OPCODE(Permlane16U32, U32, U32, U32, U32, U1, U32)
 VALUE_OPCODE(PermuteU32, U32, U32, U32, U1)
 VALUE_OPCODE(BpermuteU32, U32, U32, U32, U1)
 
@@ -251,6 +269,8 @@ VALUE_OPCODE(ReadConstBuffer, U32, BufferResource, U32)
 VALUE_OPCODE(LoadAddressU8, U8, AddressResource, U32, U32, U1)
 VALUE_OPCODE(LoadAddressU16, U16, AddressResource, U32, U32, U1)
 VALUE_OPCODE(LoadAddressU32, U32, AddressResource, U32, U32, U1)
+// The DWORD at host device address (high:low) + offset, both 4-byte aligned; 0 when inactive.
+VALUE_OPCODE(LoadDeviceAddressU32, U32, U32, U32, U32, U1)
 VALUE_OPCODE(StoreAddressU8, Void, AddressResource, U32, U32, U8, U1)
 VALUE_OPCODE(StoreAddressU16, Void, AddressResource, U32, U32, U16, U1)
 VALUE_OPCODE(StoreAddressU32, Void, AddressResource, U32, U32, U32, U1)
@@ -262,6 +282,25 @@ VALUE_OPCODE(BvhIntersectRay, U32x4, AddressResource, U32x4, U32, U32, U32, U32,
 // KYTY_RT_STUB: the "no intersection" result for node pointer (low dword). Opaque on purpose, so
 // traversal code after it is not folded away (which reshapes the CFG the game was compiled to).
 VALUE_OPCODE(BvhIntersectRayStub, U32x4, U32)
+// Native ray tracing (KYTY_RT_HW, RayTracingPatch.h, ir/RayQuery.h); the flags hold the site and
+// the variant. Init: origin xyz, direction xyz, t max, cull mask (f32 bits), TLAS header pair, EXEC.
+VALUE_OPCODE(RayQueryInit, U1, U32, U32, U32, U32, U32, U32, U32, U32, U32, U32, U1)
+VALUE_OPCODE(RayQueryNext, U32x4)
+VALUE_OPCODE(RayQueryMatch, U1)
+VALUE_OPCODE(RayQueryCandidate, U32)
+VALUE_OPCODE(RayQueryFlag, U1)
+VALUE_OPCODE(RayQuerySave, Void, U32, U32, U32)
+VALUE_OPCODE(RayQueryResolve, Void, U32, U32, U32)
+VALUE_OPCODE(RayQueryExit, Void)
+VALUE_OPCODE(RayQueryKeep, Void, U32)
+VALUE_OPCODE(RayQueryKept, U32)
+VALUE_OPCODE(RayQueryCount, Void, U1)
+// IMAGE_BVH8_INTERSECT_RAY (PS5 Pro, upstream 5eab0ec73): GetAddressResource(T# base lo, hi), T#
+// dwords 0-3, encoded base lo/hi, ray extent, instance mask, origin xyz, direction xyz, node pointer,
+// EXEC. Bvh8Extract reads result dword 0-9 (destination), 10-15 (ray out) or 16 (instance flag).
+VALUE_OPCODE(Bvh8IntersectRay, Bvh8Result, AddressResource, U32x4, U32, U32, U32, U32, U32, U32, U32,
+             U32, U32, U32, U32, U1)
+VALUE_OPCODE(Bvh8Extract, U32, Bvh8Result, U32)
 VALUE_OPCODE(LoadBufferU8, U8, BufferResource, U32, U32, U32, U1)
 VALUE_OPCODE(LoadBufferU16, U16, BufferResource, U32, U32, U32, U1)
 VALUE_OPCODE(LoadBufferU32, U32, BufferResource, U32, U32, U32, U1)
@@ -340,6 +379,9 @@ VALUE_OPCODE(SwizzleU32, U32, U32, U32, U1)
 VALUE_OPCODE(ImageQueryDimensions, U32x4, ImageResource, ImageAddress)
 VALUE_OPCODE(ImageQueryLod, U32x4, ImageResource, SamplerResource, ImageAddress)
 VALUE_OPCODE(ImageRead, U32x4, ImageResource, ImageAddress, U1)
+// KYTY_IMAGE_GLC_COHERENT / KYTY_POPS_INTERLOCK: IMAGE_LOAD* through the storage image (OpImageRead),
+// so a GLC load or a POPS read-modify-write sees the stores of other invocations.
+VALUE_OPCODE(ImageReadStorage, U32x4, ImageResource, ImageAddress, U1)
 VALUE_OPCODE(ImageWrite, Void, ImageResource, ImageAddress, U32x4, U1)
 VALUE_OPCODE(ImageSampleRaw, U32x4, ImageResource, SamplerResource, ImageAddress)
 VALUE_OPCODE(ImageGatherRaw, U32x4, ImageResource, SamplerResource, ImageAddress, U32, U32, U32, U32)

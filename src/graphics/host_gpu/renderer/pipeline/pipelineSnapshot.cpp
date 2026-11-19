@@ -26,7 +26,7 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 	s.m_mesh = allow_mesh && info.stageCount != 0 && info.pStages[0].stage == vk::ShaderStageFlagBits::eMeshEXT;
 	if (info.flags != vk::PipelineCreateFlags {} || info.renderPass != nullptr ||
 	    info.basePipelineHandle != nullptr || info.layout == nullptr ||
-	    info.pTessellationState != nullptr || (info.pVertexInputState == nullptr) != s.m_mesh ||
+	    (info.pTessellationState != nullptr && !allow_mesh) || (info.pVertexInputState == nullptr) != s.m_mesh ||
 	    (info.pInputAssemblyState == nullptr) != s.m_mesh || info.pViewportState == nullptr ||
 	    info.pRasterizationState == nullptr || info.pMultisampleState == nullptr ||
 	    info.pColorBlendState == nullptr || info.pDynamicState == nullptr) {
@@ -35,6 +35,16 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 	// The create info itself: exactly one VkPipelineRenderingCreateInfo.
 	const vk::PipelineRenderingCreateInfo* rendering = nullptr;
 	for (const auto* next = Next(info.pNext); next != nullptr; next = next->pNext) {
+		if (allow_mesh && next->sType == vk::StructureType::eAttachmentSampleCountInfoAMD &&
+		    !s.m_has_sample_count) {
+			// NV mixed samples: the attachments' sample counts (journal keys only).
+			const auto& counts = *reinterpret_cast<const vk::AttachmentSampleCountInfoAMD*>(next);
+			s.m_has_sample_count                         = true;
+			s.m_sample_count.depthStencilAttachmentSamples = counts.depthStencilAttachmentSamples;
+			s.m_color_samples.assign(counts.pColorAttachmentSamples,
+			                         counts.pColorAttachmentSamples + counts.colorAttachmentCount);
+			continue;
+		}
 		if (next->sType != vk::StructureType::ePipelineRenderingCreateInfo ||
 		    rendering != nullptr) {
 			return nullptr;
@@ -42,6 +52,16 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 		rendering = reinterpret_cast<const vk::PipelineRenderingCreateInfo*>(next);
 	}
 	if (rendering == nullptr) return nullptr;
+	// Tessellation (allow_mesh only: the journal and known keys, not the library path): the patch size;
+	// the stages may then also hold one tessellation control and one evaluation shader.
+	if (info.pTessellationState != nullptr) {
+		const auto& tess = *info.pTessellationState;
+		if (s.m_mesh || tess.pNext != nullptr || tess.flags != vk::PipelineTessellationStateCreateFlags {}) {
+			return nullptr;
+		}
+		s.m_tessellation                 = true;
+		s.m_tess_state.patchControlPoints = tess.patchControlPoints;
+	}
 	s.m_rendering.viewMask                = rendering->viewMask;
 	s.m_rendering.depthAttachmentFormat   = rendering->depthAttachmentFormat;
 	s.m_rendering.stencilAttachmentFormat = rendering->stencilAttachmentFormat;
@@ -64,9 +84,19 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 			               ->requiredSubgroupSize;
 		}
 		if (stage.flags != vk::PipelineShaderStageCreateFlags {} ||
-		    stage.pSpecializationInfo != nullptr || stage.module == nullptr ||
+		    (stage.pSpecializationInfo != nullptr && !allow_mesh) || stage.module == nullptr ||
 		    stage.pName == nullptr) {
 			return nullptr;
+		}
+		auto& specialization = s.m_specializations.emplace_back();
+		if (stage.pSpecializationInfo != nullptr) {
+			// Journal keys only: the constants travel with the snapshot.
+			const auto& spec = *stage.pSpecializationInfo;
+			if (spec.mapEntryCount > 256 || spec.dataSize > 4096) return nullptr;
+			specialization.entries.assign(spec.pMapEntries, spec.pMapEntries + spec.mapEntryCount);
+			const auto* bytes = static_cast<const uint8_t*>(spec.pData);
+			specialization.data.assign(bytes, bytes + spec.dataSize);
+			s.m_has_specialization = true;
 		}
 		s.m_stage_subgroups.push_back({.requiredSubgroupSize = subgroup});
 		if (stage.stage == first_stage && s.m_vertex_module == nullptr) {
@@ -74,7 +104,7 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 		} else if (stage.stage == vk::ShaderStageFlagBits::eFragment &&
 		           s.m_fragment_module == nullptr) {
 			s.m_fragment_module = stage.module;
-		} else {
+		} else if (!s.m_tessellation || !s.AddTessellationStage(stage.stage)) {
 			return nullptr;
 		}
 		s.m_stages.push_back(stage);
@@ -154,7 +184,17 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 	}
 
 	const auto& ms = *info.pMultisampleState;
-	if (ms.pNext != nullptr || ms.pSampleMask != nullptr) return nullptr;
+	if (ms.pSampleMask != nullptr) return nullptr;
+	for (const auto* next = Next(ms.pNext); next != nullptr; next = next->pNext) {
+		if (!allow_mesh || next->sType != vk::StructureType::ePipelineCoverageReductionStateCreateInfoNV ||
+		    s.m_has_reduction) {
+			return nullptr;
+		}
+		const auto& reduction = *reinterpret_cast<const vk::PipelineCoverageReductionStateCreateInfoNV*>(next);
+		if (reduction.flags != vk::PipelineCoverageReductionStateCreateFlagsNV {}) return nullptr;
+		s.m_has_reduction                     = true;
+		s.m_reduction.coverageReductionMode   = reduction.coverageReductionMode;
+	}
 	s.m_multisample.flags                 = ms.flags;
 	s.m_multisample.rasterizationSamples  = ms.rasterizationSamples;
 	s.m_multisample.sampleShadingEnable   = ms.sampleShadingEnable;
@@ -198,12 +238,24 @@ GraphicsPipelineSnapshot::Capture(const vk::GraphicsPipelineCreateInfo& info, bo
 }
 
 void GraphicsPipelineSnapshot::Wire() {
-	m_rendering.pNext                   = nullptr;
+	m_sample_count.colorAttachmentCount    = static_cast<uint32_t>(m_color_samples.size());
+	m_sample_count.pColorAttachmentSamples = m_color_samples.data();
+	m_sample_count.pNext                   = nullptr;
+	m_rendering.pNext                   = m_has_sample_count ? &m_sample_count : nullptr;
 	m_rendering.colorAttachmentCount    = static_cast<uint32_t>(m_color_formats.size());
 	m_rendering.pColorAttachmentFormats = m_color_formats.data();
 	for (size_t i = 0; i < m_stages.size(); ++i) {
 		m_stages[i].pName = m_stage_names[i].c_str();
 		m_stages[i].pNext = m_stage_subgroups[i].requiredSubgroupSize != 0 ? &m_stage_subgroups[i] : nullptr;
+		m_stages[i].pSpecializationInfo = nullptr;
+		if (i < m_specializations.size() && !m_specializations[i].entries.empty()) {
+			auto& spec              = m_specializations[i];
+			spec.info.mapEntryCount = static_cast<uint32_t>(spec.entries.size());
+			spec.info.pMapEntries   = spec.entries.data();
+			spec.info.dataSize      = spec.data.size();
+			spec.info.pData         = spec.data.data();
+			m_stages[i].pSpecializationInfo = &spec.info;
+		}
 	}
 	m_vertex_input.vertexBindingDescriptionCount   = static_cast<uint32_t>(m_bindings.size());
 	m_vertex_input.pVertexBindingDescriptions      = m_bindings.data();
@@ -233,10 +285,14 @@ void GraphicsPipelineSnapshot::Wire() {
 	m_create.pInputAssemblyState = m_mesh ? nullptr : &m_input_assembly;
 	m_create.pViewportState      = &m_viewport;
 	m_create.pRasterizationState = &m_rasterization;
+	m_reduction.pNext            = nullptr;
+	m_multisample.pNext          = m_has_reduction ? &m_reduction : nullptr;
 	m_create.pMultisampleState   = &m_multisample;
 	m_create.pDepthStencilState  = m_has_depth_stencil ? &m_depth_stencil : nullptr;
 	m_create.pColorBlendState    = &m_color_blend;
 	m_create.pDynamicState       = &m_dynamic;
+	m_tess_state.pNext           = nullptr;
+	m_create.pTessellationState  = m_tessellation ? &m_tess_state : nullptr;
 	m_create.layout              = layout;
 	m_create.basePipelineIndex   = base_index;
 }
@@ -244,6 +300,12 @@ void GraphicsPipelineSnapshot::Wire() {
 namespace {
 
 constexpr uint32_t SnapshotMagic = 0x324e5350u; // "PSN2"
+// With tessellation (more stages and the patch size); other pipelines keep "PSN2" and their keys.
+constexpr uint32_t SnapshotMagicTess = 0x334e5350u; // "PSN3"
+// Optional block before SnapshotEnd: NV mixed samples (coverage reduction, attachment samples).
+constexpr uint32_t SnapshotMixedBlock = 0x584d5350u; // "PSMX"
+// Optional block before SnapshotEnd (after the mixed block): per-stage specialization constants.
+constexpr uint32_t SnapshotSpecBlock = 0x50535350u; // "PSSP"
 constexpr uint32_t SnapshotEnd   = 0x00444e45u; // "END"
 
 class WordWriter {
@@ -347,7 +409,7 @@ private:
 
 bool GraphicsPipelineSnapshot::Serialize(std::vector<uint32_t>& out, const ModuleHashFn& module_hash) const {
 	WordWriter w(out);
-	w.U32(SnapshotMagic);
+	w.U32(m_tessellation ? SnapshotMagicTess : SnapshotMagic);
 	w.U32(m_mesh ? 1u : 0u);
 	w.U32(m_rendering.viewMask);
 	w.Enum(m_rendering.depthAttachmentFormat);
@@ -363,6 +425,7 @@ bool GraphicsPipelineSnapshot::Serialize(std::vector<uint32_t>& out, const Modul
 		w.Text(m_stage_names[i]);
 		w.U32(m_stage_subgroups[i].requiredSubgroupSize);
 	}
+	if (m_tessellation) w.U32(m_tess_state.patchControlPoints);
 	w.U32(static_cast<uint32_t>(m_bindings.size()));
 	for (const auto& b: m_bindings) {
 		w.U32(b.binding);
@@ -438,6 +501,37 @@ bool GraphicsPipelineSnapshot::Serialize(std::vector<uint32_t>& out, const Modul
 	w.U32(static_cast<uint32_t>(m_dynamic_states.size()));
 	for (const auto state: m_dynamic_states) w.Enum(state);
 	w.U32(static_cast<uint32_t>(m_create.basePipelineIndex));
+	if (m_has_reduction || m_has_sample_count) {
+		// The optional mixed-samples block (absent in older journals).
+		w.U32(SnapshotMixedBlock);
+		w.U32(m_has_reduction ? 1u : 0u);
+		w.Enum(m_reduction.coverageReductionMode);
+		w.U32(m_has_sample_count ? 1u : 0u);
+		w.Enum(m_sample_count.depthStencilAttachmentSamples);
+		w.U32(static_cast<uint32_t>(m_color_samples.size()));
+		for (const auto samples: m_color_samples) w.Enum(samples);
+	}
+	if (m_has_specialization) {
+		// The optional specialization block: per stage, its map entries and data words.
+		w.U32(SnapshotSpecBlock);
+		w.U32(static_cast<uint32_t>(m_specializations.size()));
+		for (const auto& spec: m_specializations) {
+			w.U32(static_cast<uint32_t>(spec.entries.size()));
+			for (const auto& e: spec.entries) {
+				w.U32(e.constantID);
+				w.U32(e.offset);
+				w.U32(static_cast<uint32_t>(e.size));
+			}
+			w.U32(static_cast<uint32_t>(spec.data.size()));
+			for (size_t at = 0; at < spec.data.size(); at += 4) {
+				uint32_t word = 0;
+				for (size_t b = 0; b < 4 && at + b < spec.data.size(); b++) {
+					word |= static_cast<uint32_t>(spec.data[at + b]) << (8u * b);
+				}
+				w.U32(word);
+			}
+		}
+	}
 	w.U32(SnapshotEnd);
 	return true;
 }
@@ -448,13 +542,15 @@ GraphicsPipelineSnapshot::Deserialize(std::span<const uint32_t> words, const Mod
 	std::unique_ptr<GraphicsPipelineSnapshot> copy(new GraphicsPipelineSnapshot());
 	auto&                                     s = *copy;
 	WordReader                                r(words);
-	if (r.U32() != SnapshotMagic) return nullptr;
+	const auto                                magic = r.U32();
+	if (magic != SnapshotMagic && magic != SnapshotMagicTess) return nullptr;
+	s.m_tessellation                      = magic == SnapshotMagicTess;
 	s.m_mesh                              = r.U32() != 0;
 	s.m_rendering.viewMask                = r.U32();
 	s.m_rendering.depthAttachmentFormat   = r.Enum<vk::Format>();
 	s.m_rendering.stencilAttachmentFormat = r.Enum<vk::Format>();
 	for (auto n = r.Count(8); n != 0; --n) s.m_color_formats.push_back(r.Enum<vk::Format>());
-	for (auto n = r.Count(2); n != 0; --n) {
+	for (auto n = r.Count(s.m_tessellation ? 5 : 2); n != 0; --n) {
 		vk::PipelineShaderStageCreateInfo stage {};
 		stage.stage       = static_cast<vk::ShaderStageFlagBits>(r.U32());
 		const auto hash   = r.U64();
@@ -468,13 +564,14 @@ GraphicsPipelineSnapshot::Deserialize(std::span<const uint32_t> words, const Mod
 			s.m_vertex_module = stage.module;
 		} else if (stage.stage == vk::ShaderStageFlagBits::eFragment && s.m_fragment_module == nullptr) {
 			s.m_fragment_module = stage.module;
-		} else {
+		} else if (!s.m_tessellation || !s.AddTessellationStage(stage.stage)) {
 			return nullptr;
 		}
 		s.m_stages.push_back(stage);
 		s.m_stage_names.push_back(std::move(name));
 	}
 	if (s.m_vertex_module == nullptr) return nullptr;
+	if (s.m_tessellation) s.m_tess_state.patchControlPoints = r.U32();
 	for (auto n = r.Count(64); n != 0; --n) {
 		vk::VertexInputBindingDescription b {};
 		b.binding   = r.U32();
@@ -551,7 +648,39 @@ GraphicsPipelineSnapshot::Deserialize(std::span<const uint32_t> words, const Mod
 	for (auto n = r.Count(8); n != 0; --n) s.m_color_write_enables.push_back(r.U32());
 	for (auto n = r.Count(64); n != 0; --n) s.m_dynamic_states.push_back(r.Enum<vk::DynamicState>());
 	s.m_create.basePipelineIndex = static_cast<int32_t>(r.U32());
-	if (r.U32() != SnapshotEnd || r.Failed() || !r.AtEnd()) return nullptr;
+	auto tail = r.U32();
+	if (tail == SnapshotMixedBlock) {
+		s.m_has_reduction                     = r.U32() != 0;
+		s.m_reduction.coverageReductionMode   = r.Enum<vk::CoverageReductionModeNV>();
+		s.m_has_sample_count                  = r.U32() != 0;
+		s.m_sample_count.depthStencilAttachmentSamples = r.Enum<vk::SampleCountFlagBits>();
+		for (auto n = r.Count(8); n != 0; --n) s.m_color_samples.push_back(r.Enum<vk::SampleCountFlagBits>());
+		tail = r.U32();
+	}
+	if (tail == SnapshotSpecBlock) {
+		const auto stages = r.Count(5);
+		if (stages != s.m_stages.size()) return nullptr;
+		s.m_specializations.assign(stages, {});
+		for (auto& spec: s.m_specializations) {
+			for (auto n = r.Count(256); n != 0; --n) {
+				vk::SpecializationMapEntry e {};
+				e.constantID = r.U32();
+				e.offset     = r.U32();
+				e.size       = r.U32();
+				spec.entries.push_back(e);
+			}
+			const auto bytes = r.Count(4096);
+			for (uint32_t at = 0; at < bytes; at += 4) {
+				const auto word = r.U32();
+				for (uint32_t b = 0; b < 4 && at + b < bytes; b++) {
+					spec.data.push_back(static_cast<uint8_t>(word >> (8u * b)));
+				}
+			}
+		}
+		s.m_has_specialization = true;
+		tail                   = r.U32();
+	}
+	if (tail != SnapshotEnd || r.Failed() || !r.AtEnd()) return nullptr;
 	s.m_create.layout = layout;
 	s.Wire();
 	return copy;
@@ -560,13 +689,14 @@ GraphicsPipelineSnapshot::Deserialize(std::span<const uint32_t> words, const Mod
 std::vector<uint64_t> GraphicsPipelineSnapshot::SerializedModules(std::span<const uint32_t> words) {
 	std::vector<uint64_t> hashes;
 	WordReader            r(words);
-	if (r.U32() != SnapshotMagic) return {};
+	const auto            magic = r.U32();
+	if (magic != SnapshotMagic && magic != SnapshotMagicTess) return {};
 	(void)r.U32();
 	(void)r.U32();
 	(void)r.U32();
 	(void)r.U32();
 	for (auto n = r.Count(8); n != 0; --n) (void)r.U32();
-	for (auto n = r.Count(2); n != 0; --n) {
+	for (auto n = r.Count(magic == SnapshotMagicTess ? 5 : 2); n != 0; --n) {
 		(void)r.U32();
 		hashes.push_back(r.U64());
 		(void)r.Text();

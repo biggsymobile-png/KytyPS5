@@ -99,6 +99,7 @@ std::vector<uint8_t> EncodeInfo(const PipelineList::Info& info) {
 	PutText(out, info.producer);
 	for (const auto size: info.input_info_sizes) Put<uint32_t>(out, size);
 	Put<uint64_t>(out, info.created_unix);
+	Put<uint32_t>(out, info.state_format);
 	return out;
 }
 
@@ -107,6 +108,28 @@ std::vector<uint8_t> EncodeLevels(const std::vector<std::string>& levels) {
 	Put<uint32_t>(out, static_cast<uint32_t>(levels.size()));
 	for (const auto& level: levels) PutText(out, level);
 	return out;
+}
+
+std::vector<uint8_t> EncodeFiles(const std::vector<std::string>& files) {
+	std::vector<uint8_t> out;
+	Put<uint32_t>(out, static_cast<uint32_t>(files.size()));
+	for (const auto& file: files) PutText(out, file);
+	return out;
+}
+
+bool DecodeFiles(std::span<const uint8_t> bytes, std::vector<std::string>& files) {
+	Reader     r(bytes);
+	const auto count = r.Count(4);
+	for (uint32_t i = 0; i < count && !r.Failed(); i++) files.push_back(r.Text());
+	if (r.Failed() || !r.AtEnd() || files.size() > PipelineList::MaxDataFiles) return false;
+	// Relative paths inside the game folder only.
+	for (const auto& file: files) {
+		if (file.empty() || file.front() == '/' || file.front() == '\\' || file.find(':') != std::string::npos ||
+		    file.find("..") != std::string::npos) {
+			return false;
+		}
+	}
+	return true;
 }
 
 std::vector<uint8_t> EncodeShaders(const std::vector<PipelineList::Shader>& shaders) {
@@ -173,6 +196,8 @@ bool DecodeInfo(std::span<const uint8_t> bytes, PipelineList::Info& info) {
 	info.producer    = r.Text();
 	for (auto& size: info.input_info_sizes) size = r.Get<uint32_t>();
 	info.created_unix = r.Get<uint64_t>();
+	if (r.Failed()) return false;
+	info.state_format = r.AtEnd() ? 0u : r.Get<uint32_t>(); // appended field (0: older list)
 	return !r.Failed(); // later formats may append fields
 }
 
@@ -209,7 +234,7 @@ bool DecodeShaders(std::span<const uint8_t> bytes, std::vector<PipelineList::Sha
 		s.plain_mip_stats_variant = r.Get<uint8_t>() != 0;
 		s.static_state            = r.Array<uint32_t>();
 		s.input_info              = r.Bytes();
-		if (file != static_cast<uint32_t>(PipelineList::CodeFile::Executable) ||
+		if (file > PipelineList::MaxDataFiles ||
 		    kind > static_cast<uint8_t>(ShaderJournal::Kind::Compute) || s.code_size == 0 ||
 		    s.code_size > (64u << 20u) / 4u || s.back_code_size > (64u << 20u) / 4u) {
 			return false;
@@ -432,13 +457,15 @@ namespace PipelineList {
 // Encoding ---------------------------------------------------------------------------------------
 
 std::vector<uint8_t> Encode(const File& file, int zstd_level) {
-	const std::pair<SectionId, std::vector<uint8_t>> sections[] = {
+	std::vector<std::pair<SectionId, std::vector<uint8_t>>> sections = {
 	    {SectionId::Info, EncodeInfo(file.info)},
 	    {SectionId::Levels, EncodeLevels(file.levels)},
 	    {SectionId::Shaders, EncodeShaders(file.shaders)},
 	    {SectionId::Permutations, EncodePermutations(file.permutations)},
 	    {SectionId::Pipelines, EncodePipelines(file.pipelines)},
 	};
+	// Only lists that read code from data files carry the files section.
+	if (!file.files.empty()) sections.emplace_back(SectionId::Files, EncodeFiles(file.files));
 	std::vector<uint8_t> out(FileMagic, FileMagic + sizeof(FileMagic));
 	Put<uint32_t>(out, FormatVersion);
 	Put<uint32_t>(out, static_cast<uint32_t>(std::size(sections)));
@@ -528,6 +555,12 @@ bool Decode(std::span<const uint8_t> bytes, File& file, std::string* error) {
 	if (!DecodePipelines(*pipelines, file.permutations.size(), file.levels.size(), file.pipelines)) {
 		return Fail(error, "malformed pipelines section");
 	}
+	if (const auto* files = find(SectionId::Files); files != nullptr && !DecodeFiles(*files, file.files)) {
+		return Fail(error, "malformed files section");
+	}
+	for (const auto& shader: file.shaders) {
+		if (static_cast<uint32_t>(shader.file) > file.files.size()) return Fail(error, "a shader names a missing file");
+	}
 	return true;
 }
 
@@ -538,13 +571,14 @@ bool Decode(std::span<const uint8_t> bytes, File& file, std::string* error) {
 bool RewriteSnapshotModules(std::span<uint32_t> words, const std::function<uint64_t(uint32_t)>& hash_for) {
 	constexpr uint32_t SnapshotMagic = 0x324e5350u; // "PSN2"
 	const size_t       size          = words.size();
-	if (size < 7 || words[0] != SnapshotMagic) return false;
+	constexpr uint32_t SnapshotMagicTess = 0x334e5350u; // "PSN3": with tessellation stages
+	if (size < 7 || (words[0] != SnapshotMagic && words[0] != SnapshotMagicTess)) return false;
 	size_t     position = 5; // magic, mesh flag, view mask, depth format, stencil format
 	const auto colors   = words[position++];
 	if (colors > 8 || size - position < colors + 1) return false;
 	position += colors;
 	const auto stages = words[position++];
-	if (stages > 2) return false;
+	if (stages > (words[0] == SnapshotMagicTess ? 5u : 2u)) return false;
 	for (uint32_t i = 0; i < stages; i++) {
 		if (size - position < 4) return false; // flags, hash (two words), entry point length
 		position++;
@@ -557,6 +591,96 @@ bool RewriteSnapshotModules(std::span<uint32_t> words, const std::function<uint6
 		position += (name + 3) / 4 + 1; // entry point, required subgroup size
 	}
 	return true;
+}
+
+namespace {
+
+// Where the device-derived words sit in a snapshot (pipelineSnapshot.cpp, Serialize).
+struct SnapshotDeviceWords {
+	std::vector<size_t> stage_flags;    // per stage: the VkShaderStageFlags word
+	std::vector<size_t> stage_subgroup; // per stage: the required subgroup size word
+	size_t              dynamic_count = 0; // the dynamic state count word; the states follow
+};
+
+bool LocateSnapshotDeviceWords(std::span<const uint32_t> words, SnapshotDeviceWords& out) {
+	constexpr uint32_t SnapshotMagic     = 0x324e5350u; // "PSN2"
+	constexpr uint32_t SnapshotMagicTess = 0x334e5350u; // "PSN3"
+	const size_t       size              = words.size();
+	if (size < 7 || (words[0] != SnapshotMagic && words[0] != SnapshotMagicTess)) return false;
+	const bool tess     = words[0] == SnapshotMagicTess;
+	size_t     position = 5; // magic, mesh flag, view mask, depth format, stencil format
+	// `count` words must follow `position`.
+	const auto room = [&](uint64_t count) { return count <= size - position; };
+	const auto colors = words[position++];
+	if (colors > 8 || !room(uint64_t {colors} + 1)) return false;
+	position += colors;
+	const auto stages = words[position++];
+	if (stages > (tess ? 5u : 2u)) return false;
+	for (uint32_t i = 0; i < stages; i++) {
+		if (!room(4)) return false; // flags, hash (two words), entry point length
+		out.stage_flags.push_back(position);
+		position += 3;
+		const auto name = words[position++];
+		const auto text = (uint64_t {name} + 3) / 4;
+		if (name > 256 || !room(text + 1)) return false;
+		position += text;
+		out.stage_subgroup.push_back(position++);
+	}
+	if (tess) {
+		if (!room(1)) return false;
+		position++; // patch control points
+	}
+	if (!room(1)) return false;
+	const auto bindings = words[position++];
+	if (bindings > 64 || !room(uint64_t {bindings} * 3 + 1)) return false;
+	position += uint64_t {bindings} * 3;
+	const auto attributes = words[position++];
+	// Input assembly, viewport, depth clip control, rasterization, provoking vertex, depth clip,
+	// multisample, depth/stencil, color blend flags, logic op and blend constants up to the blend
+	// attachment count: 56 words.
+	constexpr size_t FixedWords = 56;
+	if (attributes > 64 || !room(uint64_t {attributes} * 4 + FixedWords + 1)) return false;
+	position += uint64_t {attributes} * 4 + FixedWords;
+	const auto blends = words[position++];
+	// Blend attachments (8 words each), the color write flag, its count.
+	if (blends > 8 || !room(uint64_t {blends} * 8 + 2)) return false;
+	position += uint64_t {blends} * 8 + 1;
+	const auto writes = words[position++];
+	if (writes > 8 || !room(uint64_t {writes} + 1)) return false;
+	position += writes;
+	out.dynamic_count = position;
+	return words[position] <= 64 && room(uint64_t {words[position]} + 1);
+}
+
+} // namespace
+
+bool ApplySnapshotDeviceState(std::vector<uint32_t>& words, uint32_t& snapshot_words, bool feedback_loop,
+                              const SubgroupSizeFn& subgroup_for) {
+	if (snapshot_words > words.size()) return false;
+	SnapshotDeviceWords at;
+	if (!LocateSnapshotDeviceWords(std::span<const uint32_t>(words).first(snapshot_words), at)) return false;
+	for (size_t i = 0; i < at.stage_subgroup.size(); i++) {
+		words[at.stage_subgroup[i]] = subgroup_for ? subgroup_for(words[at.stage_flags[i]], static_cast<uint32_t>(i)) : 0u;
+	}
+	const auto first = words.begin() + static_cast<std::ptrdiff_t>(at.dynamic_count + 1);
+	const auto last  = first + words[at.dynamic_count];
+	const auto found = std::find(first, last, DynamicStateAttachmentFeedbackLoop);
+	if (!feedback_loop && found != last) {
+		const auto removed = static_cast<uint32_t>(std::count(first, last, DynamicStateAttachmentFeedbackLoop));
+		words[at.dynamic_count] -= removed;
+		words.erase(std::remove(first, last, DynamicStateAttachmentFeedbackLoop), last);
+		snapshot_words -= removed;
+	} else if (feedback_loop && found == last) {
+		// The renderer appends it after every other dynamic state (shaders.cpp).
+		words[at.dynamic_count]++;
+		words.insert(last, DynamicStateAttachmentFeedbackLoop);
+		snapshot_words++;
+	}
+	return true;
+}
+
+bool NormalizePipelineDeviceState(Pipeline& pipeline) {
+	return ApplySnapshotDeviceState(pipeline.words, pipeline.snapshot_words, false, nullptr);
 }
 
 Hash128 CodeHash(std::span<const uint8_t> code) {
@@ -685,6 +809,9 @@ uint16_t Builder::AddLevel(const std::string& level) {
 }
 
 void Builder::AddPipeline(Pipeline pipeline, ExportStats& stats) {
+	// The same pipeline recorded on two devices differs only in values the device decides: stored in
+	// the canonical form (pipelineList.h) it is one entry. Words that are not a snapshot stay as they are.
+	(void)NormalizePipelineDeviceState(pipeline);
 	std::sort(pipeline.levels.begin(), pipeline.levels.end());
 	pipeline.levels.erase(std::unique(pipeline.levels.begin(), pipeline.levels.end()), pipeline.levels.end());
 	const auto digest = PipelineDigest(pipeline);
@@ -717,16 +844,19 @@ void Builder::AddJournals(const std::vector<ShaderJournal::Source>& sources,
 			stats.sources_unlocated++;
 			continue;
 		}
-		const auto offset      = locate(source.code);
-		const auto back_offset = source.back_code.empty() ? std::optional<uint64_t> {0} : locate(source.back_code);
-		if (!offset.has_value() || !back_offset.has_value()) {
+		const auto offset = locate(source.code);
+		auto       back_offset =
+		    source.back_code.empty() || !offset.has_value() ? offset : locate(source.back_code);
+		if (source.back_code.empty() && back_offset.has_value()) back_offset->offset = 0;
+		// Both halves of a merged stage in the same file.
+		if (!offset.has_value() || !back_offset.has_value() || back_offset->file != offset->file) {
 			stats.sources_unlocated++;
 			continue;
 		}
 		const auto bytes = AsBytes(source.code);
 		Shader     shader;
-		shader.file      = CodeFile::Executable;
-		shader.offset    = *offset;
+		shader.file      = offset->file;
+		shader.offset    = offset->offset;
 		shader.code_size = source.code_size;
 		const auto hash  = CodeHash(bytes);
 		shader.code_hash_low           = hash.low;
@@ -735,7 +865,7 @@ void Builder::AddJournals(const std::vector<ShaderJournal::Source>& sources,
 		if (!source.back_code.empty()) {
 			const auto back      = AsBytes(source.back_code);
 			const auto back_hash = CodeHash(back);
-			shader.back_offset      = *back_offset;
+			shader.back_offset      = back_offset->offset;
 			shader.back_code_size   = static_cast<uint32_t>(source.back_code.size());
 			shader.back_hash_low    = back_hash.low;
 			shader.back_hash_high   = back_hash.high;
@@ -812,11 +942,21 @@ void Builder::AddJournals(const std::vector<ShaderJournal::Source>& sources,
 	}
 }
 
+CodeFile Builder::AddFile(const std::string& path) {
+	for (size_t i = 0; i < m_file.files.size(); i++) {
+		if (m_file.files[i] == path) return static_cast<CodeFile>(i + 1);
+	}
+	m_file.files.push_back(path);
+	return static_cast<CodeFile>(m_file.files.size());
+}
+
 void Builder::AddList(const File& other, ExportStats& stats) {
 	std::vector<uint32_t> shader_of(other.shaders.size());
 	for (size_t i = 0; i < other.shaders.size(); i++) {
-		bool added   = false;
-		shader_of[i] = AddShader(other.shaders[i], added);
+		bool added  = false;
+		auto shader = other.shaders[i];
+		if (shader.file != CodeFile::Executable) shader.file = AddFile(other.files[static_cast<uint32_t>(shader.file) - 1]);
+		shader_of[i] = AddShader(shader, added);
 		stats.sources++;
 		if (added) {
 			stats.sources_located++;
@@ -850,6 +990,8 @@ Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_siz
 	Resolved out;
 	out.sources.resize(file.shaders.size());
 	out.usable.assign(file.shaders.size(), false);
+	out.offsets.assign(file.shaders.size(), 0);
+	out.back_offsets.assign(file.shaders.size(), 0);
 	stats.shaders += file.shaders.size();
 	// A shader's code pieces: the code and, for a merged stage, its back half. Each is read at its
 	// recorded offset and checked by its hashes; the ones that do not match are searched for in the
@@ -902,6 +1044,8 @@ Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_siz
 		for (size_t q = 0; q < relocate.size(); q++) {
 			if (!found[q].has_value()) continue;
 			auto& piece = pieces[relocate[q]];
+			// Data-file shaders are not relocated into the executable.
+			if (file.shaders[piece.shader].file != CodeFile::Executable) continue;
 			std::memcpy(piece.code.data(), image.data() + *found[q], piece.query.size_bytes);
 			piece.found  = true;
 			piece.offset = *found[q];
@@ -910,6 +1054,7 @@ Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_siz
 	std::vector<uint8_t> moved(file.shaders.size(), 0);
 	std::vector<uint8_t> missing(file.shaders.size(), 0);
 	for (const auto& piece: pieces) {
+		(piece.back ? out.back_offsets : out.offsets)[piece.shader] = piece.offset;
 		missing[piece.shader] |= piece.found ? 0 : 1;
 		moved[piece.shader] |= piece.found && piece.offset != (piece.back ? file.shaders[piece.shader].back_offset
 		                                                                  : file.shaders[piece.shader].offset)
@@ -967,6 +1112,77 @@ Resolved Resolve(const File& file, const std::array<uint32_t, 3>& input_info_siz
 		    })) {
 			stats.pipelines_kept++;
 		}
+	}
+	return out;
+}
+
+void UpgradeVertexInputInfos(File& file, const VertexLayoutUpgrade& upgrade, uint32_t to_size, UpgradeStats& stats) {
+	size_t added = 0;
+	for (const auto& insert: upgrade.inserts) added += insert.bytes.size();
+	if (upgrade.from_size + added != to_size || upgrade.from_size == to_size) return;
+	for (auto& shader: file.shaders) {
+		if (shader.kind != ShaderJournal::Kind::Vertex || shader.input_info.size() != upgrade.from_size) continue;
+		if (upgrade.skip_if_nonzero_at + 4ull <= shader.input_info.size()) {
+			uint32_t value = 0;
+			std::memcpy(&value, shader.input_info.data() + upgrade.skip_if_nonzero_at, sizeof(value));
+			if (value != 0) {
+				stats.skipped++;
+				continue;
+			}
+		}
+		std::vector<uint8_t> out;
+		out.reserve(to_size);
+		size_t from = 0;
+		for (const auto& insert: upgrade.inserts) {
+			out.insert(out.end(), shader.input_info.begin() + static_cast<ptrdiff_t>(from),
+			           shader.input_info.begin() + static_cast<ptrdiff_t>(insert.at));
+			out.insert(out.end(), insert.bytes.begin(), insert.bytes.end());
+			from = insert.at;
+		}
+		out.insert(out.end(), shader.input_info.begin() + static_cast<ptrdiff_t>(from), shader.input_info.end());
+		shader.input_info = std::move(out);
+		stats.upgraded++;
+	}
+	if (stats.upgraded != 0 && stats.skipped == 0) file.info.input_info_sizes[0] = to_size;
+}
+
+File Retarget(const File& file, const Resolved& resolved, RetargetStats& stats) {
+	File out;
+	out.info   = file.info;
+	out.levels = file.levels;
+	std::vector<uint32_t> shader_map(file.shaders.size(), UINT32_MAX);
+	for (size_t i = 0; i < file.shaders.size(); i++) {
+		stats.shaders++;
+		if (!resolved.usable[i]) {
+			stats.missing++;
+			continue;
+		}
+		auto shader = file.shaders[i];
+		const bool same = shader.offset == resolved.offsets[i] && (shader.back_code_size == 0 || shader.back_offset == resolved.back_offsets[i]);
+		(same ? stats.same_offset : stats.moved)++;
+		shader.offset = resolved.offsets[i];
+		if (shader.back_code_size != 0) shader.back_offset = resolved.back_offsets[i];
+		shader_map[i] = static_cast<uint32_t>(out.shaders.size());
+		out.shaders.push_back(std::move(shader));
+	}
+	std::vector<uint32_t> permutation_map(file.permutations.size(), UINT32_MAX);
+	for (size_t i = 0; i < file.permutations.size(); i++) {
+		if (shader_map[file.permutations[i].shader] == UINT32_MAX) continue;
+		auto permutation = file.permutations[i];
+		permutation.shader = shader_map[permutation.shader];
+		permutation_map[i] = static_cast<uint32_t>(out.permutations.size());
+		out.permutations.push_back(std::move(permutation));
+	}
+	for (const auto& source: file.pipelines) {
+		stats.pipelines++;
+		if (!std::all_of(source.stages.begin(), source.stages.end(),
+		                 [&](const Stage& stage) { return permutation_map[stage.permutation] != UINT32_MAX; })) {
+			continue;
+		}
+		auto pipeline = source;
+		for (auto& stage: pipeline.stages) stage.permutation = permutation_map[stage.permutation];
+		out.pipelines.push_back(std::move(pipeline));
+		stats.pipelines_kept++;
 	}
 	return out;
 }

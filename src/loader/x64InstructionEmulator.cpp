@@ -1,6 +1,7 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include "common/common.h"
+#include "common/logging/log.h"
 
 #include <Zydis/Zydis.h>
 #include <atomic>
@@ -383,21 +384,21 @@ static bool ResolveShaNiMemoryAddress(const uint8_t* rip, const ShaNiInsn&    in
 	return true;
 }
 
-static bool ExecuteShaNiInsn(const ShaNiInsn& insn, const XmmWords& src2, const XmmWords& xmm0,
-                             XmmWords& dest) {
+static ZydisMnemonic ExecuteShaNiInsn(const ShaNiInsn& insn, const XmmWords& src2,
+                                      const XmmWords& xmm0, XmmWords& dest) {
 	if (insn.escape == 0x3a && insn.opcode == 0xcc) {
 		Sha1Rnds4(dest, src2, insn.imm8);
-		return true;
+		return ZYDIS_MNEMONIC_SHA1RNDS4;
 	}
 
+	// DecodeShaNiInsn accepts only opcodes 0xc8-0xcd.
 	switch (insn.opcode) {
-		case 0xc8: Sha1Nexte(dest, src2); return true;
-		case 0xc9: Sha1Msg1(dest, src2); return true;
-		case 0xca: Sha1Msg2(dest, src2); return true;
-		case 0xcb: Sha256Rnds2(dest, src2, xmm0); return true;
-		case 0xcc: Sha256Msg1(dest, src2); return true;
-		case 0xcd: Sha256Msg2(dest, src2); return true;
-		default: return false;
+		case 0xc8: Sha1Nexte(dest, src2); return ZYDIS_MNEMONIC_SHA1NEXTE;
+		case 0xc9: Sha1Msg1(dest, src2); return ZYDIS_MNEMONIC_SHA1MSG1;
+		case 0xca: Sha1Msg2(dest, src2); return ZYDIS_MNEMONIC_SHA1MSG2;
+		case 0xcb: Sha256Rnds2(dest, src2, xmm0); return ZYDIS_MNEMONIC_SHA256RNDS2;
+		case 0xcc: Sha256Msg1(dest, src2); return ZYDIS_MNEMONIC_SHA256MSG1;
+		default: Sha256Msg2(dest, src2); return ZYDIS_MNEMONIC_SHA256MSG2;
 	}
 }
 
@@ -534,6 +535,19 @@ struct Context {
 	}
 };
 
+// Names each trap-emulated instruction once, at its first guest address. Reading the flag before
+// the exchange keeps repeated traps from writing its cache line.
+static void LogFirstTrap(const Context& context, ZydisMnemonic mnemonic) {
+	static std::atomic_bool logged_traps[ZYDIS_MNEMONIC_MAX_VALUE + 1];
+	auto&                   logged = logged_traps[mnemonic];
+	if (!logged.load(std::memory_order_relaxed) &&
+	    !logged.exchange(true, std::memory_order_relaxed)) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("AMD CPU compatibility: trapping {} (first at 0x{:x})\n",
+			            ZydisMnemonicGetString(mnemonic), context.Rip()));
+	}
+}
+
 #if !defined(__APPLE__)
 
 static bool TryEmulateShaNi(Context& context) {
@@ -574,11 +588,9 @@ static bool TryEmulateShaNi(Context& context) {
 		std::memcpy(&src2, source, sizeof(src2));
 	}
 
-	if (!ExecuteShaNiInsn(insn, src2, xmm0_words, dest)) {
-		return false;
-	}
-
+	const auto mnemonic = ExecuteShaNiInsn(insn, src2, xmm0_words, dest);
 	std::memcpy(dest_xmm, &dest, sizeof(dest));
+	LogFirstTrap(context, mnemonic);
 	context.Advance(insn.length);
 	return true;
 }
@@ -649,6 +661,7 @@ static bool TryEmulateSse4a(Context& context) {
 	}
 	dest[1] = 0;
 	std::memcpy(dest_xmm, dest, sizeof(dest));
+	LogFirstTrap(context, prefix == 0x66 ? ZYDIS_MNEMONIC_EXTRQ : ZYDIS_MNEMONIC_INSERTQ);
 	context.Advance(instruction_length);
 	return true;
 }
@@ -715,6 +728,7 @@ static bool TryEmulateCpuExtensions(Context& context) {
 	} else {
 		return false;
 	}
+	LogFirstTrap(context, instruction.mnemonic);
 	context.Advance(instruction.length);
 	return true;
 }
@@ -733,6 +747,7 @@ static bool TryEmulateMonitorxMwaitx(Context& context) {
 		::sched_yield();
 #endif
 	}
+	LogFirstTrap(context, rip[2] == 0xfb ? ZYDIS_MNEMONIC_MWAITX : ZYDIS_MNEMONIC_MONITORX);
 	context.Advance(3);
 	return true;
 }
@@ -822,6 +837,7 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	_mm_setcsr(mxcsr);
 	std::memcpy(dest_xmm, &result, sizeof(result));
 	context.ClearUpperYmm(dest);
+	LogFirstTrap(context, ZYDIS_MNEMONIC_VRSQRTPS);
 	context.Advance(prefix_size + 2);
 	auto& slot = ThisThreadTrapSlot();
 	slot.traps.fetch_add(1, std::memory_order_relaxed);
@@ -1039,6 +1055,161 @@ bool ApplyGuestLoad(void* native_context, const GuestLoad::Load& load, const voi
 		default: return false;
 	}
 	context.Advance(load.length);
+	return true;
+}
+
+namespace {
+
+// Vector moves whose memory form stores (the low part of) an XMM register; MOVHPS and MOVHPD store
+// its high quadword.
+bool IsVectorStore(ZydisMnemonic mnemonic) {
+	switch (mnemonic) {
+		case ZYDIS_MNEMONIC_MOVUPS:
+		case ZYDIS_MNEMONIC_MOVAPS:
+		case ZYDIS_MNEMONIC_MOVUPD:
+		case ZYDIS_MNEMONIC_MOVAPD:
+		case ZYDIS_MNEMONIC_MOVDQU:
+		case ZYDIS_MNEMONIC_MOVDQA:
+		case ZYDIS_MNEMONIC_MOVNTPS:
+		case ZYDIS_MNEMONIC_MOVNTPD:
+		case ZYDIS_MNEMONIC_MOVNTDQ:
+		case ZYDIS_MNEMONIC_MOVSS:
+		case ZYDIS_MNEMONIC_MOVSD:
+		case ZYDIS_MNEMONIC_MOVQ:
+		case ZYDIS_MNEMONIC_MOVD:
+		case ZYDIS_MNEMONIC_MOVLPS:
+		case ZYDIS_MNEMONIC_MOVLPD:
+		case ZYDIS_MNEMONIC_MOVHPS:
+		case ZYDIS_MNEMONIC_MOVHPD:
+		case ZYDIS_MNEMONIC_VMOVUPS:
+		case ZYDIS_MNEMONIC_VMOVAPS:
+		case ZYDIS_MNEMONIC_VMOVUPD:
+		case ZYDIS_MNEMONIC_VMOVAPD:
+		case ZYDIS_MNEMONIC_VMOVDQU:
+		case ZYDIS_MNEMONIC_VMOVDQA:
+		case ZYDIS_MNEMONIC_VMOVNTPS:
+		case ZYDIS_MNEMONIC_VMOVNTPD:
+		case ZYDIS_MNEMONIC_VMOVNTDQ:
+		case ZYDIS_MNEMONIC_VMOVSS:
+		case ZYDIS_MNEMONIC_VMOVSD:
+		case ZYDIS_MNEMONIC_VMOVQ:
+		case ZYDIS_MNEMONIC_VMOVD:
+		case ZYDIS_MNEMONIC_VMOVLPS:
+		case ZYDIS_MNEMONIC_VMOVLPD:
+		case ZYDIS_MNEMONIC_VMOVHPS:
+		case ZYDIS_MNEMONIC_VMOVHPD: return true;
+		default: return false;
+	}
+}
+
+} // namespace
+
+bool TryEmulateStore(void* native_context, uint64_t fault_vaddr, StoreWriter write) {
+	Context context {};
+	if (write == nullptr || !MakeContext(native_context, context)) {
+		return false;
+	}
+	ZydisDecoder            decoder {};
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(
+	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) ||
+	    !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void*>(context.Rip()),
+	                                         ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction, operands))) {
+		return false;
+	}
+	if (instruction.operand_count_visible != 2 || (instruction.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0 ||
+	    (instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_LEGACY &&
+	     instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX)) {
+		return false;
+	}
+	const auto& mem    = operands[0];
+	const auto& source = operands[1];
+	if (mem.type != ZYDIS_OPERAND_TYPE_MEMORY || mem.mem.type != ZYDIS_MEMOP_TYPE_MEM ||
+	    mem.mem.segment == ZYDIS_REGISTER_FS || mem.mem.segment == ZYDIS_REGISTER_GS) {
+		return false;
+	}
+	const uint32_t bytes = mem.size / 8u;
+	if (bytes == 0 || bytes > 16) {
+		return false; // 32-byte (YMM) stores take the normal path
+	}
+	ZydisRegisterContext registers {};
+	for (uint8_t i = 0; i < 16; ++i) {
+		const auto value                         = static_cast<uint64_t>(context.Gpr(i));
+		registers.values[ZYDIS_REGISTER_RAX + i] = value;
+		registers.values[ZYDIS_REGISTER_EAX + i] = static_cast<uint32_t>(value);
+	}
+	uint64_t address = 0;
+	if (!ZYAN_SUCCESS(
+	        ZydisCalcAbsoluteAddressEx(&instruction, &mem, context.Rip(), &registers, &address)) ||
+	    fault_vaddr < address || fault_vaddr - address >= bytes) {
+		return false;
+	}
+	alignas(16) uint8_t data[16] {};
+	switch (instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_MOV:
+		case ZYDIS_MNEMONIC_MOVNTI: {
+			if (bytes > 8) {
+				return false;
+			}
+			uint64_t value = 0;
+			if (source.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+				const auto reg_class = ZydisRegisterGetClass(source.reg.value);
+				// The 64-bit register that holds it: ZydisRegisterGetId numbers GPR8 as AL CL DL BL
+				// AH CH DH BH SPL BPL SIL DIL R8B.., so SIL (id 10) or R8B (id 12) would have read R10
+				// or R12 and stored the wrong bytes (GT7 crashed in guest code with this switch).
+				const auto enclosing =
+				    ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, source.reg.value);
+				const auto index = static_cast<int>(enclosing) - static_cast<int>(ZYDIS_REGISTER_RAX);
+				if ((reg_class != ZYDIS_REGCLASS_GPR8 && reg_class != ZYDIS_REGCLASS_GPR16 &&
+				     reg_class != ZYDIS_REGCLASS_GPR32 && reg_class != ZYDIS_REGCLASS_GPR64) ||
+				    index < 0 || index >= 16 || source.reg.value == ZYDIS_REGISTER_AH ||
+				    source.reg.value == ZYDIS_REGISTER_CH || source.reg.value == ZYDIS_REGISTER_DH ||
+				    source.reg.value == ZYDIS_REGISTER_BH) {
+					return false; // segment registers, high-byte registers
+				}
+				value = static_cast<uint64_t>(context.Gpr(static_cast<uint8_t>(index)));
+			} else if (source.type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+			           instruction.mnemonic == ZYDIS_MNEMONIC_MOV) {
+				// MOV r/m64, imm32 sign-extends; the decoder has done it.
+				value = source.imm.is_signed ? static_cast<uint64_t>(source.imm.value.s)
+				                             : source.imm.value.u;
+			} else {
+				return false;
+			}
+			std::memcpy(data, &value, bytes);
+			break;
+		}
+		default: {
+			if (!IsVectorStore(instruction.mnemonic) || source.type != ZYDIS_OPERAND_TYPE_REGISTER ||
+			    ZydisRegisterGetClass(source.reg.value) != ZYDIS_REGCLASS_XMM) {
+				return false; // YMM, MMX, or a general-purpose source
+			}
+			const auto index = ZydisRegisterGetId(source.reg.value);
+			if (index < 0 || index >= 16) {
+				return false;
+			}
+			const auto* xmm = context.Xmm(static_cast<uint8_t>(index));
+			if (xmm == nullptr) {
+				return false;
+			}
+			uint8_t value[16] {};
+			std::memcpy(value, xmm, sizeof(value));
+			const bool high = instruction.mnemonic == ZYDIS_MNEMONIC_MOVHPS ||
+			                  instruction.mnemonic == ZYDIS_MNEMONIC_MOVHPD ||
+			                  instruction.mnemonic == ZYDIS_MNEMONIC_VMOVHPS ||
+			                  instruction.mnemonic == ZYDIS_MNEMONIC_VMOVHPD;
+			if (high && bytes != 8) {
+				return false;
+			}
+			std::memcpy(data, value + (high ? 8 : 0), bytes);
+			break;
+		}
+	}
+	if (!write(context.Rip(), fault_vaddr, address, data, bytes)) {
+		return false;
+	}
+	context.Advance(instruction.length);
 	return true;
 }
 

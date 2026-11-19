@@ -18,11 +18,13 @@ add_executable(launcher WIN32
 	${launcher_src}
 	${launcher_forms}
 	resources.qrc
+	# The start-up CPU check (common/cpuCheck.h), before Qt's and the launcher's static initializers.
+	$<TARGET_OBJECTS:kyty_cpu_check>
 )
 
 
 target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static
-	LibAtrac9 kyty_git_version common)
+	LibAtrac9 kyty_git_version common FFmpeg::ffmpeg)
 if(LINUX)
 	find_package(Qt6 COMPONENTS DBus REQUIRED)
 	target_link_libraries(launcher Qt6::DBus)
@@ -36,6 +38,87 @@ target_link_libraries(launcher pthread)
 endif()
 target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
+
+add_executable(launcher_game_views_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherGameViewsTests.cpp"
+	src/gameContent.cpp
+	src/launcherTheme.cpp
+	resources.qrc
+)
+target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
+target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
+
+add_executable(launcher_configuration_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherConfigurationTests.cpp"
+	include/configuration.h
+	src/configuration.cpp
+)
+target_link_libraries(launcher_configuration_tests Qt6::Gui common)
+target_include_directories(launcher_configuration_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_configuration_tests PROPERTIES AUTOMOC ON)
+add_test(NAME launcher_configuration COMMAND $<TARGET_FILE:launcher_configuration_tests>)
+# The Precompile button without its windows: shader list paths and the prepare run's lines.
+add_executable(launcher_precompile_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherPrecompileTests.cpp"
+	include/precompile.h
+	src/precompile.cpp
+)
+target_link_libraries(launcher_precompile_tests Qt6::Core)
+target_include_directories(launcher_precompile_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME launcher_precompile COMMAND $<TARGET_FILE:launcher_precompile_tests>)
+
+# The Precompile column of the game list and its row button (offscreen, no emulator).
+add_executable(launcher_precompile_item_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherPrecompileItemTests.cpp"
+	include/configuration.h
+	src/configuration.cpp
+	src/configurationItem.cpp
+	src/gameContent.cpp
+	src/precompile.cpp
+	src/shaderListExport.cpp
+	resources.qrc
+)
+target_link_libraries(launcher_precompile_item_tests Qt6::Concurrent Qt6::Widgets common)
+target_include_directories(launcher_precompile_item_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_precompile_item_tests PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
+add_test(NAME launcher_precompile_item COMMAND $<TARGET_FILE:launcher_precompile_item_tests>)
+
+# The Export list button without its windows: tool, journals, file names, arguments, the export's
+# counts and keeping only a checked list.
+add_executable(launcher_shader_list_export_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherShaderListExportTests.cpp"
+	include/shaderListExport.h
+	src/shaderListExport.cpp
+	src/precompile.cpp
+)
+target_link_libraries(launcher_shader_list_export_tests Qt6::Core)
+target_include_directories(launcher_shader_list_export_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_test(NAME launcher_shader_list_export COMMAND $<TARGET_FILE:launcher_shader_list_export_tests>)
+
+# The game configuration dialog without showing it: Reset and the Recommended button.
+add_executable(launcher_edit_dialog_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherEditDialogTests.cpp"
+	include/configuration.h
+	include/configurationEditDialog.h
+	include/mandatoryLineEdit.h
+	src/configuration.cpp
+	src/configurationEditDialog.cpp
+	src/mandatoryLineEdit.cpp
+)
+target_link_libraries(launcher_edit_dialog_tests Qt6::Widgets Vulkan::Headers SDL3::SDL3-static common)
+if(WIN32)
+	target_link_libraries(launcher_edit_dialog_tests setupapi)
+endif()
+target_include_directories(launcher_edit_dialog_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_edit_dialog_tests PROPERTIES AUTOMOC ON AUTOUIC ON)
+add_test(NAME launcher_edit_dialog COMMAND $<TARGET_FILE:launcher_edit_dialog_tests>)
+if(WIN32)
+	# Qt's DLLs are deployed beside the launcher only.
+	set_tests_properties(launcher_configuration launcher_precompile launcher_precompile_item
+		launcher_shader_list_export launcher_edit_dialog
+		PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${Qt6_DIR}/../../../bin")
+endif()
 
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
@@ -51,6 +134,12 @@ add_custom_target(stage_updater
 	DEPENDS kyty_updater
 	VERBATIM)
 add_dependencies(launcher kyty_emulator stage_updater)
+if(WIN32)
+	# The Export list button runs kyty_pipeline_list (shaderListExport.h): built and installed with
+	# the launcher. Without it (other systems for now) the button is hidden.
+	add_dependencies(launcher kyty_pipeline_list)
+	install(TARGETS kyty_pipeline_list RUNTIME DESTINATION . OPTIONAL)
+endif()
 
 if(KYTY_CLANG_CL)
 	add_custom_command(TARGET launcher POST_BUILD
@@ -116,6 +205,7 @@ if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(TARGETS kyty_updater DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION "KytyPS5.app/Contents/Resources/assets/sounds")
+	install(FILES ${KYTY_NOTO_SANS_FONTS} DESTINATION "KytyPS5.app/Contents/Resources/assets/fonts")
 	install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/cursors" DESTINATION "KytyPS5.app/Contents/Resources/assets")
 	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
 	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
@@ -198,9 +288,12 @@ elseif(LINUX)
 				RESOLVED_DEPENDENCIES_VAR kyty_resolved
 				POST_INCLUDE_REGEXES \"libQt6\" \"libicu\"
 				POST_EXCLUDE_REGEXES \".*\")
+			# Install each library once, as a regular file under the name the binaries load.
 			foreach(kyty_dep \${kyty_resolved})
+				get_filename_component(kyty_dep_file \"\${kyty_dep}\" REALPATH)
+				get_filename_component(kyty_dep_name \"\${kyty_dep}\" NAME)
 				file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/lib\"
-					TYPE SHARED_LIBRARY FOLLOW_SYMLINK_CHAIN FILES \"\${kyty_dep}\")
+					RENAME \"\${kyty_dep_name}\" FILES \"\${kyty_dep_file}\")
 			endforeach()
 		")
 		install(CODE "

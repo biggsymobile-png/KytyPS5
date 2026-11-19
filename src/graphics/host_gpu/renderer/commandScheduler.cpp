@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "common/staticOnce.h"
 
 #include "common/assert.h"
 #include "common/cpuPlacement.h"
@@ -250,6 +251,21 @@ uint64_t CommandScheduler::FlushObservable() {
 	return tick;
 }
 
+uint64_t CommandScheduler::Backlog() {
+	m_master.Refresh();
+	const auto submitted = m_master.CurrentTick() - 1;
+	const auto done      = m_master.KnownGpuTick();
+	return submitted > done ? submitted - done : 0;
+}
+
+void CommandScheduler::HoldFlush() {
+	CheckActive();
+	EXIT_IF(m_command.IsInvalid());
+	m_command.EndRendering();
+	m_command.FlushBarriers();
+	m_flush_held = true;
+}
+
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit({}, true);
 	m_master.Wait(tick);
@@ -294,7 +310,41 @@ static bool PendingOpsNoWait() {
 	return g_pending_ops_nowait.On();
 }
 
+// KYTY_POP_READY_FAST (live, default 0): the non-waiting pop at every draw and dispatch
+// (PopReadyOperations, with KYTY_RENDERER_BATCH's early returns) first reads the queue front's tick
+// without taking the operation mutex, and returns at once when the queue is empty or its first
+// operation belongs to the recording tick: the two cases in which the locked check returns without
+// doing anything. At the Playroom GPU Jungle the lock and unlock cost ~0.2 ms per flip (10,000 draws).
+// A push racing the read is seen by the next pop, as a push just after a locked check is.
+static Live::Switch g_pop_ready_fast("KYTY_POP_READY_FAST", [](const char* value) -> int64_t {
+	return value != nullptr ? std::strtoll(value, nullptr, 10) : 0;
+});
+
+// KYTY_POP_READY_FAST=2: also without the lock while the front operation's tick is not known
+// complete; the GPU's progress is then queried (MasterSemaphore::Refresh, a driver call) at most every
+// KYTY_PENDING_REFRESH_US (preset 200), else every 50 us (the operations are deletions and recycling nothing at a
+// draw waits for; every blocking pop still queries).
+static uint64_t PendingRefreshIntervalNs();
+
 void CommandScheduler::PopReadyOperations() {
+	if (const auto fast = g_pop_ready_fast.Get(); fast != 0 && Common::RendererBatchEnabled()) {
+		const auto front = m_pending_front_tick.load(std::memory_order_acquire);
+		if (front == UINT64_MAX || front >= CurrentTick()) {
+			return;
+		}
+		if (fast >= 2 && !m_master.IsFree(front)) {
+			const auto now = GpuTiming::NowNs();
+			const auto interval = PendingRefreshIntervalNs(); // KYTY_PENDING_REFRESH_US, else 50 us
+			if (now - m_last_pending_refresh_ns < (interval != 0 ? interval : 50'000u)) {
+				return;
+			}
+			m_last_pending_refresh_ns = now;
+			m_master.Refresh();
+			if (!m_master.IsFree(front)) {
+				return;
+			}
+		}
+	}
 	PopOperations(!PendingOpsNoWait());
 }
 
@@ -363,6 +413,8 @@ void CommandScheduler::PopOperations(bool wait_for_priority) {
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			m_pending_front_tick.store(m_pending_operations.empty() ? UINT64_MAX : m_pending_operations.front().tick,
+			                           std::memory_order_release);
 		}
 		if (wait_for_priority) {
 			WaitPriorityOperations(operation.tick);
@@ -385,6 +437,7 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 			m_diagnostic_generic_completion = true;
 		}
 		m_pending_operations.push({std::move(operation), CurrentTick()});
+		m_pending_front_tick.store(m_pending_operations.front().tick, std::memory_order_release);
 		return;
 	}
 	if (g_deferred_callback_scheduler == this) {
@@ -415,6 +468,7 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 			}
 		}
 		const bool was_empty = m_priority_operations.empty();
+		m_priority_tick.store(CurrentTick(), std::memory_order_relaxed);
 		m_priority_operations.push({std::move(operation), CurrentTick()});
 		lock.unlock();
 		if (!PriorityWakeupsBatched()) {
@@ -438,10 +492,12 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 }
 
 bool CommandScheduler::PriorityWakeupsBatched() {
-	static const bool enabled = [] {
+	static constexpr auto enabled_init = [] {
 		const auto* value = std::getenv("KYTY_PRIORITY_WAKE_BATCH");
 		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	};
+	static constinit Common::StaticOnce<std::remove_cvref_t<decltype(enabled_init())>> enabled_once;
+	const bool& enabled = enabled_once.Get(enabled_init);
 	return enabled;
 }
 
@@ -631,7 +687,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 			// KYTY_EOP_TIMESTAMPS=gpu: reset the slots whose results were read, as recorder
 			// packets after the recorder's Begin (no drain). Without it no slot would ever become
 			// free.
-			m_eop_timestamps->BeginCommand(m_command.StateSink());
+			m_eop_timestamps->BeginCommand(m_command.StateSink(), m_master.CurrentTick());
 		}
 		return m_command;
 	}
@@ -643,7 +699,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	}
 	if (m_eop_timestamps) {
 		// Outside rendering: reset the guest timestamp slots whose results were read.
-		m_eop_timestamps->BeginCommand(m_command.StateSink());
+		m_eop_timestamps->BeginCommand(m_command.StateSink(), m_master.CurrentTick());
 	}
 	if (m_gpu_ops) {
 		GpuOpProfiler::OnBeginCommand(m_graphics, m_command.m_buffer, m_master.CurrentTick(),
@@ -656,8 +712,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	const CpGaps::Scope gap(CpGaps::Cat::Flush);
 	HangWatchdog::NoteSubmission();
 	EXIT_IF(m_command.IsInvalid());
-	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
-	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
+	m_flush_held = false; // KYTY_FLUSH_DEFER: a held slice end goes with this submission
 	if (m_pre_submit_hook != nullptr && !m_in_pre_submit && Active()) {
 		// Work its owner deferred to the end of this command buffer (SetPreSubmitHook).
 		m_in_pre_submit = true;
@@ -724,6 +779,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		// allocated here, exactly as in queued mode.
 		m_command.EndRendering();
 		m_command.FlushBarriers();
+		if (m_eop_timestamps) {
+			m_eop_timestamps->EndCommand(m_command.StateSink(), m_master.CurrentTick()); // busy
+		}
 		m_command.CloseDirectWindow();
 		CommandStream::SubmitPacket packet;
 		packet.submit       = submit;
@@ -756,6 +814,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 			// Pending batched barriers belong before the end stamp, as when recorded directly.
 			m_command.FlushBarriers();
 			m_gpu_timing->EndCommand(m_command.m_buffer);
+		}
+		if (m_eop_timestamps) {
+			m_eop_timestamps->EndCommand(m_command.StateSink(), m_master.CurrentTick()); // busy
 		}
 		m_command.End();
 	}
@@ -850,7 +911,6 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	if (m_gpu_timing) {
 		if (auto* dispatch_ns = m_gpu_timing->Submitted(tick, submit_ns); dispatch_ns != nullptr) {
 			*dispatch_ns = GpuTiming::NowNs();
