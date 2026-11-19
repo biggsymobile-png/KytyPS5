@@ -17,7 +17,10 @@ add_library(common STATIC ${common_src} ${common_headers})
 # Loading/watchdog diagnostics handle filesystem and thread-start exceptions locally.
 # Other sources retain the project's no-exceptions compilation policy.
 if(LINUX OR APPLE)
-	set_property(SOURCE profiler.cpp hangWatchdog.cpp APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
+	# (int22 added try blocks to compileWatch.cpp, kytyEvents.cpp and u59Preset.cpp without adding them
+	# here, so Linux and macOS did not compile them.)
+	set_property(SOURCE profiler.cpp hangWatchdog.cpp compileWatch.cpp kytyEvents.cpp u59Preset.cpp
+	             APPEND PROPERTY COMPILE_OPTIONS -fexceptions)
 endif()
 set(localization_dir "${PROJECT_SOURCE_DIR}/assets/localization")
 file(GLOB localization_catalogs CONFIGURE_DEPENDS "${localization_dir}/*.json")
